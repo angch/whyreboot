@@ -17,11 +17,21 @@ Guidance for agentic coders working in this repository. Read this before touchin
 ## Repository layout
 
 ```
-src/main.rs       — entire program (~1200 lines, single file by design)
+src/main.rs       — CLI args and entry point (~70 lines)
+src/types.rs      — shared structs and enums
+src/xml.rs        — hand-rolled XML parsing (no external dep)
+src/color.rs      — ANSI palette and Win32 VTP enable
+src/events.rs     — System + WER event fetching, minidump listing
+src/analysis.rs   — boot cycle analysis, lookup tables, WER correlation
+src/registry.rs   — registry helpers + audio power settings check
+src/display.rs    — text/JSON output, explanation generation
 Cargo.toml        — deps: windows 0.62.2 + chrono 0.4
+HowItWorks.md     — full narrative of the analysis pipeline and decision logic
 TODO.md           — feature tracking (most items done)
 HANDOFF.md        — early session notes (mostly superseded by this file)
 ```
+
+**Keep `HowItWorks.md` in sync** when modifying the analysis decision tree (`analyze_slice`, `classify_event41`, `classify_event1074`), the WER/minidump correlation windows, the device power check logic, or the explanation patterns in `generate_explanation`. The doc describes the exact logic, not just the concept.
 
 ---
 
