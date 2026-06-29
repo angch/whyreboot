@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Windows registry helpers and audio device power settings check.
 //!
 //! The audio device class GUID `{4d36e96c-e325-11ce-bfc1-08002be10318}` is a fixed

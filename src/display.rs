@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Text and JSON output for boot cycles, including explanations and remediation advice.
 
 use chrono::Local;

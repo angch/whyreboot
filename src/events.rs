@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Windows Event Log fetching: System channel, WER (Application channel), and minidump listing.
 
 use std::ffi::c_void;

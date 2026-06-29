@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Minimal XML extraction for Windows Event Log records.
 //! `EvtRender(EvtRenderEventXml)` produces well-structured output, so a
 //! full parser is unnecessary — string scanning is sufficient and avoids

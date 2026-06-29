@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Boot cycle analysis: stop code tables, event classification, and WER/minidump annotation.
 
 use chrono::{DateTime, Duration, Local};

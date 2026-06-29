@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! ANSI color palette and Win32 terminal setup.
 //! Windows consoles ignore ANSI escape codes by default; `enable_ansi_color`
 //! must be called before printing any color sequences.
