@@ -495,3 +495,495 @@ fn annotate_wer_module(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        hex_u64, stop_name, decode_reason, module_from_bucket,
+        bsod_evidence, classify_event41, classify_event1074,
+        analyze_slice, collect_boot_indices, extract_boot_cycles,
+    };
+    use crate::types::{Cause, EventRecord};
+    use chrono::Local;
+
+    fn make_event(event_id: u32, provider: &str, data: &[(&str, &str)]) -> EventRecord {
+        EventRecord {
+            event_id,
+            time_created: Local::now(),
+            provider: provider.to_string(),
+            data: data.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        }
+    }
+
+    // ── hex_u64 ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn hex_u64_0x_prefix_lowercase() {
+        assert_eq!(hex_u64("0x9f"), Some(0x9f));
+        assert_eq!(hex_u64("0x0000009f"), Some(0x9f));
+    }
+
+    #[test]
+    fn hex_u64_0x_prefix_uppercase() {
+        assert_eq!(hex_u64("0X9F"), Some(0x9f));
+    }
+
+    #[test]
+    fn hex_u64_decimal() {
+        assert_eq!(hex_u64("0"), Some(0));
+        assert_eq!(hex_u64("159"), Some(159));
+    }
+
+    #[test]
+    fn hex_u64_bare_hex_inferred() {
+        // Contains a–f without prefix → parsed as hex.
+        assert_eq!(hex_u64("9f"), Some(0x9f));
+        assert_eq!(hex_u64("ff"), Some(0xff));
+    }
+
+    #[test]
+    fn hex_u64_invalid() {
+        assert_eq!(hex_u64(""), None);
+        assert_eq!(hex_u64("xyz"), None);
+        assert_eq!(hex_u64("0xgg"), None);
+    }
+
+    // ── stop_name ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn stop_name_known_codes() {
+        assert_eq!(stop_name(0x9F),  "DRIVER_POWER_STATE_FAILURE");
+        assert_eq!(stop_name(0x19C), "WIN32K_POWER_WATCHDOG_TIMEOUT");
+        assert_eq!(stop_name(0xFE),  "BUGCODE_USB_DRIVER");
+        assert_eq!(stop_name(0x144), "BUGCODE_USB3_DRIVER");
+        assert_eq!(stop_name(0x50),  "PAGE_FAULT_IN_NONPAGED_AREA");
+    }
+
+    #[test]
+    fn stop_name_unknown() {
+        assert_eq!(stop_name(0xDEADBEEF), "(unknown)");
+        assert_eq!(stop_name(0),          "(unknown)");
+    }
+
+    // ── decode_reason ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn decode_reason_with_0x_prefix() {
+        let r = decode_reason("0x80020002").expect("should be found");
+        assert!(r.contains("Windows Update") || r.contains("Reconfiguration"));
+    }
+
+    #[test]
+    fn decode_reason_without_prefix() {
+        assert_eq!(decode_reason("80020002"), decode_reason("0x80020002"));
+    }
+
+    #[test]
+    fn decode_reason_uppercase_x() {
+        assert_eq!(decode_reason("0X80020002"), decode_reason("0x80020002"));
+    }
+
+    #[test]
+    fn decode_reason_not_found() {
+        assert!(decode_reason("DEADBEEF").is_none());
+        assert!(decode_reason("00000000").is_none());
+    }
+
+    // ── module_from_bucket ────────────────────────────────────────────────────
+
+    #[test]
+    fn bucket_bang_pattern_with_prefix_tokens() {
+        // Priority 1: token before '!' (after last '_')
+        assert_eq!(
+            module_from_bucket("0x9F_3_DXG_POWER_IRP_TIMEOUT_portcls!GetIrpDisposition"),
+            Some("portcls".to_string())
+        );
+    }
+
+    #[test]
+    fn bucket_bang_pattern_simple() {
+        assert_eq!(
+            module_from_bucket("0x9F_3_usbccgp!WaitForSignal"),
+            Some("usbccgp".to_string())
+        );
+    }
+
+    #[test]
+    fn bucket_image_pattern() {
+        // Priority 2: token after '_IMAGE_'
+        assert_eq!(
+            module_from_bucket("0x9F_3_usbccgp_IMAGE_UsbHub3.sys"),
+            Some("UsbHub3.sys".to_string())
+        );
+    }
+
+    #[test]
+    fn bucket_sys_token_fallback() {
+        // Priority 3: token ending in .sys
+        assert_eq!(module_from_bucket("0x50_ntoskrnl.exe"), Some("ntoskrnl.exe".to_string()));
+        assert_eq!(module_from_bucket("CRASH_win32k.sys"),  Some("win32k.sys".to_string()));
+    }
+
+    #[test]
+    fn bucket_dll_token_fallback() {
+        assert_eq!(module_from_bucket("0x1E_some_lib.dll"), Some("lib.dll".to_string()));
+    }
+
+    #[test]
+    fn bucket_no_match() {
+        assert_eq!(module_from_bucket("0x9F_NOSYMBOLS"), None);
+        assert_eq!(module_from_bucket(""), None);
+    }
+
+    #[test]
+    fn bucket_bang_with_empty_module_falls_through() {
+        // '_!function' → before='_', rfind('_')=0, m="" → falls through to .sys scan
+        assert_eq!(module_from_bucket("_!func_ntoskrnl.exe"), Some("ntoskrnl.exe".to_string()));
+    }
+
+    // ── bsod_evidence ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn bsod_evidence_0x9f_p1_decoded_for_values_1_to_4() {
+        for p1 in 1u64..=4 {
+            let ev = bsod_evidence(0x9F, [p1, 0, 0, 0]);
+            // Must have stop code line + P1 decode line.
+            assert!(ev.len() >= 2, "P1={p1} should produce a decode line");
+            assert!(ev[0].contains("DRIVER_POWER_STATE_FAILURE"));
+            assert!(ev.iter().any(|l| l.contains(&format!("P1=0x{p1:X}"))));
+        }
+    }
+
+    #[test]
+    fn bsod_evidence_0x9f_p1_zero_no_decode_line() {
+        let ev = bsod_evidence(0x9F, [0, 0, 0, 0]);
+        // All params zero → only the stop code line.
+        assert_eq!(ev.len(), 1);
+    }
+
+    #[test]
+    fn bsod_evidence_nonzero_params_appear() {
+        let ev = bsod_evidence(0x50, [0, 0xDEAD, 0, 0xBEEF]);
+        assert!(!ev.iter().any(|l| l.contains("Parameter 1")), "zero param 1 should be absent");
+        assert!(ev.iter().any(|l| l.contains("Parameter 2")));
+        assert!(!ev.iter().any(|l| l.contains("Parameter 3")), "zero param 3 should be absent");
+        assert!(ev.iter().any(|l| l.contains("Parameter 4")));
+    }
+
+    // ── classify_event41 ──────────────────────────────────────────────────────
+
+    #[test]
+    fn ev41_bsod_stop_code_nonzero() {
+        let ev = make_event(41, "Microsoft-Windows-Kernel-Power", &[
+            ("BugcheckCode", "0x9f"),
+            ("BugcheckParameter1", "3"),
+            ("BugcheckParameter2", "0"),
+            ("BugcheckParameter3", "0"),
+            ("BugcheckParameter4", "0"),
+            ("PowerButtonTimestamp", "0"),
+        ]);
+        let (cause, conf, _) = classify_event41(&ev, false);
+        assert!(matches!(cause, Cause::BlueScreen { stop_code, .. } if stop_code == 0x9F));
+        assert_eq!(conf, 95);
+    }
+
+    #[test]
+    fn ev41_forced_power_off() {
+        let ev = make_event(41, "Microsoft-Windows-Kernel-Power", &[
+            ("BugcheckCode", "0"),
+            ("PowerButtonTimestamp", "0x1234"),
+        ]);
+        let (cause, conf, _) = classify_event41(&ev, false);
+        assert!(matches!(cause, Cause::ForcedPowerOff));
+        assert_eq!(conf, 82);
+    }
+
+    #[test]
+    fn ev41_unexpected_no_stop_code_no_power_btn() {
+        let ev = make_event(41, "Microsoft-Windows-Kernel-Power", &[
+            ("BugcheckCode", "0"),
+            ("PowerButtonTimestamp", "0"),
+        ]);
+        let (cause, conf, _) = classify_event41(&ev, false);
+        assert!(matches!(cause, Cause::UnexpectedShutdown));
+        assert_eq!(conf, 75);
+    }
+
+    #[test]
+    fn ev41_unexpected_with_6008_flag_adds_evidence() {
+        let ev = make_event(41, "Microsoft-Windows-Kernel-Power", &[
+            ("BugcheckCode", "0"),
+            ("PowerButtonTimestamp", "0"),
+        ]);
+        let (cause, _, evidence) = classify_event41(&ev, true);
+        assert!(matches!(cause, Cause::UnexpectedShutdown));
+        assert!(evidence.iter().any(|e| e.contains("6008")));
+    }
+
+    // ── classify_event1074 ────────────────────────────────────────────────────
+
+    #[test]
+    fn ev1074_tiworker_is_windows_update() {
+        let ev = make_event(1074, "User32", &[
+            ("param1", r"C:\Windows\System32\TiWorker.exe"),
+            ("param3", r"NT AUTHORITY\SYSTEM"),
+            ("param4", "0x80020002"),
+            ("param5", "restart"),
+            ("param6", ""),
+        ]);
+        let (cause, conf, _, _) = classify_event1074(&ev);
+        assert!(matches!(cause, Cause::WindowsUpdate { .. }));
+        assert!(conf >= 90);
+    }
+
+    #[test]
+    fn ev1074_reason_code_0x80020002_alone_triggers_update() {
+        // Even when the process is not TiWorker, the reason code overrides.
+        let ev = make_event(1074, "User32", &[
+            ("param1", "SomeProcess.exe"),
+            ("param3", r"DOMAIN\user"),
+            ("param4", "0x80020002"),
+            ("param5", "restart"),
+            ("param6", ""),
+        ]);
+        let (cause, _, _, _) = classify_event1074(&ev);
+        assert!(matches!(cause, Cause::WindowsUpdate { .. }));
+    }
+
+    #[test]
+    fn ev1074_system_user_is_system_process() {
+        let ev = make_event(1074, "User32", &[
+            ("param1", "svchost.exe"),
+            ("param3", r"NT AUTHORITY\SYSTEM"),
+            ("param4", "0x80040001"),
+            ("param5", "power off"),
+            ("param6", ""),
+        ]);
+        let (cause, _, _, _) = classify_event1074(&ev);
+        assert!(matches!(cause, Cause::SystemProcess { .. }));
+    }
+
+    #[test]
+    fn ev1074_normal_user_is_user_action() {
+        let ev = make_event(1074, "User32", &[
+            ("param1", "explorer.exe"),
+            ("param3", r"DESKTOP-ABC\angch"),
+            ("param4", "0x00040000"),
+            ("param5", "restart"),
+            ("param6", "testing reboot"),
+        ]);
+        let (cause, conf, evidence, _) = classify_event1074(&ev);
+        assert!(matches!(cause, Cause::UserAction { .. }));
+        assert!(conf >= 88);
+        assert!(evidence.iter().any(|e| e.contains("angch")));
+        assert!(evidence.iter().any(|e| e.contains("testing reboot")));
+    }
+
+    #[test]
+    fn ev1074_action_normalised() {
+        let ev = make_event(1074, "User32", &[
+            ("param1", "p.exe"),
+            ("param3", r"DOMAIN\bob"),
+            ("param4", "0"),
+            ("param5", "power off"),
+            ("param6", ""),
+        ]);
+        let (_, _, _, msg) = classify_event1074(&ev);
+        assert!(msg.contains("Shutdown"));
+    }
+
+    // ── analyze_slice (full decision tree) ────────────────────────────────────
+
+    #[test]
+    fn analyze_bsod_from_event41() {
+        let post = [make_event(41, "Microsoft-Windows-Kernel-Power", &[
+            ("BugcheckCode", "0x9f"),
+            ("BugcheckParameter1", "3"),
+            ("BugcheckParameter2", "0"),
+            ("BugcheckParameter3", "0"),
+            ("BugcheckParameter4", "0"),
+            ("PowerButtonTimestamp", "0"),
+        ])];
+        let a = analyze_slice(None, &post, &[]);
+        assert!(matches!(a.cause, Cause::BlueScreen { stop_code, .. } if stop_code == 0x9F));
+        assert_eq!(a.confidence, 95);
+        assert!(a.shutdown_time.is_none(), "crashes have no shutdown_time");
+    }
+
+    #[test]
+    fn analyze_forced_poweroff_from_event41() {
+        let post = [make_event(41, "Microsoft-Windows-Kernel-Power", &[
+            ("BugcheckCode", "0"),
+            ("PowerButtonTimestamp", "1"),
+        ])];
+        let a = analyze_slice(None, &post, &[]);
+        assert!(matches!(a.cause, Cause::ForcedPowerOff));
+    }
+
+    #[test]
+    fn analyze_windows_update_from_1074() {
+        let pre = [make_event(1074, "User32", &[
+            ("param1", "TiWorker.exe"),
+            ("param3", "SYSTEM"),
+            ("param4", "0x80020002"),
+            ("param5", "restart"),
+            ("param6", ""),
+        ])];
+        let a = analyze_slice(None, &[], &pre);
+        assert!(matches!(a.cause, Cause::WindowsUpdate { .. }));
+        assert!(a.shutdown_time.is_some(), "clean shutdowns record shutdown_time");
+    }
+
+    #[test]
+    fn analyze_unexpected_from_6008_only() {
+        let post = [make_event(6008, "EventLog", &[])];
+        let a = analyze_slice(None, &post, &[]);
+        assert!(matches!(a.cause, Cause::UnexpectedShutdown));
+        assert_eq!(a.confidence, 60);
+    }
+
+    #[test]
+    fn analyze_normal_from_event13() {
+        let pre = [make_event(13, "Microsoft-Windows-Kernel-General", &[])];
+        let a = analyze_slice(None, &[], &pre);
+        assert!(matches!(a.cause, Cause::NormalShutdown));
+        assert!(a.shutdown_time.is_some());
+    }
+
+    #[test]
+    fn analyze_normal_from_event6006() {
+        let pre = [make_event(6006, "EventLog", &[])];
+        let a = analyze_slice(None, &[], &pre);
+        assert!(matches!(a.cause, Cause::NormalShutdown));
+    }
+
+    #[test]
+    fn analyze_undetermined_when_no_events() {
+        let a = analyze_slice(None, &[], &[]);
+        assert!(matches!(a.cause, Cause::Undetermined));
+        assert_eq!(a.confidence, 10);
+    }
+
+    #[test]
+    fn analyze_event41_takes_priority_over_1074() {
+        let post = [make_event(41, "Microsoft-Windows-Kernel-Power", &[
+            ("BugcheckCode", "0x9f"),
+            ("BugcheckParameter1", "3"),
+            ("BugcheckParameter2", "0"),
+            ("BugcheckParameter3", "0"),
+            ("BugcheckParameter4", "0"),
+            ("PowerButtonTimestamp", "0"),
+        ])];
+        let pre = [make_event(1074, "User32", &[
+            ("param1", "TiWorker.exe"),
+            ("param3", "SYSTEM"),
+            ("param4", "0x80020002"),
+            ("param5", "restart"),
+            ("param6", ""),
+        ])];
+        let a = analyze_slice(None, &post, &pre);
+        assert!(matches!(a.cause, Cause::BlueScreen { .. }), "Event 41 must win over Event 1074");
+    }
+
+    #[test]
+    fn analyze_6008_without_41_is_lower_confidence_than_41() {
+        let post_with_41 = [make_event(41, "Microsoft-Windows-Kernel-Power", &[
+            ("BugcheckCode", "0"),
+            ("PowerButtonTimestamp", "0"),
+        ])];
+        let post_6008_only = [make_event(6008, "EventLog", &[])];
+        let a_41   = analyze_slice(None, &post_with_41,   &[]);
+        let a_6008 = analyze_slice(None, &post_6008_only, &[]);
+        assert!(a_41.confidence > a_6008.confidence);
+    }
+
+    // ── collect_boot_indices ──────────────────────────────────────────────────
+
+    #[test]
+    fn boot_indices_prefers_kernel_general_provider() {
+        let events = vec![
+            make_event(12, "Microsoft-Windows-Kernel-General", &[]), // idx 0 ✓
+            make_event(41, "Microsoft-Windows-Kernel-Power",   &[]), // idx 1
+            make_event(12, "SomeOtherProvider",                &[]), // idx 2 — not General
+            make_event(12, "Microsoft-Windows-Kernel-General", &[]), // idx 3 ✓
+        ];
+        assert_eq!(collect_boot_indices(&events), vec![0, 3]);
+    }
+
+    #[test]
+    fn boot_indices_falls_back_to_any_event12() {
+        let events = vec![
+            make_event(41, "Kernel-Power",  &[]),
+            make_event(12, "SomeProvider",  &[]), // idx 1
+            make_event(41, "Kernel-Power",  &[]),
+            make_event(12, "OtherProvider", &[]), // idx 3
+        ];
+        assert_eq!(collect_boot_indices(&events), vec![1, 3]);
+    }
+
+    #[test]
+    fn boot_indices_empty_when_no_event12() {
+        let events = vec![make_event(41, "Kernel-Power", &[])];
+        assert!(collect_boot_indices(&events).is_empty());
+    }
+
+    // ── extract_boot_cycles ───────────────────────────────────────────────────
+
+    #[test]
+    fn extract_empty_events_returns_one_undetermined_cycle() {
+        let cycles = extract_boot_cycles(&[], &[], &[], 1);
+        assert_eq!(cycles.len(), 1);
+        assert!(matches!(cycles[0].cause, Cause::Undetermined));
+        assert_eq!(cycles[0].index, 0);
+    }
+
+    #[test]
+    fn extract_limit_restricts_count() {
+        // events: [ev41, Event12, Event13, Event12, Event13] → 2 boot cycles
+        let events = vec![
+            make_event(41, "Kernel-Power", &[("BugcheckCode","0"),("PowerButtonTimestamp","0")]),
+            make_event(12, "Microsoft-Windows-Kernel-General", &[]),
+            make_event(13, "Microsoft-Windows-Kernel-General", &[]),
+            make_event(12, "Microsoft-Windows-Kernel-General", &[]),
+            make_event(13, "Microsoft-Windows-Kernel-General", &[]),
+        ];
+        assert_eq!(extract_boot_cycles(&events, &[], &[], 1).len(), 1);
+        assert_eq!(extract_boot_cycles(&events, &[], &[], 0).len(), 2); // 0 = all
+    }
+
+    #[test]
+    fn extract_bsod_cycle_identified() {
+        // post_boot of cycle 0 = [ev41], pre_boot = [ev13]
+        let events = vec![
+            make_event(41, "Microsoft-Windows-Kernel-Power", &[
+                ("BugcheckCode", "0x9f"),
+                ("BugcheckParameter1", "3"),
+                ("BugcheckParameter2", "0"),
+                ("BugcheckParameter3", "0"),
+                ("BugcheckParameter4", "0"),
+                ("PowerButtonTimestamp", "0"),
+            ]),
+            make_event(12, "Microsoft-Windows-Kernel-General", &[]),
+            make_event(13, "Microsoft-Windows-Kernel-General", &[]),
+        ];
+        let cycles = extract_boot_cycles(&events, &[], &[], 1);
+        assert_eq!(cycles.len(), 1);
+        assert!(matches!(&cycles[0].cause, Cause::BlueScreen { stop_code, .. } if *stop_code == 0x9F));
+    }
+
+    #[test]
+    fn extract_two_boots_assigns_correct_indices() {
+        let events = vec![
+            make_event(12, "Microsoft-Windows-Kernel-General", &[]), // idx 0: current boot
+            make_event(13, "Microsoft-Windows-Kernel-General", &[]), // pre_boot of cycle 0
+            make_event(12, "Microsoft-Windows-Kernel-General", &[]), // idx 2: previous boot
+            make_event(13, "Microsoft-Windows-Kernel-General", &[]), // pre_boot of cycle 1
+        ];
+        let cycles = extract_boot_cycles(&events, &[], &[], 0);
+        assert_eq!(cycles.len(), 2);
+        assert_eq!(cycles[0].index, 0);
+        assert_eq!(cycles[1].index, 1);
+        assert!(matches!(cycles[0].cause, Cause::NormalShutdown));
+        assert!(matches!(cycles[1].cause, Cause::NormalShutdown));
+    }
+}

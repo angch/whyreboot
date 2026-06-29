@@ -80,3 +80,163 @@ pub fn parse_event(xml: &str) -> Option<EventRecord> {
     let data          = xml_data(xml);
     Some(EventRecord { event_id, time_created, provider, data })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Realistic EvtRender output for an Event 41 (unexpected shutdown with BSOD).
+    // BugcheckCode 159 == 0x9F. SelfEmpty tests self-closing element skipping.
+    const EV41_XML: &str = r#"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'>
+ <System>
+  <Provider Name='Microsoft-Windows-Kernel-Power' Guid='{331c3b3a-2005-44c2-ac5e-77220c37d6b4}'/>
+  <EventID>41</EventID>
+  <TimeCreated SystemTime='2026-06-29T10:00:00.000000000Z'/>
+ </System>
+ <EventData>
+  <Data Name='BugcheckCode'>159</Data>
+  <Data Name='BugcheckParameter1'>3</Data>
+  <Data Name='SelfEmpty'/>
+ </EventData>
+</Event>"#;
+
+    // ── xml_attr ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn attr_single_quote() {
+        assert_eq!(
+            xml_attr("<Provider Name='Kernel-Power'>", "Provider", "Name"),
+            Some("Kernel-Power".to_string())
+        );
+    }
+
+    #[test]
+    fn attr_double_quote() {
+        assert_eq!(
+            xml_attr(r#"<TimeCreated SystemTime="2026-06-29T10:00:00Z"/>"#, "TimeCreated", "SystemTime"),
+            Some("2026-06-29T10:00:00Z".to_string())
+        );
+    }
+
+    #[test]
+    fn attr_missing_tag() {
+        assert_eq!(xml_attr("<Provider Name='foo'>", "System", "Name"), None);
+    }
+
+    #[test]
+    fn attr_missing_attr() {
+        assert_eq!(xml_attr("<Provider Name='foo'>", "Provider", "Guid"), None);
+    }
+
+    #[test]
+    fn attr_first_occurrence_only() {
+        // Two Provider tags — only the first is matched.
+        let xml = "<Provider Name='first'/><Provider Name='second'/>";
+        assert_eq!(xml_attr(xml, "Provider", "Name"), Some("first".to_string()));
+    }
+
+    // ── xml_elem ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn elem_basic() {
+        assert_eq!(xml_elem("<EventID>41</EventID>", "EventID"), Some("41".to_string()));
+    }
+
+    #[test]
+    fn elem_trims_whitespace() {
+        assert_eq!(xml_elem("<EventID>  41  </EventID>", "EventID"), Some("41".to_string()));
+    }
+
+    #[test]
+    fn elem_missing() {
+        assert_eq!(xml_elem("<EventID>41</EventID>", "Level"), None);
+    }
+
+    #[test]
+    fn elem_first_occurrence_only() {
+        let xml = "<EventID>41</EventID><EventID>42</EventID>";
+        assert_eq!(xml_elem(xml, "EventID"), Some("41".to_string()));
+    }
+
+    // ── xml_data ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn data_named_fields() {
+        let xml = r#"<Data Name="BugcheckCode">159</Data><Data Name="BugcheckParameter1">3</Data>"#;
+        let m = xml_data(xml);
+        assert_eq!(m.get("BugcheckCode"), Some(&"159".to_string()));
+        assert_eq!(m.get("BugcheckParameter1"), Some(&"3".to_string()));
+    }
+
+    #[test]
+    fn data_anonymous_fields_keyed_sequentially() {
+        let xml = "<Data>first</Data><Data>second</Data>";
+        let m = xml_data(xml);
+        assert_eq!(m.get("_0"), Some(&"first".to_string()));
+        assert_eq!(m.get("_1"), Some(&"second".to_string()));
+    }
+
+    #[test]
+    fn data_self_closing_skipped() {
+        let xml = r#"<Data Name="Empty"/><Data Name="Real">value</Data>"#;
+        let m = xml_data(xml);
+        assert!(!m.contains_key("Empty"));
+        assert_eq!(m.get("Real"), Some(&"value".to_string()));
+    }
+
+    #[test]
+    fn data_empty_input() {
+        assert!(xml_data("").is_empty());
+    }
+
+    #[test]
+    fn data_trims_content_whitespace() {
+        let xml = r#"<Data Name="K">  hello  </Data>"#;
+        let m = xml_data(xml);
+        assert_eq!(m.get("K"), Some(&"hello".to_string()));
+    }
+
+    // ── parse_event ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_event_valid() {
+        let rec = parse_event(EV41_XML).expect("should parse valid event");
+        assert_eq!(rec.event_id, 41);
+        assert_eq!(rec.provider, "Microsoft-Windows-Kernel-Power");
+        assert_eq!(rec.data.get("BugcheckCode"), Some(&"159".to_string()));
+        // Self-closing Data element must be absent.
+        assert!(!rec.data.contains_key("SelfEmpty"));
+    }
+
+    #[test]
+    fn parse_event_missing_event_id() {
+        let xml = r#"<Event><System><TimeCreated SystemTime='2026-06-29T10:00:00Z'/></System></Event>"#;
+        assert!(parse_event(xml).is_none());
+    }
+
+    #[test]
+    fn parse_event_non_numeric_event_id() {
+        let xml = r#"<Event><System><EventID>abc</EventID><TimeCreated SystemTime='2026-06-29T10:00:00Z'/></System></Event>"#;
+        assert!(parse_event(xml).is_none());
+    }
+
+    #[test]
+    fn parse_event_missing_time() {
+        let xml = r#"<Event><System><EventID>12</EventID></System></Event>"#;
+        assert!(parse_event(xml).is_none());
+    }
+
+    #[test]
+    fn parse_event_invalid_time_format() {
+        let xml = r#"<Event><System><EventID>12</EventID><TimeCreated SystemTime='not-a-date'/></System></Event>"#;
+        assert!(parse_event(xml).is_none());
+    }
+
+    #[test]
+    fn parse_event_missing_provider_returns_empty_string() {
+        let xml = r#"<Event><System><EventID>6008</EventID><TimeCreated SystemTime='2026-06-29T10:00:00Z'/></System></Event>"#;
+        let rec = parse_event(xml).expect("should parse without provider");
+        assert_eq!(rec.event_id, 6008);
+        assert_eq!(rec.provider, "");
+    }
+}

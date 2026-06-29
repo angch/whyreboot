@@ -466,3 +466,182 @@ fn cause_json(cause: &Cause) -> (&'static str, String) {
         other => (cause_label(other), String::new()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{AudioPowerInfo, Cause};
+
+    fn audio(allow_idle_d3: Option<u32>) -> AudioPowerInfo {
+        AudioPowerInfo { instance: "0000".into(), name: "Test Audio".into(), allow_idle_d3, enhanced_pm: None }
+    }
+
+    // ── fmt_secs ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn fmt_secs_seconds_range() {
+        assert_eq!(fmt_secs(0),  "0s");
+        assert_eq!(fmt_secs(30), "30s");
+        assert_eq!(fmt_secs(59), "59s");
+    }
+
+    #[test]
+    fn fmt_secs_minutes_range() {
+        assert_eq!(fmt_secs(60),   "1m 00s");
+        assert_eq!(fmt_secs(90),   "1m 30s");
+        assert_eq!(fmt_secs(3599), "59m 59s");
+    }
+
+    #[test]
+    fn fmt_secs_hours_range() {
+        assert_eq!(fmt_secs(3600), "1h 00m");
+        assert_eq!(fmt_secs(3661), "1h 01m");
+        assert_eq!(fmt_secs(7200), "2h 00m");
+    }
+
+    #[test]
+    fn fmt_secs_negative_clamped_to_zero() {
+        assert_eq!(fmt_secs(-100), "0s");
+    }
+
+    // ── cause_label ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn cause_label_all_variants() {
+        let bsod = Cause::BlueScreen { stop_code: 0x9F, stop_name: "X", params: [0;4] };
+        assert!(cause_label(&bsod).contains("BLUE SCREEN"));
+        assert!(cause_label(&Cause::ForcedPowerOff).contains("FORCED"));
+        assert!(cause_label(&Cause::UnexpectedShutdown).contains("UNEXPECTED"));
+        assert!(cause_label(&Cause::WindowsUpdate { process: "x".into() }).contains("WINDOWS UPDATE"));
+        assert!(cause_label(&Cause::UserAction { user: "u".into(), action: "a".into(), comment: "c".into() }).contains("USER"));
+        assert!(cause_label(&Cause::SystemProcess { process: "p".into(), reason: "r".into(), action: "a".into() }).contains("SYSTEM"));
+        assert!(cause_label(&Cause::NormalShutdown).contains("NORMAL"));
+        assert!(cause_label(&Cause::Undetermined).contains("UNDETERMINED"));
+    }
+
+    // ── cause_detail ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn cause_detail_bsod_contains_hex_and_name() {
+        let c = Cause::BlueScreen { stop_code: 0x9F, stop_name: "DRIVER_POWER_STATE_FAILURE", params: [0;4] };
+        let d = cause_detail(&c);
+        assert!(d.contains("0x0000009F"), "should contain zero-padded hex stop code");
+        assert!(d.contains("DRIVER_POWER_STATE_FAILURE"));
+    }
+
+    #[test]
+    fn cause_detail_windows_update_uses_last_path_component() {
+        let c = Cause::WindowsUpdate { process: r"C:\Windows\TiWorker.exe".into() };
+        let d = cause_detail(&c);
+        assert!(d.contains("TiWorker.exe"));
+        assert!(!d.contains(r"C:\Windows\"), "full path should not appear");
+    }
+
+    #[test]
+    fn cause_detail_user_action() {
+        let c = Cause::UserAction { user: "angch".into(), action: "Restart".into(), comment: "".into() };
+        let d = cause_detail(&c);
+        assert!(d.contains("angch") && d.contains("Restart"));
+    }
+
+    #[test]
+    fn cause_detail_system_process() {
+        let c = Cause::SystemProcess { process: "svchost.exe".into(), reason: "r".into(), action: "Shutdown".into() };
+        let d = cause_detail(&c);
+        assert!(d.contains("svchost.exe") && d.contains("Shutdown"));
+    }
+
+    // ── generate_explanation ──────────────────────────────────────────────────
+
+    #[test]
+    fn explanation_non_bsod_returns_empty() {
+        assert!(generate_explanation(&Cause::NormalShutdown, &None, &[]).is_empty());
+        assert!(generate_explanation(&Cause::UnexpectedShutdown, &None, &[]).is_empty());
+        assert!(generate_explanation(&Cause::Undetermined, &None, &[]).is_empty());
+    }
+
+    #[test]
+    fn explanation_unknown_stop_code_returns_empty() {
+        let cause = Cause::BlueScreen { stop_code: 0x50, stop_name: "PAGE_FAULT", params: [0;4] };
+        assert!(generate_explanation(&cause, &None, &[]).is_empty());
+    }
+
+    #[test]
+    fn explanation_0x9f_audio_portcls_suggests_allow_idle_d3() {
+        let cause = Cause::BlueScreen { stop_code: 0x9F, stop_name: "DRIVER_POWER_STATE_FAILURE", params: [3,0,0,0] };
+        let exp = generate_explanation(&cause, &Some("portcls".into()), &[]);
+        assert!(!exp.is_empty());
+        assert!(exp.iter().any(|l| l.contains("AllowIdleIrpInD3")));
+    }
+
+    #[test]
+    fn explanation_0x9f_audio_all_safe_says_ok() {
+        let cause = Cause::BlueScreen { stop_code: 0x9F, stop_name: "DRIVER_POWER_STATE_FAILURE", params: [3,0,0,0] };
+        let devs  = vec![audio(Some(0)), audio(Some(0))];
+        let exp   = generate_explanation(&cause, &Some("portcls".into()), &devs);
+        assert!(exp.iter().any(|l| l.contains("[OK]")), "should acknowledge safe state");
+    }
+
+    #[test]
+    fn explanation_0x9f_audio_partial_safe_mentions_unset() {
+        let cause = Cause::BlueScreen { stop_code: 0x9F, stop_name: "DRIVER_POWER_STATE_FAILURE", params: [3,0,0,0] };
+        let devs  = vec![audio(Some(0)), audio(None)]; // one safe, one unset
+        let exp   = generate_explanation(&cause, &Some("portcls".into()), &devs);
+        // Should mention "Some audio devices still have AllowIdleIrpInD3 unset"
+        assert!(exp.iter().any(|l| l.contains("still have")));
+    }
+
+    #[test]
+    fn explanation_0x9f_usb_module_mentions_usb() {
+        let cause = Cause::BlueScreen { stop_code: 0x9F, stop_name: "DRIVER_POWER_STATE_FAILURE", params: [3,0,0,0] };
+        let exp   = generate_explanation(&cause, &Some("usbccgp".into()), &[]);
+        assert!(exp.iter().any(|l| l.to_lowercase().contains("usb")));
+        assert!(!exp.iter().any(|l| l.contains("AllowIdleIrpInD3")), "USB path should not mention D3");
+    }
+
+    #[test]
+    fn explanation_0x9f_other_driver_generic_advice() {
+        let cause = Cause::BlueScreen { stop_code: 0x9F, stop_name: "DRIVER_POWER_STATE_FAILURE", params: [3,0,0,0] };
+        let exp   = generate_explanation(&cause, &Some("somedrv".into()), &[]);
+        assert!(exp.iter().any(|l| l.contains("somedrv")));
+    }
+
+    #[test]
+    fn explanation_0x19c_mentions_gpu_or_display() {
+        let cause = Cause::BlueScreen { stop_code: 0x19C, stop_name: "WIN32K_POWER_WATCHDOG_TIMEOUT", params: [0;4] };
+        let exp   = generate_explanation(&cause, &Some("dxgkrnl".into()), &[]);
+        assert!(!exp.is_empty());
+        assert!(exp.iter().any(|l| l.contains("GPU") || l.to_lowercase().contains("display") || l.contains("watchdog")));
+    }
+
+    #[test]
+    fn explanation_0xfe_is_usb_bugcheck() {
+        let cause = Cause::BlueScreen { stop_code: 0xFE, stop_name: "BUGCODE_USB_DRIVER", params: [0;4] };
+        let exp   = generate_explanation(&cause, &None, &[]);
+        assert!(exp.iter().any(|l| l.to_lowercase().contains("usb")));
+    }
+
+    #[test]
+    fn explanation_0x144_is_usb3_bugcheck() {
+        let cause = Cause::BlueScreen { stop_code: 0x144, stop_name: "BUGCODE_USB3_DRIVER", params: [0;4] };
+        let exp   = generate_explanation(&cause, &None, &[]);
+        assert!(exp.iter().any(|l| l.to_lowercase().contains("usb")));
+    }
+
+    // ── json_str ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn json_str_escapes_backslash_and_quote() {
+        assert_eq!(super::json_str(r#"C:\path"quoted""#), r#""C:\\path\"quoted\"""#);
+    }
+
+    #[test]
+    fn json_str_escapes_newline_and_tab() {
+        assert_eq!(super::json_str("a\nb\tc"), r#""a\nb\tc""#);
+    }
+
+    #[test]
+    fn json_str_plain_string() {
+        assert_eq!(super::json_str("hello"), r#""hello""#);
+    }
+}
