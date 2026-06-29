@@ -1,3 +1,5 @@
+//! Boot cycle analysis: stop code tables, event classification, and WER/minidump annotation.
+
 use chrono::{DateTime, Duration, Local};
 use std::path::PathBuf;
 use crate::types::{BootCycle, Cause, EventRecord, WerRecord};
@@ -77,6 +79,7 @@ const STOP_CODES: &[(u64, &str)] = &[
     (0xC0000142, "STATUS_DLL_INIT_FAILED"),
 ];
 
+/// Returns the symbolic name for a bugcheck stop code, or `"(unknown)"`.
 pub fn stop_name(code: u64) -> &'static str {
     STOP_CODES
         .iter()
@@ -112,6 +115,8 @@ const REASON_CODES: &[(&str, &str)] = &[
     ("00050003", "Legacy API shutdown"),
 ];
 
+/// Looks up an Event 1074 reason code (accepts `0x` prefix, uppercase, short forms).
+/// Returns `None` for codes not in the table.
 pub fn decode_reason(code: &str) -> Option<&'static str> {
     let padded = format!(
         "{:0>8}",
@@ -123,6 +128,8 @@ pub fn decode_reason(code: &str) -> Option<&'static str> {
         .map(|&(_, d)| d)
 }
 
+/// Parses a u64 from a decimal or `0x`-prefixed hex string.
+/// Falls back to hex if the string contains a–f without a prefix.
 pub fn hex_u64(s: &str) -> Option<u64> {
     let s = s.trim();
     if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
@@ -134,6 +141,11 @@ pub fn hex_u64(s: &str) -> Option<u64> {
     }
 }
 
+/// Extracts the faulting module name from a WER fault bucket string.
+/// Three patterns tried in order:
+/// 1. `module!function` — take the token before `!` (after last `_`)
+/// 2. `_IMAGE_module.sys` — take the token after `_image_`
+/// 3. Any `_`-delimited token ending in `.sys`, `.exe`, or `.dll`
 pub fn module_from_bucket(bucket: &str) -> Option<String> {
     let lower = bucket.to_lowercase();
     if let Some(bang) = bucket.find('!') {
@@ -159,6 +171,7 @@ pub fn module_from_bucket(bucket: &str) -> Option<String> {
 
 // ── Analysis result ───────────────────────────────────────────────────────────
 
+/// Intermediate result from `analyze_slice`, before WER/minidump annotation.
 pub struct CycleAnalysis {
     pub cause:         Cause,
     pub confidence:    u8,
@@ -169,6 +182,8 @@ pub struct CycleAnalysis {
 
 // ── Event classifiers ─────────────────────────────────────────────────────────
 
+/// Builds the evidence bullet list for a BSOD. For stop code 0x9F,
+/// adds a human-readable decode of Parameter 1 (the failure mode).
 fn bsod_evidence(stop_code: u64, params: [u64; 4]) -> Vec<String> {
     let mut ev = vec![format!("BSOD stop code: 0x{:08X} — {}", stop_code, stop_name(stop_code))];
     if stop_code == 0x9F {
@@ -191,6 +206,9 @@ fn bsod_evidence(stop_code: u64, params: [u64; 4]) -> Vec<String> {
     ev
 }
 
+/// Classifies an Event 41 (Kernel-Power: unexpected shutdown) into BlueScreen,
+/// ForcedPowerOff, or UnexpectedShutdown based on `BugcheckCode` and `PowerButtonTimestamp`.
+/// `unexpected_flag` is true if Event 6008 also appears in the same `post_boot` slice.
 fn classify_event41(ev: &EventRecord, unexpected_flag: bool) -> (Cause, u8, Vec<String>) {
     let stop_code = ev.data.get("BugcheckCode").and_then(|s| hex_u64(s)).unwrap_or(0);
     let params = [
@@ -221,7 +239,9 @@ fn classify_event41(ev: &EventRecord, unexpected_flag: bool) -> (Cause, u8, Vec<
     }
 }
 
-// Returns (cause, confidence, evidence, timeline_message).
+/// Classifies an Event 1074 (process-initiated shutdown) into WindowsUpdate,
+/// SystemProcess, or UserAction based on process name, user, and reason code.
+/// Returns `(cause, confidence, evidence, timeline_message)`.
 fn classify_event1074(ev: &EventRecord) -> (Cause, u8, Vec<String>, String) {
     let process     = ev.data.get("param1").cloned().unwrap_or_default();
     let user        = ev.data.get("param3").cloned().unwrap_or_default();
@@ -270,6 +290,10 @@ fn classify_event1074(ev: &EventRecord) -> (Cause, u8, Vec<String>, String) {
 
 // ── Core analysis ─────────────────────────────────────────────────────────────
 
+/// Applies the priority-ordered decision tree to classify one boot cycle.
+/// `post_boot` contains events logged at the recovery boot about the prior session
+/// (e.g. Event 41, 6008). `pre_boot` contains events logged during the prior session
+/// (e.g. Event 1074, 13, 6006). See `HowItWorks.md` for the full decision tree.
 pub fn analyze_slice(
     boot_time: Option<DateTime<Local>>,
     post_boot: &[EventRecord],
@@ -325,6 +349,9 @@ pub fn analyze_slice(
 
 // ── Boot cycle extraction ─────────────────────────────────────────────────────
 
+/// Returns indices of all Event 12 entries in the (newest-first) event list.
+/// Prefers events from the `Microsoft-Windows-Kernel-General` provider; falls back
+/// to any Event 12 if none found from that provider.
 pub fn collect_boot_indices(events: &[EventRecord]) -> Vec<usize> {
     let general: Vec<usize> = events
         .iter()
@@ -341,6 +368,10 @@ pub fn collect_boot_indices(events: &[EventRecord]) -> Vec<usize> {
         .collect()
 }
 
+/// Slices the flat event list into per-boot cycles and classifies each one.
+/// `limit` is the number of most-recent cycles to return (0 = all).
+/// Falls back to treating the entire event set as a single cycle if no Event 12 is found.
+/// After initial classification, annotates each cycle with WER module and minidump data.
 pub fn extract_boot_cycles(
     events: &[EventRecord],
     wer:    &[WerRecord],
@@ -398,6 +429,7 @@ pub fn extract_boot_cycles(
     cycles
 }
 
+/// Runs both annotation passes (minidumps then WER module) over all cycles.
 fn annotate_with_wer_and_dumps(
     cycles: &mut Vec<BootCycle>,
     wer:    &[WerRecord],
@@ -415,6 +447,9 @@ fn annotate_with_wer_and_dumps(
     }
 }
 
+/// Matches filesystem minidumps to this cycle by modification time.
+/// The window is `[session_start, boot_time + 10 min]`; the upper bound
+/// accommodates WER processing delay after the recovery boot.
 fn annotate_minidumps(
     cycle:         &mut BootCycle,
     boot_time:     Option<DateTime<Local>>,
@@ -432,6 +467,10 @@ fn annotate_minidumps(
         .collect();
 }
 
+/// Matches a WER record to this cycle's BSOD by stop code and time window.
+/// WER runs during the recovery boot, so the window is `[boot_time, wer_end]`
+/// where `wer_end` is the start of the next boot (or now for the most recent cycle).
+/// Also fills `minidumps` from `WerRecord.minidump_path` if the filesystem scan found nothing.
 fn annotate_wer_module(
     cycle:     &mut BootCycle,
     boot_time: Option<DateTime<Local>>,

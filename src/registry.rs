@@ -1,5 +1,14 @@
+//! Windows registry helpers and audio device power settings check.
+//!
+//! The audio device class GUID `{4d36e96c-e325-11ce-bfc1-08002be10318}` is a fixed
+//! Microsoft-assigned identifier for "Sound, video and game controllers" (the Media
+//! device class). It has been stable since Windows 98 and covers all audio devices:
+//! HD Audio, USB audio, Bluetooth audio, etc.
+
 use crate::types::AudioPowerInfo;
 
+/// Reads a `REG_DWORD` value from an open registry key. Returns `None` if the
+/// value is absent, the wrong type, or the query fails.
 fn reg_read_dword(hk: windows::Win32::System::Registry::HKEY, name: &str) -> Option<u32> {
     use windows::Win32::System::Registry::{RegQueryValueExW, REG_VALUE_TYPE};
     let w: Vec<u16> = name.encode_utf16().chain([0]).collect();
@@ -21,6 +30,8 @@ fn reg_read_dword(hk: windows::Win32::System::Registry::HKEY, name: &str) -> Opt
     if ok && tp.0 == 4 { Some(val) } else { None }
 }
 
+/// Reads a `REG_SZ` or `REG_EXPAND_SZ` value from an open registry key.
+/// Uses a two-pass query: size probe then read. Returns `None` if absent or empty.
 fn reg_read_string(hk: windows::Win32::System::Registry::HKEY, name: &str) -> Option<String> {
     use windows::Win32::System::Registry::{RegQueryValueExW, REG_VALUE_TYPE};
     let w: Vec<u16> = name.encode_utf16().chain([0]).collect();
@@ -62,6 +73,10 @@ fn reg_read_string(hk: windows::Win32::System::Registry::HKEY, name: &str) -> Op
     }
 }
 
+/// Reads power management registry values for all audio class instances (0000–0020).
+/// Skips entries that have neither `DriverDesc` nor `FriendlyName` (not real devices).
+/// Returns one `AudioPowerInfo` per found instance with `AllowIdleIrpInD3` and
+/// `EnhancedPowerManagementEnabled` values (`None` = registry value absent).
 pub fn check_audio_power_settings() -> Vec<AudioPowerInfo> {
     use windows::Win32::System::Registry::{
         RegOpenKeyExW, RegCloseKey, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,

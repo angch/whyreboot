@@ -1,3 +1,5 @@
+//! Windows Event Log fetching: System channel, WER (Application channel), and minidump listing.
+
 use std::ffi::c_void;
 use std::path::PathBuf;
 use chrono::{DateTime, Local};
@@ -5,6 +7,9 @@ use windows::Win32::System::EventLog::*;
 use crate::types::{EventRecord, WerRecord};
 use crate::xml::parse_event;
 
+/// Generic `EvtQuery` wrapper. Returns up to `limit` parsed events from the given
+/// `channel` using the provided XPath `query_str`, newest first
+/// (`EvtQueryReverseDirection`). Silently returns empty on query failure.
 pub fn fetch_channel(channel: &[u16], query_str: &[u16], limit: usize) -> Vec<EventRecord> {
     let mut records = Vec::new();
     unsafe {
@@ -61,6 +66,11 @@ pub fn fetch_channel(channel: &[u16], query_str: &[u16], limit: usize) -> Vec<Ev
     records
 }
 
+/// Fetches up to 300 shutdown/boot-related events from the System log.
+/// Covers Event IDs: 12 (boot), 13 (shutdown), 41 (unexpected shutdown),
+/// 109 (power button), 1074 (process-initiated shutdown), 1076 (shutdown reason),
+/// 6006 (log stopped cleanly), 6008 (previous shutdown unexpected), 6009 (version),
+/// 6013 (uptime).
 pub fn fetch_system_events() -> Vec<EventRecord> {
     let ch: Vec<u16> = "System\0".encode_utf16().collect();
     let q: Vec<u16> =
@@ -72,6 +82,11 @@ pub fn fetch_system_events() -> Vec<EventRecord> {
     fetch_channel(&ch, &q, 300)
 }
 
+/// Fetches WER BugCheck records from the Application log (Event 1001).
+/// Filters to records where the provider name contains "error reporting" or "wer"
+/// and `EventName` is `"BlueScreen"` or `"BugCheck"` (both accepted defensively).
+/// Parses `P1` as bare hex (no `0x` prefix) for the stop code.
+/// Falls back through `Bucket` → `BucketId` → `HashedBucket` → `_0` for the bucket field.
 pub fn fetch_wer_events() -> Vec<WerRecord> {
     let ch: Vec<u16> = "Application\0".encode_utf16().collect();
     let q: Vec<u16>  = "*[System[EventID=1001]]\0".encode_utf16().collect();
@@ -113,6 +128,8 @@ pub fn fetch_wer_events() -> Vec<WerRecord> {
         .collect()
 }
 
+/// Lists `*.dmp` files in `%SystemRoot%\Minidump`, sorted newest first.
+/// Returns an empty vec if the directory cannot be read (no admin rights, or dir absent).
 pub fn list_minidumps() -> Vec<(DateTime<Local>, PathBuf)> {
     let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
     let dir = PathBuf::from(sysroot).join("Minidump");

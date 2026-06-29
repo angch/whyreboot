@@ -14,12 +14,14 @@ use analysis::extract_boot_cycles;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
+/// Parsed command-line options.
 struct Args {
     history: usize,
     json:    bool,
     color:   bool,
 }
 
+/// Parses `std::env::args` into `Args`. Unknown flags are silently ignored.
 fn parse_args() -> Args {
     let mut args = Args { history: 1, json: false, color: true };
     let argv: Vec<String> = std::env::args().skip(1).collect();

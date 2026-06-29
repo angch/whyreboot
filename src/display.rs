@@ -1,9 +1,12 @@
+//! Text and JSON output for boot cycles, including explanations and remediation advice.
+
 use chrono::Local;
 use crate::color::Pal;
 use crate::types::{AudioPowerInfo, BootCycle, Cause, EventRecord};
 
 // ── Cause labelling ───────────────────────────────────────────────────────────
 
+/// Short all-caps label for the verdict line, e.g. `"BLUE SCREEN OF DEATH (BSOD)"`.
 pub fn cause_label(cause: &Cause) -> &'static str {
     match cause {
         Cause::BlueScreen { .. }    => "BLUE SCREEN OF DEATH (BSOD)",
@@ -17,6 +20,7 @@ pub fn cause_label(cause: &Cause) -> &'static str {
     }
 }
 
+/// One-line detail sentence printed under the verdict, e.g. stop code and name for BSODs.
 pub fn cause_detail(cause: &Cause) -> String {
     match cause {
         Cause::BlueScreen { stop_code, stop_name, .. } =>
@@ -38,6 +42,7 @@ pub fn cause_detail(cause: &Cause) -> String {
     }
 }
 
+/// Maps a cause to the appropriate palette color (crash=red, undetermined=yellow, else=green).
 fn cause_color<'p>(cause: &Cause, pal: &'p Pal) -> &'p str {
     match cause {
         Cause::BlueScreen { .. } | Cause::ForcedPowerOff | Cause::UnexpectedShutdown => pal.crash,
@@ -48,6 +53,7 @@ fn cause_color<'p>(cause: &Cause, pal: &'p Pal) -> &'p str {
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
 
+/// Formats a duration in seconds as `Xs`, `Xm YYs`, or `Xh YYm`.
 pub fn fmt_secs(s: i64) -> String {
     let s = s.max(0);
     if s < 60        { format!("{}s", s) }
@@ -55,10 +61,12 @@ pub fn fmt_secs(s: i64) -> String {
     else             { format!("{}h {:02}m", s / 3600, (s % 3600) / 60) }
 }
 
+/// Returns the last `-`-delimited component of a provider name for compact table display.
 fn short_provider(p: &str) -> &str {
     p.rfind('-').map(|i| &p[i + 1..]).unwrap_or(p)
 }
 
+/// Short human-readable summary for a raw event row in the event table.
 fn event_summary(ev: &EventRecord) -> String {
     let d = &ev.data;
     match ev.event_id {
@@ -89,6 +97,10 @@ fn event_summary(ev: &EventRecord) -> String {
 
 // ── Explanation ───────────────────────────────────────────────────────────────
 
+/// Generates plain-English diagnosis and numbered remediation steps for known BSOD patterns.
+/// Returns an empty vec for non-BSOD causes or stop codes without a known handler.
+/// Dispatches by stop code: 0x9F → driver power failure, 0x19C → Win32k watchdog,
+/// 0xFE / 0x144 → USB driver bugcheck.
 pub fn generate_explanation(
     cause:  &Cause,
     module: &Option<String>,
@@ -113,6 +125,8 @@ pub fn generate_explanation(
     out
 }
 
+/// Explanation handler for stop code 0x9F (DRIVER_POWER_STATE_FAILURE).
+/// Branches on whether the faulting module is audio, USB, or other.
 fn explain_driver_power_failure(
     module: &Option<String>,
     p1:     u64,
@@ -153,6 +167,8 @@ fn explain_driver_power_failure(
     }
 }
 
+/// Adds audio-specific remediation steps, incorporating the actual registry state.
+/// If all devices already have `AllowIdleIrpInD3=0`, pivots to "update driver/BIOS".
 fn explain_audio_fix(audio: &[AudioPowerInfo], out: &mut Vec<String>) {
     let all_safe = !audio.is_empty() && audio.iter().all(|d| d.allow_idle_d3 == Some(0));
 
@@ -181,6 +197,8 @@ fn explain_audio_fix(audio: &[AudioPowerInfo], out: &mut Vec<String>) {
     out.push("     can manifest as portcls stalls.".into());
 }
 
+/// Explanation handler for stop code 0x19C (WIN32K_POWER_WATCHDOG_TIMEOUT).
+/// Typically a GPU driver failing to wake during a power transition.
 fn explain_win32k_power_watchdog(module: &Option<String>, out: &mut Vec<String>) {
     let m = module.as_deref().unwrap_or("(unknown driver)");
     out.push("WIN32K_POWER_WATCHDOG_TIMEOUT: the display subsystem failed to respond".into());
@@ -199,6 +217,9 @@ fn explain_win32k_power_watchdog(module: &Option<String>, out: &mut Vec<String>)
 
 // ── Cycle printing ────────────────────────────────────────────────────────────
 
+/// Prints all sections for one boot cycle to stdout in order:
+/// header → boot times → verdict → evidence → timeline → minidumps →
+/// device power settings → explanation → event table.
 pub fn print_cycle(cycle: &BootCycle, pal: &Pal, total: usize, audio: &[AudioPowerInfo]) {
     let w     = 74usize;
     let line  = "─".repeat(w);
@@ -216,6 +237,7 @@ pub fn print_cycle(cycle: &BootCycle, pal: &Pal, total: usize, audio: &[AudioPow
     print_event_table(cycle, &line);
 }
 
+/// Prints the cycle separator line with centered "Boot Cycle N of M" label.
 fn print_cycle_header(cycle: &BootCycle, pal: &Pal, total: usize, dline: &str) {
     let w = 74usize;
     if total > 1 {
@@ -299,6 +321,8 @@ fn print_minidumps(cycle: &BootCycle, pal: &Pal) {
     }
 }
 
+/// Prints audio class registry power state — only for power-related BSODs
+/// where the faulting module is audio-related (`portcls`, `audio`, `hdaud`).
 fn print_device_power(cycle: &BootCycle, pal: &Pal, audio: &[AudioPowerInfo]) {
     let module_low = cycle.wer_module.as_deref().unwrap_or("").to_lowercase();
     let is_power_crash = matches!(&cycle.cause, Cause::BlueScreen { stop_code, .. }
@@ -350,6 +374,7 @@ fn print_event_table(cycle: &BootCycle, line: &str) {
 
 // ── JSON output ───────────────────────────────────────────────────────────────
 
+/// Escapes a string for JSON output (backslash, quote, newlines, tabs).
 fn json_str(s: &str) -> String {
     format!("\"{}\"",
         s.replace('\\', "\\\\")
@@ -359,6 +384,7 @@ fn json_str(s: &str) -> String {
          .replace('\t', "\\t"))
 }
 
+/// Outputs all boot cycles as hand-built JSON to stdout (no serde dependency).
 pub fn print_json(cycles: &[BootCycle]) {
     let now = Local::now().to_rfc3339();
     println!("{{");
@@ -407,6 +433,8 @@ pub fn print_json(cycles: &[BootCycle]) {
     println!("}}");
 }
 
+/// Returns `(kind_string, extra_json_fields)` for a `Cause` variant.
+/// `extra_json_fields` is a fragment of pre-formatted JSON (with trailing comma).
 fn cause_json(cause: &Cause) -> (&'static str, String) {
     match cause {
         Cause::BlueScreen { stop_code, stop_name, params } => (
