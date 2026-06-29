@@ -47,7 +47,8 @@ fn reg_read_string(hk: windows::Win32::System::Registry::HKEY, name: &str) -> Op
             Some(&mut sz),
         );
     }
-    if sz < 2 { return None; }
+    // sz=2 is just a null terminator (empty string); skip that too.
+    if sz <= 2 { return None; }
     let mut buf = vec![0u8; sz as usize + 2];
     let ok = unsafe {
         RegQueryValueExW(

@@ -49,7 +49,15 @@ pub fn fetch_channel(channel: &[u16], query_str: &[u16], limit: usize) -> Vec<Ev
                     )
                     .is_ok()
                     {
-                        let xml = String::from_utf16_lossy(&buf[..needed as usize / 2]);
+                        // `needed` is the byte count including the UTF-16 null
+                        // terminator; strip it so the resulting String is clean.
+                        let char_count = needed as usize / 2;
+                        let end = if char_count > 0 && buf.get(char_count - 1) == Some(&0) {
+                            char_count - 1
+                        } else {
+                            char_count
+                        };
+                        let xml = String::from_utf16_lossy(&buf[..end]);
                         if let Some(rec) = parse_event(&xml) {
                             records.push(rec);
                         }

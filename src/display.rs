@@ -273,9 +273,13 @@ fn print_boot_times(cycle: &BootCycle, pal: &Pal) {
 
     if let (Some(sd), Some(bt)) = (cycle.shutdown_time, cycle.boot_time) {
         let offline = bt.signed_duration_since(sd).num_seconds();
-        println!("  {}Offline:{}   {} → {}  ({})",
-            pal.bold, pal.reset,
-            sd.format("%H:%M:%S"), bt.format("%H:%M:%S"), fmt_secs(offline));
+        // Skip the line if offline is negative (clock skew or event timestamp anomaly)
+        // rather than showing a misleading "0s".
+        if offline >= 0 {
+            println!("  {}Offline:{}   {} → {}  ({})",
+                pal.bold, pal.reset,
+                sd.format("%H:%M:%S"), bt.format("%H:%M:%S"), fmt_secs(offline));
+        }
     }
 }
 
@@ -303,11 +307,12 @@ fn print_evidence(cycle: &BootCycle, pal: &Pal) {
 
 fn print_timeline(cycle: &BootCycle, pal: &Pal) {
     if cycle.timeline.len() <= 1 { return; }
-    let mut tl = cycle.timeline.clone();
-    tl.sort_by_key(|(t, _)| *t);
+    let mut idxs: Vec<usize> = (0..cycle.timeline.len()).collect();
+    idxs.sort_by_key(|&i| cycle.timeline[i].0);
     println!();
     println!("  {}Timeline:{}", pal.bold, pal.reset);
-    for (t, msg) in &tl {
+    for i in idxs {
+        let (t, msg) = &cycle.timeline[i];
         println!("    {}{}{}  {}", pal.dim, t.format("%Y-%m-%d %H:%M:%S"), pal.reset, msg);
     }
 }

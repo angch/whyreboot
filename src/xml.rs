@@ -9,20 +9,31 @@ use crate::types::EventRecord;
 
 /// Extracts an attribute value from the first occurrence of `<tag … attr='…'>`.
 /// Handles both single- and double-quoted attribute values.
+/// Requires the character immediately after the tag name to be a word boundary
+/// (space, `>`, `/`) to avoid matching longer tag names such as `<DataObject>`
+/// when searching for `<Data>`.
 pub fn xml_attr(xml: &str, tag: &str, attr: &str) -> Option<String> {
-    let start = xml.find(&format!("<{}", tag))?;
-    let region_end = xml[start..].find('>')?;
-    let region = &xml[start..start + region_end];
-    for (open, close) in [("='", '\''), ("=\"", '"')] {
-        let search = format!("{}{}", attr, open);
-        if let Some(pos) = region.find(&search) {
-            let vs = pos + search.len();
-            if let Some(ve) = region[vs..].find(close) {
-                return Some(region[vs..vs + ve].to_string());
+    let tag_prefix = format!("<{}", tag);
+    let mut from = 0;
+    loop {
+        let start = xml[from..].find(&tag_prefix).map(|i| from + i)?;
+        let after = start + tag_prefix.len();
+        if xml[after..].starts_with(|c: char| c == '>' || c == '/' || c.is_ascii_whitespace()) {
+            let region_end = xml[start..].find('>')?;
+            let region = &xml[start..start + region_end];
+            for (open, close) in [("='", '\''), ("=\"", '"')] {
+                let search = format!("{}{}", attr, open);
+                if let Some(pos) = region.find(&search) {
+                    let vs = pos + search.len();
+                    if let Some(ve) = region[vs..].find(close) {
+                        return Some(region[vs..vs + ve].to_string());
+                    }
+                }
             }
+            return None;
         }
+        from = start + 1;
     }
-    None
 }
 
 /// Extracts the trimmed text content of `<tag>…</tag>` (first occurrence only).
@@ -44,9 +55,14 @@ pub fn xml_data(xml: &str) -> HashMap<String, String> {
     while let Some(rel) = xml[cursor..].find("<Data") {
         let abs  = cursor + rel;
         let rest = &xml[abs..];
+        // Guard against matching <DataSomethingElse> when we want only <Data …>.
+        if !rest[5..].starts_with(|c: char| c == '>' || c == '/' || c.is_ascii_whitespace()) {
+            cursor = abs + 1;
+            continue;
+        }
         let name = xml_attr(rest, "Data", "Name");
         if let Some(gt) = rest.find('>') {
-            if rest.get(gt.saturating_sub(1)..gt) == Some("/") {
+            if rest[..gt].ends_with('/') {
                 cursor = abs + gt + 1;
                 continue;
             }
@@ -135,6 +151,13 @@ mod tests {
         assert_eq!(xml_attr(xml, "Provider", "Name"), Some("first".to_string()));
     }
 
+    #[test]
+    fn attr_skips_longer_tag_name() {
+        // <SystemTime> must not be matched when searching for <System>.
+        let xml = r#"<SystemTime attr='wrong'/><System Name='right'/>"#;
+        assert_eq!(xml_attr(xml, "System", "Name"), Some("right".to_string()));
+    }
+
     // ── xml_elem ─────────────────────────────────────────────────────────────
 
     #[test]
@@ -194,6 +217,15 @@ mod tests {
         let xml = r#"<Data Name="K">  hello  </Data>"#;
         let m = xml_data(xml);
         assert_eq!(m.get("K"), Some(&"hello".to_string()));
+    }
+
+    #[test]
+    fn data_skips_longer_tag_name() {
+        // <DataProvider> must not be matched as <Data>.
+        let xml = r#"<DataProvider Name="wrong"/><Data Name="right">val</Data>"#;
+        let m = xml_data(xml);
+        assert!(!m.contains_key("wrong"), "longer tag name must not be matched");
+        assert_eq!(m.get("right"), Some(&"val".to_string()));
     }
 
     // ── parse_event ───────────────────────────────────────────────────────────

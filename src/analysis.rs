@@ -120,7 +120,7 @@ const REASON_CODES: &[(&str, &str)] = &[
 pub fn decode_reason(code: &str) -> Option<&'static str> {
     let padded = format!(
         "{:0>8}",
-        code.trim().trim_start_matches("0x").trim_start_matches("0X").to_lowercase()
+        code.trim().to_lowercase().trim_start_matches("0x")
     );
     REASON_CODES
         .iter()
@@ -269,13 +269,17 @@ fn classify_event1074(ev: &EventRecord) -> (Cause, u8, Vec<String>, String) {
     let timeline_msg = format!("{} initiated by {} (Event 1074)", action, process);
 
     let pl        = process.to_lowercase();
+    // Normalize the reason code to bare hex (strip "0x"/"0X" if present) before
+    // comparing, since Event 1074 param4 may arrive with or without the prefix.
+    let rc_norm = reason_code.trim().to_lowercase();
+    let rc_norm = rc_norm.trim_start_matches("0x");
     let is_update = pl.contains("tiworker")
         || pl.contains("trustedinstaller")
         || pl.contains("wuauclt")
         || pl.contains("windowsupdate")
-        || reason_code.trim().eq_ignore_ascii_case("0x80020002");
-    let is_system = user.to_lowercase().contains("system")
-        || user.to_lowercase().contains("authority");
+        || rc_norm == "80020002";
+    let ul = user.to_lowercase();
+    let is_system = ul.contains("system") || ul.contains("authority");
 
     let (cause, confidence) = if is_update {
         (Cause::WindowsUpdate { process }, 92)
@@ -305,9 +309,11 @@ pub fn analyze_slice(
     let e13             = pre_boot.iter().find(|e| e.event_id == 13);
     let e6006           = pre_boot.iter().find(|e| e.event_id == 6006);
 
-    let shutdown_time = (e41.is_none())
-        .then(|| e1074.or(e13).or(e6006).map(|e| e.time_created))
-        .flatten();
+    let shutdown_time = if e41.is_none() {
+        e1074.or(e13).or(e6006).map(|e| e.time_created)
+    } else {
+        None
+    };
 
     let mut timeline = Vec::new();
     if let Some(bt) = boot_time {
@@ -743,6 +749,20 @@ mod tests {
             ("param1", "SomeProcess.exe"),
             ("param3", r"DOMAIN\user"),
             ("param4", "0x80020002"),
+            ("param5", "restart"),
+            ("param6", ""),
+        ]);
+        let (cause, _, _, _) = classify_event1074(&ev);
+        assert!(matches!(cause, Cause::WindowsUpdate { .. }));
+    }
+
+    #[test]
+    fn ev1074_reason_code_without_0x_prefix_triggers_update() {
+        // param4 "80020002" (no 0x prefix) must still classify as WindowsUpdate.
+        let ev = make_event(1074, "User32", &[
+            ("param1", "SomeProcess.exe"),
+            ("param3", r"DOMAIN\user"),
+            ("param4", "80020002"),
             ("param5", "restart"),
             ("param6", ""),
         ]);

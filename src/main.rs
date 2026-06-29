@@ -34,7 +34,7 @@ fn parse_args() -> Args {
             "--help" | "-h" => print_help(),
             "--history" => {
                 i += 1;
-                if let Some(n) = argv.get(i).and_then(|s| s.parse().ok()) {
+                if let Some(n) = argv.get(i).and_then(|s| s.parse::<usize>().ok()) {
                     args.history = n;
                 }
             }
