@@ -1,245 +1,244 @@
 # How whyreboot Works
 
-This document traces how the tool goes from raw Windows Event Log data to a diagnosis. Keep it in sync with the source when logic changes.
+whyreboot turns raw Windows Event Log entries into a plain-English verdict. This document walks through each step of that pipeline. Keep it in sync with the source when logic changes.
 
 ---
 
-## Overview
-
-Every time Windows shuts down or crashes, it writes structured records to the Windows Event Log. whyreboot reads those records, identifies boot boundaries, groups events into per-boot cycles, and classifies each cycle's shutdown cause by applying a priority-ordered decision tree.
+## The pipeline at a glance
 
 ```
-Windows Event Log (System channel)
-  └─ fetch_system_events()  →  Vec<EventRecord>   (newest-first)
-Windows Error Reporting (Application channel)
-  └─ fetch_wer_events()     →  Vec<WerRecord>      (crash detail + faulting driver)
-C:\Windows\Minidump\
-  └─ list_minidumps()       →  Vec<(time, path)>
-HKLM registry (audio class)
-  └─ check_audio_power_settings() → Vec<AudioPowerInfo>
-           │
-           ▼
-    extract_boot_cycles()
-           │
-     ┌─────┴──────┐
-     │ per cycle  │
-     │ analyze_   │
-     │ slice()    │
-     └────────────┘
-           │
-    print_cycle() / print_json()
+ Windows Event Log (System)      ──► fetch_system_events()
+ Windows Error Reporting (App)   ──► fetch_wer_events()
+ C:\Windows\Minidump\            ──► list_minidumps()
+ Registry (audio class)          ──► check_audio_power_settings()
+                                              │
+                                              ▼
+                                    extract_boot_cycles()
+                                    ┌─────────────────────┐
+                                    │  for each cycle:    │
+                                    │  analyze_slice()    │
+                                    │  annotate WER       │
+                                    │  annotate dumps     │
+                                    └─────────────────────┘
+                                              │
+                                              ▼
+                                    print_cycle() / print_json()
 ```
 
 ---
 
-## Step 1 — Fetching events
+## Step 1 — Fetch events
 
-### System channel (`src/events.rs: fetch_system_events`)
+### System log (`fetch_system_events`)
 
-Uses the Win32 `EvtQuery` API with `EvtQueryReverseDirection` so events arrive **newest first** (index 0 = most recent). Fetches up to 300 events matching these IDs from the `System` log:
+Calls `EvtQuery` with `EvtQueryReverseDirection` so events arrive **newest first** (index 0 = most recent). Pulls up to 300 events matching these IDs:
 
-| Event ID | Provider | Meaning |
+| ID | Provider | What it means |
 |---|---|---|
-| 12 | Microsoft-Windows-Kernel-General | System started — logged at every boot |
-| 13 | Microsoft-Windows-Kernel-General | OS shutdown initiated — logged during orderly shutdown |
-| 41 | Microsoft-Windows-Kernel-Power | Unexpected shutdown — logged at the *next* boot to report the previous session |
-| 109 | Microsoft-Windows-Kernel-Power | Power button state transition |
+| 12 | Kernel-General | System started — one per boot |
+| 13 | Kernel-General | OS shutdown initiated |
+| 41 | Kernel-Power | Unexpected shutdown — written at the *next* boot |
+| 109 | Kernel-Power | Power button state transition |
 | 1074 | User32 | Process-initiated shutdown or restart |
-| 1076 | User32 | Shutdown reason documented by user |
-| 6006 | EventLog | Event log service stopped cleanly |
-| 6008 | EventLog | Event log reports previous shutdown was unexpected |
-| 6009 | EventLog | Windows version recorded at startup |
+| 1076 | User32 | Shutdown reason documented |
+| 6006 | EventLog | Event log stopped cleanly |
+| 6008 | EventLog | Previous shutdown was unexpected |
+| 6009 | EventLog | Windows version at startup |
 | 6013 | EventLog | System uptime in seconds |
 
-### Application channel (`src/events.rs: fetch_wer_events`)
+> **Important timing note:** Event 41 and Event 6008 are *retrospective* — Windows logs them at the start of the recovery boot to describe what happened in the *previous* session. Events 1074, 13, and 6006 are *prospective* — logged during the shutdown itself.
 
-Queries Event ID 1001 from the `Application` log, then filters to Windows Error Reporting (WER) provider events where `EventName == "BlueScreen"` (the actual field value Windows uses — not "BugCheck"). These appear after every BSOD, during the next session, once WER has finished processing the crash dump.
+### Windows Error Reporting (`fetch_wer_events`)
 
-Fields extracted from WER XML:
+Queries Event ID 1001 from the Application log, filtered to WER provider records where `EventName == "BlueScreen"`. These appear after every BSOD, once WER has finished processing the crash dump during the recovery boot.
 
-| XML field | Maps to | Note |
+Three fields matter:
+
+| Field | Used for | Gotcha |
 |---|---|---|
-| `P1` | stop code (hex) | Bare hex without `0x` prefix, e.g. `"9f"` |
-| `Bucket` | fault bucket string | Contains faulting driver name; NOT named `BucketId` |
-| `AttachedFiles` | minidump path | First line ending in `.dmp`; strip leading `\\?\` |
+| `P1` | Stop code | Bare hex without `0x` — e.g. `"9f"`, not `"0x0000009F"` |
+| `Bucket` | Faulting driver name | Called `Bucket`, not `BucketId` |
+| `AttachedFiles` | Minidump path | First `.dmp` line; strip leading `\\?\` |
 
 ---
 
-## Step 2 — Finding boot boundaries (`src/analysis.rs: collect_boot_indices`)
+## Step 2 — Find boot boundaries
 
-Event 12 from provider `Microsoft-Windows-Kernel-General` marks the start of every boot session. `collect_boot_indices` scans all events (which are newest-first) and returns the indices of every Event 12 from that provider. If none are found it falls back to any Event 12.
+`collect_boot_indices` scans the flat event list (newest-first) for Event 12 from `Microsoft-Windows-Kernel-General`. Each occurrence marks the start of a boot session. If none are found, it falls back to any Event 12.
 
-Result: a list of indices, e.g. `[0, 15, 31, 47]` — each pointing to a boot marker, newest first.
-
----
-
-## Step 3 — Slicing events into boot cycles (`src/analysis.rs: extract_boot_cycles`)
-
-For boot cycle N (index 0 = current boot, index 1 = previous, etc.):
-
-```
-events array (newest → oldest):
- [0 ......... boot_idxs[0] ........... boot_idxs[1] ........... boot_idxs[2] ...]
-              ^ Event 12 (boot N)      ^ Event 12 (boot N-1)
-  |<-post_boot->|                      |
-                |<----pre_boot---->|
-```
-
-- **`post_boot`**: events between the previous boot marker and this boot marker (indices `boot_idxs[N-1]+1 .. boot_idxs[N]`). These were logged *at* the current boot's startup and contain retrospective reports about the previous session (Event 41, Event 6008).
-- **`pre_boot`**: events after this boot marker up to the next boot marker (`boot_idxs[N]+1 .. boot_idxs[N+1]`). These were logged *during* the previous session while it was running (Event 1074, Event 13, Event 6006).
-
-**Key insight**: Event 41 ("unexpected shutdown") and Event 6008 ("previous shutdown was unexpected") are retrospective — Windows writes them at the start of the *next* boot, not at crash time. They live in `post_boot`. Events 1074/13/6006 are prospective — written during the shutdown itself — and live in `pre_boot`.
+The result is a list of indices into the event array, e.g. `[0, 15, 31, 47]`, one per boot, newest first.
 
 ---
 
-## Step 4 — Classifying each cycle (`src/analysis.rs: analyze_slice`)
+## Step 3 — Slice events into boot cycles
 
-`analyze_slice` applies a priority-ordered decision tree. The first matching condition wins.
-
-### Decision tree
+For boot cycle N (0 = current boot, 1 = previous, …):
 
 ```
-1. Event 41 in post_boot?
-   ├─ BugcheckCode != 0  →  BLUE SCREEN (95% confidence)
-   ├─ PowerButtonTimestamp != 0  →  FORCED POWER-OFF (82%)
-   └─ otherwise  →  UNEXPECTED SHUTDOWN (75%)
-        └─ also Event 6008?  →  still UNEXPECTED, note confirms it
+events (newest → oldest):
+ [0 ··· boot_idxs[N] ·················· boot_idxs[N+1] ··· ]
+         ^ Event 12 (this boot)          ^ Event 12 (prior boot)
 
-2. Event 1074 in pre_boot?
-   ├─ process is TiWorker / TrustedInstaller / wuauclt  →  WINDOWS UPDATE (92%)
-   ├─ process is TrustedInstaller / wuauclt
-   │   OR reason code == 0x80020002  →  WINDOWS UPDATE (92%)
-   ├─ user contains "SYSTEM" or "NT AUTHORITY"  →  SYSTEM PROCESS (87%)
-   └─ otherwise  →  USER ACTION (90%)
+         |←── post_boot ──→|←──── pre_boot ────→|
+```
 
-3. Event 6008 in post_boot (but no Event 41)?
-   →  UNEXPECTED SHUTDOWN (60%)
-      (crash happened before Event 41 could be written)
+- **`post_boot`** — events between the prior boot marker and this boot marker. These are retrospective: crash reports logged *at startup* about the previous session (Event 41, Event 6008).
+- **`pre_boot`** — events after this boot marker up to the next older boot marker. These are prospective: logged *during* the previous session (Event 1074, Event 13, Event 6006).
 
-4. Event 13 or Event 6006 in pre_boot?
-   →  NORMAL SHUTDOWN (60%)
+This two-bucket split is the key insight that lets the tool correctly associate crash evidence with the session that actually crashed.
 
-5. None of the above
-   →  UNDETERMINED (10%)
+---
+
+## Step 4 — Classify each cycle
+
+`analyze_slice` applies a priority-ordered decision tree. The **first matching condition wins.**
+
+```
+ 1.  Event 41 in post_boot?
+     ├─ BugcheckCode ≠ 0              →  BLUE SCREEN  (95%)
+     ├─ PowerButtonTimestamp ≠ 0      →  FORCED POWER-OFF  (82%)
+     └─ neither                       →  UNEXPECTED SHUTDOWN  (75%)
+          + Event 6008 also present?  →  (same verdict, evidence noted)
+
+ 2.  Event 1074 in pre_boot?
+     ├─ process = TiWorker / TrustedInstaller / wuauclt
+     │   OR reason code = 0x80020002  →  WINDOWS UPDATE  (92%)
+     ├─ user contains "SYSTEM" / "NT AUTHORITY"
+     │                                →  SYSTEM PROCESS  (87%)
+     └─ otherwise                     →  USER ACTION  (90%)
+
+ 3.  Event 6008 in post_boot (no Event 41)?
+     →  UNEXPECTED SHUTDOWN  (60%)
+
+ 4.  Event 13 or Event 6006 in pre_boot?
+     →  NORMAL SHUTDOWN  (60%)
+
+ 5.  Nothing matched
+     →  UNDETERMINED  (10%)
 ```
 
 ### Confidence values
 
-| Cause | Confidence | Reason |
+| Cause | Confidence | Why |
 |---|---|---|
-| BlueScreen | 95% | Event 41 with non-zero stop code is unambiguous |
-| WindowsUpdate | 92% | TiWorker + reason 0x80020002 is definitive |
-| UserAction | 90% | Event 1074 from interactive user is reliable |
-| SystemProcess | 87% | Event 1074 from SYSTEM, less specific |
-| ForcedPowerOff | 82% | PowerButtonTimestamp heuristic, sometimes incorrect |
-| UnexpectedShutdown (with 41) | 75% | Event 41 present but no stop code |
-| NormalShutdown | 60% | Event 13/6006 only; no 1074 explanation |
-| UnexpectedShutdown (6008 only) | 60% | 6008 without 41 is weaker evidence |
-| Undetermined | 10% | Insufficient data |
+| Blue Screen | 95% | Non-zero bugcheck code is unambiguous |
+| Windows Update | 92% | TiWorker + reason `0x80020002` is definitive |
+| User Action | 90% | Event 1074 from an interactive user is reliable |
+| System Process | 87% | Event 1074 from SYSTEM; less specific process |
+| Forced Power-Off | 82% | `PowerButtonTimestamp` heuristic; occasionally wrong |
+| Unexpected Shutdown (Event 41) | 75% | Event 41 without a stop code |
+| Normal Shutdown | 60% | Event 13/6006 only; no 1074 explanation |
+| Unexpected Shutdown (Event 6008 only) | 60% | Weaker evidence — no Event 41 |
+| Undetermined | 10% | Insufficient log data |
 
-### Blue screen detail (`src/analysis.rs: classify_event41 + bsod_evidence`)
+### Blue screen detail
 
-For stop code 0x9F (`DRIVER_POWER_STATE_FAILURE`), Parameter 1 is decoded:
+For stop code `0x9F` (DRIVER_POWER_STATE_FAILURE), Parameter 1 narrows the failure mode:
 
-| P1 value | Meaning |
+| P1 | Meaning |
 |---|---|
-| 1 | Device object failed WaitForSingleObject during power transition |
-| 2 | Device object failed IRP_MN_SET_POWER for SystemPowerState |
-| 3 | Device object stalled during IRP_MN_SET_POWER (check P4 for the device object) |
-| 4 | Device object stalled powering down (check P4) |
+| 1 | Device failed `WaitForSingleObject` during power transition |
+| 2 | Device failed `IRP_MN_SET_POWER` for system power state |
+| 3 | Device stalled on `IRP_MN_SET_POWER` — check P4 for the device object |
+| 4 | Device stalled powering down — check P4 |
 
 ### Shutdown time
 
-`shutdown_time` is only recorded for clean shutdowns (no Event 41). It is taken from the earliest of Event 1074, Event 13, or Event 6006. When Event 41 is present the time of the crash is unknown — only the time of the subsequent boot is known.
+`shutdown_time` is recorded only for clean shutdowns (no Event 41 present). It comes from whichever of Event 1074, Event 13, or Event 6006 appears first. For crashes the shutdown time is unknown — only the recovery boot time is known.
 
 ---
 
-## Step 5 — WER correlation (`src/analysis.rs: annotate_wer_module`)
+## Step 5 — Correlate WER data
 
-WER processes the crash dump during the boot *after* the crash. So a BSOD in session N gets a WER event during session N+1. The correlation window is:
+WER processes the crash dump during the boot *after* the crash, so a BSOD from session N produces a WER event during session N+1. The tool matches WER records to cycles using a time window and stop code:
 
 ```
-time >= boot_times[N]          (WER can't run before the recovery boot starts)
-time <= boot_times[N-1]        (or "now" if this is the most recent crash)
-w.p1 == stop_code              (P1 field matches the bugcheck stop code)
+ WER record matches cycle N when:
+   w.time >= boot_time[N]        (WER runs after the recovery boot starts)
+   w.time <= boot_time[N-1]      (or "now" for the most recent crash)
+   w.p1   == stop_code           (P1 field = bugcheck code)
 ```
 
-The faulting module name is extracted from the WER `Bucket` string using three patterns, tried in order:
+The faulting module is extracted from the WER `Bucket` string. Three patterns are tried in order:
 
-1. **`module!function`** — e.g. `0x9F_3_DXG_POWER_IRP_TIMEOUT_portcls!GetIrpDisposition` → `portcls`
-   - Take everything before `!`, then take the substring after the last `_`
-2. **`_IMAGE_module.sys`** — e.g. `0x9F_3_usbccgp_IMAGE_UsbHub3.sys` → `UsbHub3.sys`
-   - Find `_image_`, take the token after it up to the next `_`
-3. **Token ending in `.sys`/`.dll`/`.exe`** — fallback scan of `_`-delimited tokens
+1. **`module!function`** — e.g. `0x9F_3_DXG_POWER_IRP_TIMEOUT_portcls!GetIrpDisposition`
+   → take the token before `!`, then the last `_`-delimited segment → `portcls`
+
+2. **`_IMAGE_module.sys`** — e.g. `0x9F_3_usbccgp_IMAGE_UsbHub3.sys`
+   → find `_image_`, take the token that follows → `UsbHub3.sys`
+
+3. **Token ending in `.sys` / `.dll` / `.exe`** — fallback scan across all `_`-delimited tokens
 
 ---
 
-## Step 6 — Minidump correlation (`src/analysis.rs: annotate_minidumps`)
+## Step 6 — Match minidumps
 
 Two sources, tried in order:
 
-1. **Filesystem** (`C:\Windows\Minidump\*.dmp`): matches dump files whose modification time falls between the start of the crashed session and 10 minutes after the recovery boot. Requires admin; returns nothing otherwise.
-2. **WER `AttachedFiles`**: the WER Event 1001 record contains the full path to the processed dump in its `AttachedFiles` data field. Used as fallback if the filesystem scan returned nothing (no admin required).
+1. **Filesystem** (`C:\Windows\Minidump\*.dmp`): matches dump files whose modification time falls within `[session_start, boot_time + 10 min]`. Requires admin rights; returns nothing otherwise.
+
+2. **WER `AttachedFiles`**: the WER Event 1001 record includes the full dump path in its data. Used as fallback when the filesystem scan returns nothing (no admin required).
 
 ---
 
-## Step 7 — Device power settings check (`src/registry.rs`)
+## Step 7 — Check audio device power settings
 
-Reads `HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e96c-e325-11ce-bfc1-08002be10318}` (the Windows audio device class) and iterates instances `0000`–`0020`. For each instance with a `DriverDesc` value, reads:
+Reads `HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e96c-e325-11ce-bfc1-08002be10318}` — the Windows-assigned GUID for the audio device class (stable since Windows 98). Iterates instances `0000`–`0020` and reads two registry values per device:
 
-| Registry value | Type | Meaning |
-|---|---|---|
-| `AllowIdleIrpInD3` | DWORD | `0` = safe (D3 idle disabled); `1` = risky; absent = driver default (risky for portcls) |
-| `EnhancedPowerManagementEnabled` | DWORD | Supplementary power management flag |
+| Value | Meaning |
+|---|---|
+| `AllowIdleIrpInD3 = 0` | Safe — D3 idle IRPs are disabled |
+| `AllowIdleIrpInD3 = 1` | Risky — driver may stall on power transition |
+| `AllowIdleIrpInD3` absent | Risky — driver uses its own (often unsafe) default |
+| `EnhancedPowerManagementEnabled` | Supplementary power management flag |
 
-This check is displayed only when the current crash is a power-related BSOD (stop codes 0x9F, 0x19C, 0xFE, 0x144) with an audio-related faulting module (`portcls`, `audio`, `hdaud`).
+This check is shown only for power-related BSODs (stop codes 0x9F, 0x19C, 0xFE, 0x144) when the faulting module is audio-related (`portcls`, `audio`, `hdaud`).
 
 ---
 
-## Step 8 — Explanation generation (`src/display.rs: generate_explanation`)
+## Step 8 — Generate explanation
 
-Triggered when the cause is a BSOD with a known stop code. Pattern-matches on stop code × module name to produce plain-English text and remediation steps:
+When the cause is a BSOD with a recognised stop code, `generate_explanation` pattern-matches on stop code and module name to produce plain-English text and numbered remediation steps:
 
-| Stop code | Module pattern | Explanation topic |
+| Stop code | Module | Topic |
 |---|---|---|
-| `0x9F` | `portcls`, `audio`, `hdaud` | Audio driver power transition failure; suggests `AllowIdleIrpInD3=0` fix |
+| `0x9F` | `portcls`, `audio`, `hdaud` | Audio driver power transition failure; suggests `AllowIdleIrpInD3=0` |
 | `0x9F` | `usbccgp`, `usbhub`, `usb` | USB device power transition failure; suggests disabling selective suspend |
 | `0x9F` | other | Generic driver power failure |
-| `0x19C` | any | Win32k power watchdog timeout (usually GPU driver) |
+| `0x19C` | any | Win32k power watchdog timeout (usually a GPU driver issue) |
 | `0xFE`, `0x144` | any | USB driver bugcheck |
 
-For the audio path, the actual registry state (from Step 7) is incorporated: if all devices already have `AllowIdleIrpInD3=0`, the explanation says so and pivots to "update driver / BIOS" as the next step.
+The actual registry state from Step 7 is woven in: if all audio devices already have `AllowIdleIrpInD3=0`, the explanation says so and suggests updating the driver or BIOS instead.
 
 ---
 
 ## Output format
 
-### Text mode
+**Text mode** prints each boot cycle in this order:
 
-Each boot cycle prints in order:
-1. Cycle header with boot time and "N of M"
+1. Header with boot time and "N of M"
 2. Last boot timestamp + offline duration (clean shutdowns only)
-3. **VERDICT** — cause label, detail, confidence %, faulting module
+3. **Verdict** — cause, detail, confidence %, faulting module
 4. **Evidence** — bullet points from the matching events
-5. **Timeline** — sorted list of key event timestamps
-6. **Minidumps** — paths if found
+5. **Timeline** — key event timestamps, sorted chronologically
+6. **Minidumps** — file paths if found
 7. **Device Power Settings** — audio registry state (power BSODs with audio module only)
-8. **Explanation** — plain-English diagnosis + numbered remediation steps (known patterns only)
-9. Raw event table — time, event ID, provider, summary
+8. **Explanation** — diagnosis and numbered steps (known stop code patterns only)
+9. Raw event table — timestamp, ID, provider, summary
 
-Cycles print oldest-first so the most recent result is at the bottom of the terminal.
+Cycles print oldest-first so the most recent result appears at the bottom of the terminal.
 
-### JSON mode (`--json`)
-
-Outputs a JSON object with `generated`, `cycle_count`, and a `cycles` array. Each cycle has `index`, `boot_time`, `shutdown_time`, `confidence`, `cause`, `stop_code` (BSODs), `params`, `faulting_module`, `evidence`, `minidumps`.
+**JSON mode** (`--json`) outputs a single object with `generated`, `cycle_count`, and a `cycles` array. Each cycle includes `index`, `boot_time`, `shutdown_time`, `confidence`, `cause`, `stop_code`, `params`, `faulting_module`, `evidence`, and `minidumps`.
 
 ---
 
-## Limitations and edge cases
+## Known limitations
 
-- **Log rollover**: the System log has a default size limit. On systems that haven't rebooted recently or crash frequently, older boot cycles may not appear at all. The tool degrades gracefully: if no Event 12 is found, the entire event set is treated as a single cycle with `boot_time = None`.
-- **Admin rights**: not required for Event Log or WER reading. Required for `C:\Windows\Minidump` filesystem access (WER fallback covers this case).
-- **Event 41 timing**: Windows writes Event 41 at the beginning of the recovery boot, not at crash time. The crash itself is unlogged — only the subsequent boot timestamp is known.
-- **Event 6008 without Event 41**: can occur if the kernel crashed before it had time to write Event 41 (rare). Classified as `UnexpectedShutdown` at 60% confidence.
-- **WER timing**: WER processes dumps asynchronously in the background. A very quick reboot after a crash may not have a corresponding WER event yet.
-- **Multiple crashes between boots**: not common, but if it happened the tool would only see the most recent boot boundary. The minidump directory may have multiple files from that period.
+| Limitation | Detail |
+|---|---|
+| Log rollover | The System log has a default size cap. Older cycles may not appear on systems that crash frequently or rarely reboot. The tool degrades gracefully: if no Event 12 is found it treats all events as one cycle with `boot_time = None`. |
+| Admin rights | Not required for Event Log or WER. Required only for direct minidump filesystem access; WER-reported paths work without it. |
+| Event 41 timing | Windows writes Event 41 at the start of the recovery boot, not at crash time. The exact moment of the crash is unlogged. |
+| Event 6008 without Event 41 | Rare — can happen if the kernel crashed before it had time to write Event 41. Classified as Unexpected Shutdown at 60% confidence. |
+| WER latency | WER processes dumps asynchronously. A very fast reboot after a crash may not have a WER event yet. |
+| Multiple crashes between boots | Not common, but the tool would only see the most recent boot boundary. The minidump directory may contain multiple files from that window. |
