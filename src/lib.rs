@@ -3,6 +3,7 @@
 //! The CLI binary (`src/main.rs`) and the GUI crate (`gui/`) both depend on this.
 pub mod analysis;
 pub mod events;
+pub mod format;
 pub mod registry;
 pub mod types;
 pub mod xml;

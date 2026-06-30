@@ -15,6 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use whyreboot::{
     analysis::extract_boot_cycles,
     events::{fetch_system_events, fetch_wer_events, list_minidumps},
+    format::{cause_detail, cause_label, event_summary, fmt_secs, generate_explanation, short_provider},
     registry::check_audio_power_settings,
     types::{AudioPowerInfo, BootCycle, Cause},
 };
@@ -43,7 +44,7 @@ struct NMLVGETINFOTIPW {
 
 // ── Layout ────────────────────────────────────────────────────────────────────
 
-const WIN_W:  i32 = 660;
+const WIN_W:  i32 = 860;
 const WIN_H:  i32 = 500;
 const LV_W:   i32 = 252;   // left-pane ListView width
 const PAD:    i32 = 4;      // gap between panes / edge margins
@@ -67,10 +68,10 @@ unsafe fn apply_font(hwnd: HWND, font: HGDIOBJ) {
 
 // ── Format cycle detail (right pane) ─────────────────────────────────────────
 
-fn format_cycle_detail(c: &BootCycle) -> String {
+fn format_cycle_detail(c: &BootCycle, audio: &[AudioPowerInfo]) -> String {
     let mut s = String::new();
 
-    // Boot time
+    // ── Boot times ────────────────────────────────────────────────────────────
     let bt_str = c.boot_time
         .map(|t| format!("{}", t.format("%Y-%m-%d  %H:%M:%S")))
         .unwrap_or_else(|| "(unknown — no Event 12 found)".into());
@@ -85,60 +86,93 @@ fn format_cycle_detail(c: &BootCycle) -> String {
         s += &format!("             ({})\r\n", ago);
     }
 
-    // Offline duration
-    match c.shutdown_time.zip(c.boot_time) {
-        Some((sd, bt)) => {
-            let secs = bt.signed_duration_since(sd).num_seconds();
-            let off = if secs < 0      { "(clock skew)".into() }
-                else if secs < 60      { format!("{secs}s") }
-                else if secs < 3600    { format!("{}m {:02}s", secs / 60, secs % 60) }
-                else                   { format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60) };
-            s += &format!("Offline:     {}\r\n", off);
+    if let Some((sd, bt)) = c.shutdown_time.zip(c.boot_time) {
+        let secs = bt.signed_duration_since(sd).num_seconds();
+        if secs >= 0 {
+            s += &format!("Offline:     {}  \u{2192}  {}  ({})\r\n",
+                sd.format("%H:%M:%S"), bt.format("%H:%M:%S"), fmt_secs(secs));
         }
-        None => { s += "Offline:     (unknown)\r\n"; }
     }
 
     s += "\r\n";
 
-    // Cause
-    let cause = match &c.cause {
-        Cause::BlueScreen { .. }    => "BLUE SCREEN OF DEATH (BSOD)",
-        Cause::ForcedPowerOff       => "FORCED POWER-OFF",
-        Cause::UnexpectedShutdown   => "UNEXPECTED / UNCLEAN SHUTDOWN",
-        Cause::WindowsUpdate { .. } => "WINDOWS UPDATE RESTART",
-        Cause::UserAction { .. }    => "USER-INITIATED SHUTDOWN",
-        Cause::SystemProcess { .. } => "SYSTEM / SOFTWARE RESTART",
-        Cause::NormalShutdown       => "NORMAL SHUTDOWN",
-        Cause::Undetermined         => "UNDETERMINED",
-    };
-    s += &format!("Cause:       {}\r\n", cause);
-
-    let detail = match &c.cause {
-        Cause::BlueScreen { stop_code, stop_name, .. } =>
-            format!("0x{:08X}  {}", stop_code, stop_name),
-        Cause::WindowsUpdate { process } =>
-            format!("via {}", process.split('\\').last().unwrap_or(process)),
-        Cause::UserAction { user, action, .. } =>
-            format!("{} (user: {})", action, user),
-        Cause::SystemProcess { process, action, .. } =>
-            format!("{} by {}", action, process.split('\\').last().unwrap_or(process)),
-        _ => String::new(),
-    };
-    if !detail.is_empty() {
-        s += &format!("             {}\r\n", detail);
-    }
-
+    // ── Verdict ───────────────────────────────────────────────────────────────
+    s += &format!("VERDICT:     {}  ({}% confidence)\r\n", cause_label(&c.cause), c.confidence);
+    s += &format!("             {}\r\n", cause_detail(&c.cause));
     if let Some(m) = &c.wer_module {
-        s += &format!("Module:      {}\r\n", m);
+        s += &format!("Module:      {}  [from WER Event 1001]\r\n", m);
     }
 
-    s += &format!("Confidence:  {}%\r\n", c.confidence);
-
+    // ── Evidence ──────────────────────────────────────────────────────────────
     if !c.evidence.is_empty() {
         s += "\r\nEvidence:\r\n";
         for e in &c.evidence {
             s += &format!("  \u{2022} {}\r\n", e);
         }
+    }
+
+    // ── Timeline ──────────────────────────────────────────────────────────────
+    if c.timeline.len() > 1 {
+        let mut idxs: Vec<usize> = (0..c.timeline.len()).collect();
+        idxs.sort_by_key(|&i| c.timeline[i].0);
+        s += "\r\nTimeline:\r\n";
+        for i in idxs {
+            let (t, msg) = &c.timeline[i];
+            s += &format!("  {}  {}\r\n", t.format("%Y-%m-%d %H:%M:%S"), msg);
+        }
+    }
+
+    // ── Minidumps ─────────────────────────────────────────────────────────────
+    if !c.minidumps.is_empty() {
+        s += "\r\nMinidumps:\r\n";
+        for (t, p) in &c.minidumps {
+            s += &format!("  {}  {}\r\n", t.format("%Y-%m-%d %H:%M:%S"), p.display());
+        }
+    }
+
+    // ── Device Power Settings (conditional: audio power-crash only) ───────────
+    let module_low = c.wer_module.as_deref().unwrap_or("").to_lowercase();
+    let is_power_crash = matches!(&c.cause, Cause::BlueScreen { stop_code, .. }
+        if *stop_code == 0x9F || *stop_code == 0x19C || *stop_code == 0xFE || *stop_code == 0x144);
+    let is_audio_crash = is_power_crash
+        && (module_low.contains("portcls") || module_low.contains("audio") || module_low.contains("hdaud"));
+    if is_audio_crash && !audio.is_empty() {
+        s += "\r\nDevice Power Settings (audio class):\r\n";
+        for dev in audio {
+            let status = match dev.allow_idle_d3 {
+                Some(0) => "AllowIdleIrpInD3=0  [safe — D3 idle disabled]",
+                Some(_) => "AllowIdleIrpInD3=1  [RISKY — D3 idle enabled]",
+                None    => "AllowIdleIrpInD3: not set [driver default — risky]",
+            };
+            s += &format!("  [{}] {:<32}  {}\r\n", dev.instance, dev.name, status);
+        }
+    }
+
+    // ── Explanation / remediation ─────────────────────────────────────────────
+    let explanation = generate_explanation(&c.cause, &c.wer_module, audio);
+    if !explanation.is_empty() {
+        s += "\r\nExplanation:\r\n";
+        for ln in &explanation {
+            if ln.is_empty() { s += "\r\n"; } else { s += &format!("  {}\r\n", ln); }
+        }
+    }
+
+    // ── Raw event table ───────────────────────────────────────────────────────
+    if !c.display_events.is_empty() {
+        let line = "\u{2500}".repeat(69);
+        s += &format!("\r\n{}\r\n", line);
+        s += &format!("{:<20} {:>6}  {:<26}  {}\r\n", "Time", "Event", "Provider", "Summary");
+        s += &format!("{}\r\n", line);
+        for ev in &c.display_events {
+            s += &format!(
+                "{:<20} {:>6}  {:<26.26}  {}\r\n",
+                ev.time_created.format("%Y-%m-%d %H:%M:%S"),
+                ev.event_id,
+                short_provider(&ev.provider),
+                event_summary(ev),
+            );
+        }
+        s += &format!("{}\r\n", line);
     }
 
     s
@@ -193,7 +227,10 @@ unsafe fn update_detail(idx: usize) {
     let detail = DETAIL_H.with(|t| as_hwnd(t.get()));
     if detail.0.is_null() { return; }
     let cycles = CYCLES.get().map(|v| v.as_slice()).unwrap_or(&[]);
-    let text = cycles.get(idx).map(format_cycle_detail).unwrap_or_default();
+    let audio  = AUDIO.get().map(|v| v.as_slice()).unwrap_or(&[]);
+    let text = cycles.get(idx)
+        .map(|c| format_cycle_detail(c, audio))
+        .unwrap_or_default();
     let txt = wstr(&text);
     let _ = SetWindowTextW(detail, PCWSTR(txt.as_ptr()));
 }
@@ -451,6 +488,48 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             SetTextColor(hdc, COLORREF(GetSysColor(COLOR_WINDOWTEXT)));
             LRESULT(GetSysColorBrush(COLOR_3DFACE).0 as isize)
         }
+        WM_SIZE => {
+            // Skip minimized — nothing to lay out.
+            if wp.0 == 1 { return LRESULT(0); }
+            let cw = (lp.0 & 0xFFFF) as i32;
+            let ch = (lp.0 >> 16 & 0xFFFF) as i32;
+            let tab = TAB_H.with(|t| as_hwnd(t.get()));
+
+            // Stretch tab control to fill the client area.
+            SetWindowPos(tab, None, 0, 0, cw, ch,
+                SWP_NOZORDER | SWP_NOACTIVATE).ok();
+
+            // Ask the tab control for the usable inner rect.
+            let mut rc = RECT { left: 2, top: 2, right: cw - 2, bottom: ch - 2 };
+            SendMessageW(tab, TCM_ADJUSTRECT,
+                Some(WPARAM(0)), Some(LPARAM(&mut rc as *mut _ as isize)));
+            let pw = rc.right  - rc.left;
+            let ph = rc.bottom - rc.top;
+
+            // Resize both panels to the new inner rect.
+            let panels = PANELS.with(|p| p.get());
+            for &raw in &panels {
+                SetWindowPos(as_hwnd(raw), None, rc.left, rc.top, pw, ph,
+                    SWP_NOZORDER | SWP_NOACTIVATE).ok();
+            }
+
+            // Resize ListView (left, fixed width) and EDIT (right, fills rest).
+            let lv     = LV_H.with(|t| as_hwnd(t.get()));
+            let detail = DETAIL_H.with(|t| as_hwnd(t.get()));
+            SetWindowPos(lv, None, PAD, PAD, LV_W, ph - PAD * 2,
+                SWP_NOZORDER | SWP_NOACTIVATE).ok();
+            let ex = LV_W + PAD * 2;
+            SetWindowPos(detail, None, ex, PAD, pw - ex - PAD, ph - PAD * 2,
+                SWP_NOZORDER | SWP_NOACTIVATE).ok();
+
+            // Resize the About panel's static text child.
+            if let Ok(child) = GetWindow(as_hwnd(panels[1]), GW_CHILD) {
+                SetWindowPos(child, None, 16, 16, pw - 32, ph - 32,
+                    SWP_NOZORDER | SWP_NOACTIVATE).ok();
+            }
+
+            LRESULT(0)
+        }
         WM_DESTROY => { PostQuitMessage(0); LRESULT(0) }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
@@ -498,7 +577,7 @@ unsafe fn run_ui() {
     };
     RegisterClassW(&wc);
 
-    let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_SIZEBOX | WS_MAXIMIZEBOX;
     let mut rc = RECT { left: 0, top: 0, right: WIN_W, bottom: WIN_H };
     AdjustWindowRect(&mut rc, style, false).ok();
 
