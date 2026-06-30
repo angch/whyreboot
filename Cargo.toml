@@ -1,8 +1,19 @@
+[workspace]
+members = ["gui"]
+
 [package]
 name = "whyreboot"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+
+[lib]
+name = "whyreboot"
+path = "src/lib.rs"
+
+[[bin]]
+name = "whyreboot"
+path = "src/main.rs"
 
 [dependencies]
 windows = { version = "0.62.2", features = [
@@ -12,4 +23,11 @@ windows = { version = "0.62.2", features = [
     "Win32_Foundation",
 ] }
 chrono = { version = "0.4.39", default-features = false, features = ["clock", "std"] }
+
+[profile.release]
+opt-level   = "z"
+lto         = true
+codegen-units = 1
+strip       = true
+panic       = "abort"
 

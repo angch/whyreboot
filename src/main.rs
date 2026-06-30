@@ -1,17 +1,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-mod analysis;
 mod color;
 mod display;
-mod events;
-mod registry;
-mod types;
-mod xml;
 
 use color::{enable_ansi_color, COLORS, NO_COLOR};
 use display::{print_cycle, print_json};
-use events::{fetch_system_events, fetch_wer_events, list_minidumps};
-use registry::check_audio_power_settings;
-use analysis::extract_boot_cycles;
+use whyreboot::events::{fetch_system_events, fetch_wer_events, list_minidumps};
+use whyreboot::registry::check_audio_power_settings;
+use whyreboot::analysis::extract_boot_cycles;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 

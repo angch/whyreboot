@@ -3,7 +3,7 @@
 
 use chrono::Local;
 use crate::color::Pal;
-use crate::types::{AudioPowerInfo, BootCycle, Cause, EventRecord};
+use whyreboot::types::{AudioPowerInfo, BootCycle, Cause, EventRecord};
 
 // ── Cause labelling ───────────────────────────────────────────────────────────
 
