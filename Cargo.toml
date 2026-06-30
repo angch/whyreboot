@@ -17,12 +17,13 @@ path = "src/main.rs"
 
 [dependencies]
 windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
     "Win32_System_EventLog",
     "Win32_System_Console",
     "Win32_System_Registry",
-    "Win32_Foundation",
+    "Win32_System_Time",
 ] }
-chrono = { version = "0.4.39", default-features = false, features = ["clock", "std"] }
 
 [profile.release]
 opt-level   = "z"

@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-use chrono::{DateTime, Local};
-use std::collections::HashMap;
+use crate::timestamp::Timestamp;
 use std::path::PathBuf;
 
 /// Parsed representation of a single Windows Event Log record.
@@ -9,9 +8,15 @@ use std::path::PathBuf;
 #[derive(Debug, Clone)]
 pub struct EventRecord {
     pub event_id:     u32,
-    pub time_created: DateTime<Local>,
+    pub time_created: Timestamp,
     pub provider:     String,
-    pub data:         HashMap<String, String>,
+    pub data:         Vec<(String, String)>,
+}
+
+impl EventRecord {
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.data.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
 }
 
 /// One Windows Error Reporting BugCheck record (Application log, Event 1001).
@@ -21,7 +26,7 @@ pub struct EventRecord {
 /// module; see `module_from_bucket` in analysis.rs.
 #[derive(Debug, Clone)]
 pub struct WerRecord {
-    pub time_created:  DateTime<Local>,
+    pub time_created:  Timestamp,
     pub p1:            u64,
     pub bucket_id:     String,
     pub minidump_path: Option<PathBuf>,
@@ -68,13 +73,13 @@ pub enum Cause {
 /// initial classification.
 pub struct BootCycle {
     pub index:          usize,
-    pub boot_time:      Option<DateTime<Local>>,
-    pub shutdown_time:  Option<DateTime<Local>>,
+    pub boot_time:      Option<Timestamp>,
+    pub shutdown_time:  Option<Timestamp>,
     pub cause:          Cause,
     pub confidence:     u8,
     pub evidence:       Vec<String>,
-    pub timeline:       Vec<(DateTime<Local>, String)>,
+    pub timeline:       Vec<(Timestamp, String)>,
     pub wer_module:     Option<String>,
-    pub minidumps:      Vec<(DateTime<Local>, PathBuf)>,
+    pub minidumps:      Vec<(Timestamp, PathBuf)>,
     pub display_events: Vec<EventRecord>,
 }

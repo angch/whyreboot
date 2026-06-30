@@ -6,6 +6,9 @@ on:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -31,11 +34,24 @@ jobs:
       - name: Build release binaries
         run: cargo build --release --workspace
 
+      - name: Compress with UPX
+        shell: pwsh
+        run: |
+          choco install upx --yes --no-progress
+          upx --best --lzma target\release\whyreboot.exe
+          upx --best --lzma target\release\whyreboot-gui.exe
+
       - name: Rename artifacts
         shell: pwsh
         run: |
           Copy-Item target\release\whyreboot.exe     whyreboot-cli-x86_64-windows.exe
           Copy-Item target\release\whyreboot-gui.exe whyreboot-gui-x86_64-windows.exe
+
+      - name: Show binary sizes
+        shell: pwsh
+        run: |
+          Get-Item whyreboot-cli-x86_64-windows.exe, whyreboot-gui-x86_64-windows.exe |
+            Select-Object Name, @{N='KB';E={[math]::Round($_.Length/1KB,1)}}
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

@@ -5,5 +5,6 @@ pub mod analysis;
 pub mod events;
 pub mod format;
 pub mod registry;
+pub mod timestamp;
 pub mod types;
 pub mod xml;

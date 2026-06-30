@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Text and JSON output for boot cycles, including explanations and remediation advice.
 
-use chrono::Local;
 use crate::color::Pal;
 use whyreboot::format::{
     cause_label, cause_detail, fmt_secs, short_provider, event_summary, generate_explanation,
 };
+use whyreboot::timestamp::Timestamp;
 use whyreboot::types::{AudioPowerInfo, BootCycle, Cause};
 
 // ── Cause color ───────────────────────────────────────────────────────────────
@@ -61,29 +61,27 @@ fn print_cycle_header(cycle: &BootCycle, pal: &Pal, total: usize, dline: &str) {
 
 fn print_boot_times(cycle: &BootCycle, pal: &Pal) {
     if let Some(bt) = cycle.boot_time {
-        let ago = Local::now().signed_duration_since(bt);
-        let ago_s = if ago.num_days() >= 2 {
-            format!("{} days ago", ago.num_days())
-        } else if ago.num_hours() >= 2 {
-            format!("{} hours ago", ago.num_hours())
-        } else {
-            format!("{} minutes ago", ago.num_minutes())
-        };
-        println!("  {}Last boot:{} {}  ({})", pal.bold, pal.reset, bt.format("%Y-%m-%d %H:%M:%S"), ago_s);
+        let ago_s = secs_to_ago(Timestamp::now().secs_since(bt));
+        println!("  {}Last boot:{} {}  ({})", pal.bold, pal.reset, bt.format_dt(), ago_s);
     } else {
         println!("  {}Boot time:{} (unknown — no Event 12 in log window)", pal.bold, pal.reset);
     }
 
     if let (Some(sd), Some(bt)) = (cycle.shutdown_time, cycle.boot_time) {
-        let offline = bt.signed_duration_since(sd).num_seconds();
-        // Skip the line if offline is negative (clock skew or event timestamp anomaly)
-        // rather than showing a misleading "0s".
+        let offline = bt.secs_since(sd);
         if offline >= 0 {
             println!("  {}Offline:{}   {} → {}  ({})",
                 pal.bold, pal.reset,
-                sd.format("%H:%M:%S"), bt.format("%H:%M:%S"), fmt_secs(offline));
+                sd.format_t(), bt.format_t(), fmt_secs(offline));
         }
     }
+}
+
+fn secs_to_ago(secs: i64) -> String {
+    let s = secs.max(0);
+    if s >= 2 * 86_400       { format!("{} days ago",    s / 86_400) }
+    else if s >= 2 * 3_600   { format!("{} hours ago",   s / 3_600)  }
+    else                      { format!("{} minutes ago", s / 60)     }
 }
 
 fn print_verdict(cycle: &BootCycle, pal: &Pal) {
@@ -116,7 +114,7 @@ fn print_timeline(cycle: &BootCycle, pal: &Pal) {
     println!("  {}Timeline:{}", pal.bold, pal.reset);
     for i in idxs {
         let (t, msg) = &cycle.timeline[i];
-        println!("    {}{}{}  {}", pal.dim, t.format("%Y-%m-%d %H:%M:%S"), pal.reset, msg);
+        println!("    {}{}{}  {}", pal.dim, t.format_dt(), pal.reset, msg);
     }
 }
 
@@ -125,7 +123,7 @@ fn print_minidumps(cycle: &BootCycle, pal: &Pal) {
     println!();
     println!("  {}Minidumps:{}", pal.bold, pal.reset);
     for (t, p) in &cycle.minidumps {
-        println!("    {}{}{}  {}", pal.dim, t.format("%Y-%m-%d %H:%M:%S"), pal.reset, p.display());
+        println!("    {}{}{}  {}", pal.dim, t.format_dt(), pal.reset, p.display());
     }
 }
 
@@ -171,7 +169,7 @@ fn print_event_table(cycle: &BootCycle, line: &str) {
     for ev in &cycle.display_events {
         println!(
             "{:<20} {:>6}  {:<26.26}  {}",
-            ev.time_created.format("%Y-%m-%d %H:%M:%S"),
+            ev.time_created.format_dt(),
             ev.event_id,
             short_provider(&ev.provider),
             event_summary(ev),
@@ -194,7 +192,7 @@ fn json_str(s: &str) -> String {
 
 /// Outputs all boot cycles as hand-built JSON to stdout (no serde dependency).
 pub fn print_json(cycles: &[BootCycle]) {
-    let now = Local::now().to_rfc3339();
+    let now = Timestamp::now().to_rfc3339();
     println!("{{");
     println!("  \"generated\": {},", json_str(&now));
     println!("  \"cycle_count\": {},", cycles.len());

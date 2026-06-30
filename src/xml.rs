@@ -4,8 +4,7 @@
 //! full parser is unnecessary — string scanning is sufficient and avoids
 //! adding an XML dependency.
 
-use std::collections::HashMap;
-use chrono::{DateTime, Local};
+use crate::timestamp::Timestamp;
 use crate::types::EventRecord;
 
 /// Extracts an attribute value from the first occurrence of `<tag … attr='…'>`.
@@ -49,8 +48,8 @@ pub fn xml_elem(xml: &str, tag: &str) -> Option<String> {
 /// Collects all `<Data Name="key">value</Data>` pairs from an event XML fragment.
 /// Fields without a `Name` attribute are assigned anonymous keys `_0`, `_1`, etc.
 /// Self-closing `<Data … />` elements are skipped (empty values).
-pub fn xml_data(xml: &str) -> HashMap<String, String> {
-    let mut map    = HashMap::new();
+pub fn xml_data(xml: &str) -> Vec<(String, String)> {
+    let mut map    = Vec::new();
     let mut cursor = 0;
     let mut anon   = 0usize;
     while let Some(rel) = xml[cursor..].find("<Data") {
@@ -75,7 +74,7 @@ pub fn xml_data(xml: &str) -> HashMap<String, String> {
                     anon += 1;
                     k
                 });
-                map.insert(key, value);
+                map.push((key, value));
                 cursor = abs + cs + end + 7;
             } else {
                 cursor = abs + 1;
@@ -92,7 +91,7 @@ pub fn xml_data(xml: &str) -> HashMap<String, String> {
 pub fn parse_event(xml: &str) -> Option<EventRecord> {
     let event_id: u32 = xml_elem(xml, "EventID")?.parse().ok()?;
     let time_str      = xml_attr(xml, "TimeCreated", "SystemTime")?;
-    let time_created  = DateTime::parse_from_rfc3339(&time_str).ok()?.with_timezone(&Local);
+    let time_created  = Timestamp::from_rfc3339(&time_str)?;
     let provider      = xml_attr(xml, "Provider", "Name").unwrap_or_default();
     let data          = xml_data(xml);
     Some(EventRecord { event_id, time_created, provider, data })
@@ -184,28 +183,32 @@ mod tests {
 
     // ── xml_data ─────────────────────────────────────────────────────────────
 
+    fn dget<'a>(m: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        m.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+
     #[test]
     fn data_named_fields() {
         let xml = r#"<Data Name="BugcheckCode">159</Data><Data Name="BugcheckParameter1">3</Data>"#;
         let m = xml_data(xml);
-        assert_eq!(m.get("BugcheckCode"), Some(&"159".to_string()));
-        assert_eq!(m.get("BugcheckParameter1"), Some(&"3".to_string()));
+        assert_eq!(dget(&m, "BugcheckCode"), Some("159"));
+        assert_eq!(dget(&m, "BugcheckParameter1"), Some("3"));
     }
 
     #[test]
     fn data_anonymous_fields_keyed_sequentially() {
         let xml = "<Data>first</Data><Data>second</Data>";
         let m = xml_data(xml);
-        assert_eq!(m.get("_0"), Some(&"first".to_string()));
-        assert_eq!(m.get("_1"), Some(&"second".to_string()));
+        assert_eq!(dget(&m, "_0"), Some("first"));
+        assert_eq!(dget(&m, "_1"), Some("second"));
     }
 
     #[test]
     fn data_self_closing_skipped() {
         let xml = r#"<Data Name="Empty"/><Data Name="Real">value</Data>"#;
         let m = xml_data(xml);
-        assert!(!m.contains_key("Empty"));
-        assert_eq!(m.get("Real"), Some(&"value".to_string()));
+        assert!(dget(&m, "Empty").is_none());
+        assert_eq!(dget(&m, "Real"), Some("value"));
     }
 
     #[test]
@@ -217,7 +220,7 @@ mod tests {
     fn data_trims_content_whitespace() {
         let xml = r#"<Data Name="K">  hello  </Data>"#;
         let m = xml_data(xml);
-        assert_eq!(m.get("K"), Some(&"hello".to_string()));
+        assert_eq!(dget(&m, "K"), Some("hello"));
     }
 
     #[test]
@@ -225,8 +228,8 @@ mod tests {
         // <DataProvider> must not be matched as <Data>.
         let xml = r#"<DataProvider Name="wrong"/><Data Name="right">val</Data>"#;
         let m = xml_data(xml);
-        assert!(!m.contains_key("wrong"), "longer tag name must not be matched");
-        assert_eq!(m.get("right"), Some(&"val".to_string()));
+        assert!(dget(&m, "wrong").is_none(), "longer tag name must not be matched");
+        assert_eq!(dget(&m, "right"), Some("val"));
     }
 
     // ── parse_event ───────────────────────────────────────────────────────────
@@ -236,9 +239,9 @@ mod tests {
         let rec = parse_event(EV41_XML).expect("should parse valid event");
         assert_eq!(rec.event_id, 41);
         assert_eq!(rec.provider, "Microsoft-Windows-Kernel-Power");
-        assert_eq!(rec.data.get("BugcheckCode"), Some(&"159".to_string()));
+        assert_eq!(rec.get("BugcheckCode"), Some("159"));
         // Self-closing Data element must be absent.
-        assert!(!rec.data.contains_key("SelfEmpty"));
+        assert!(rec.get("SelfEmpty").is_none());
     }
 
     #[test]

@@ -62,25 +62,24 @@ pub fn short_provider(p: &str) -> &str {
 
 /// Short human-readable summary for a raw event row in the event table.
 pub fn event_summary(ev: &EventRecord) -> String {
-    let d = &ev.data;
     match ev.event_id {
         12   => "System started".into(),
         13   => "System shutdown initiated".into(),
         41   => format!(
             "Unexpected shutdown — BugCheck={}",
-            d.get("BugcheckCode").map(|s| s.as_str()).unwrap_or("?")
+            ev.get("BugcheckCode").unwrap_or("?")
         ),
         109  => "Kernel power button transition".into(),
         1074 => format!(
             "{} by {}",
-            d.get("param5").map(|s| s.as_str()).unwrap_or("action"),
-            d.get("param3").map(|s| s.as_str()).unwrap_or("?")
+            ev.get("param5").unwrap_or("action"),
+            ev.get("param3").unwrap_or("?")
         ),
         1076 => "Shutdown reason documented".into(),
         6006 => "Event log stopped cleanly (shutdown)".into(),
         6008 => "Previous shutdown was unexpected".into(),
         6009 => "Startup: Windows version info".into(),
-        6013 => d.get("param1")
+        6013 => ev.get("param1")
             .and_then(|s| s.parse::<i64>().ok())
             .map(|s| format!("System uptime: {}", fmt_secs(s)))
             .unwrap_or_else(|| "System uptime".into()),

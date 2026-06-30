@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Boot cycle analysis: stop code tables, event classification, and WER/minidump annotation.
 
-use chrono::{DateTime, Duration, Local};
 use std::path::PathBuf;
+use crate::timestamp::Timestamp;
 use crate::types::{BootCycle, Cause, EventRecord, WerRecord};
 
 // ── Lookup tables ─────────────────────────────────────────────────────────────
@@ -176,9 +176,9 @@ pub fn module_from_bucket(bucket: &str) -> Option<String> {
 pub struct CycleAnalysis {
     pub cause:         Cause,
     pub confidence:    u8,
-    pub shutdown_time: Option<DateTime<Local>>,
+    pub shutdown_time: Option<Timestamp>,
     pub evidence:      Vec<String>,
-    pub timeline:      Vec<(DateTime<Local>, String)>,
+    pub timeline:      Vec<(Timestamp, String)>,
 }
 
 // ── Event classifiers ─────────────────────────────────────────────────────────
@@ -211,17 +211,15 @@ fn bsod_evidence(stop_code: u64, params: [u64; 4]) -> Vec<String> {
 /// ForcedPowerOff, or UnexpectedShutdown based on `BugcheckCode` and `PowerButtonTimestamp`.
 /// `unexpected_flag` is true if Event 6008 also appears in the same `post_boot` slice.
 fn classify_event41(ev: &EventRecord, unexpected_flag: bool) -> (Cause, u8, Vec<String>) {
-    let stop_code = ev.data.get("BugcheckCode").and_then(|s| hex_u64(s)).unwrap_or(0);
+    let stop_code = ev.get("BugcheckCode").and_then(hex_u64).unwrap_or(0);
     let params = [
-        ev.data.get("BugcheckParameter1").and_then(|s| hex_u64(s)).unwrap_or(0),
-        ev.data.get("BugcheckParameter2").and_then(|s| hex_u64(s)).unwrap_or(0),
-        ev.data.get("BugcheckParameter3").and_then(|s| hex_u64(s)).unwrap_or(0),
-        ev.data.get("BugcheckParameter4").and_then(|s| hex_u64(s)).unwrap_or(0),
+        ev.get("BugcheckParameter1").and_then(hex_u64).unwrap_or(0),
+        ev.get("BugcheckParameter2").and_then(hex_u64).unwrap_or(0),
+        ev.get("BugcheckParameter3").and_then(hex_u64).unwrap_or(0),
+        ev.get("BugcheckParameter4").and_then(hex_u64).unwrap_or(0),
     ];
-    let power_btn = ev
-        .data
-        .get("PowerButtonTimestamp")
-        .and_then(|s| hex_u64(s))
+    let power_btn = ev.get("PowerButtonTimestamp")
+        .and_then(hex_u64)
         .map(|v| v != 0)
         .unwrap_or(false);
 
@@ -244,11 +242,11 @@ fn classify_event41(ev: &EventRecord, unexpected_flag: bool) -> (Cause, u8, Vec<
 /// SystemProcess, or UserAction based on process name, user, and reason code.
 /// Returns `(cause, confidence, evidence, timeline_message)`.
 fn classify_event1074(ev: &EventRecord) -> (Cause, u8, Vec<String>, String) {
-    let process     = ev.data.get("param1").cloned().unwrap_or_default();
-    let user        = ev.data.get("param3").cloned().unwrap_or_default();
-    let reason_code = ev.data.get("param4").cloned().unwrap_or_default();
-    let action_raw  = ev.data.get("param5").cloned().unwrap_or_default();
-    let comment     = ev.data.get("param6").cloned().unwrap_or_default();
+    let process     = ev.get("param1").unwrap_or_default().to_owned();
+    let user        = ev.get("param3").unwrap_or_default().to_owned();
+    let reason_code = ev.get("param4").unwrap_or_default().to_owned();
+    let action_raw  = ev.get("param5").unwrap_or_default().to_owned();
+    let comment     = ev.get("param6").unwrap_or_default().to_owned();
 
     let action = match action_raw.as_str() {
         "restart"              => "Restart",
@@ -300,7 +298,7 @@ fn classify_event1074(ev: &EventRecord) -> (Cause, u8, Vec<String>, String) {
 /// (e.g. Event 41, 6008). `pre_boot` contains events logged during the prior session
 /// (e.g. Event 1074, 13, 6006). See `HowItWorks.md` for the full decision tree.
 pub fn analyze_slice(
-    boot_time: Option<DateTime<Local>>,
+    boot_time: Option<Timestamp>,
     post_boot: &[EventRecord],
     pre_boot:  &[EventRecord],
 ) -> CycleAnalysis {
@@ -382,7 +380,7 @@ pub fn collect_boot_indices(events: &[EventRecord]) -> Vec<usize> {
 pub fn extract_boot_cycles(
     events: &[EventRecord],
     wer:    &[WerRecord],
-    dumps:  &[(DateTime<Local>, PathBuf)],
+    dumps:  &[(Timestamp, PathBuf)],
     limit:  usize,
 ) -> Vec<BootCycle> {
     let boot_idxs = collect_boot_indices(events);
@@ -440,9 +438,9 @@ pub fn extract_boot_cycles(
 fn annotate_with_wer_and_dumps(
     cycles: &mut Vec<BootCycle>,
     wer:    &[WerRecord],
-    dumps:  &[(DateTime<Local>, PathBuf)],
+    dumps:  &[(Timestamp, PathBuf)],
 ) {
-    let boot_times: Vec<Option<DateTime<Local>>> = cycles.iter().map(|c| c.boot_time).collect();
+    let boot_times: Vec<Option<Timestamp>> = cycles.iter().map(|c| c.boot_time).collect();
 
     for idx in 0..cycles.len() {
         let boot_time    = boot_times[idx];
@@ -459,14 +457,14 @@ fn annotate_with_wer_and_dumps(
 /// accommodates WER processing delay after the recovery boot.
 fn annotate_minidumps(
     cycle:         &mut BootCycle,
-    boot_time:     Option<DateTime<Local>>,
-    session_start: Option<DateTime<Local>>,
-    dumps:         &[(DateTime<Local>, PathBuf)],
+    boot_time:     Option<Timestamp>,
+    session_start: Option<Timestamp>,
+    dumps:         &[(Timestamp, PathBuf)],
 ) {
     let lower = session_start.unwrap_or_else(|| {
-        boot_time.map(|t| t - Duration::days(30)).unwrap_or_else(Local::now)
+        boot_time.map(|t| t.add_secs(-30 * 86_400)).unwrap_or_else(Timestamp::now)
     });
-    let upper = boot_time.map(|t| t + Duration::minutes(10)).unwrap_or_else(Local::now);
+    let upper = boot_time.map(|t| t.add_secs(10 * 60)).unwrap_or_else(Timestamp::now);
     cycle.minidumps = dumps
         .iter()
         .filter(|(t, _)| *t >= lower && *t <= upper)
@@ -480,14 +478,14 @@ fn annotate_minidumps(
 /// Also fills `minidumps` from `WerRecord.minidump_path` if the filesystem scan found nothing.
 fn annotate_wer_module(
     cycle:     &mut BootCycle,
-    boot_time: Option<DateTime<Local>>,
-    wer_end:   Option<DateTime<Local>>,
+    boot_time: Option<Timestamp>,
+    wer_end:   Option<Timestamp>,
     wer:       &[WerRecord],
 ) {
     let Cause::BlueScreen { stop_code, .. } = &cycle.cause else { return };
     let sc    = *stop_code;
-    let bt    = boot_time.unwrap_or_else(Local::now);
-    let upper = wer_end.unwrap_or_else(Local::now);
+    let bt    = boot_time.unwrap_or_else(Timestamp::now);
+    let upper = wer_end.unwrap_or_else(Timestamp::now);
 
     let Some(wr) = wer.iter().find(|w| w.p1 == sc && w.time_created >= bt && w.time_created <= upper)
     else { return };
@@ -510,13 +508,13 @@ mod tests {
         bsod_evidence, classify_event41, classify_event1074,
         analyze_slice, collect_boot_indices, extract_boot_cycles,
     };
+    use crate::timestamp::Timestamp;
     use crate::types::{Cause, EventRecord};
-    use chrono::Local;
 
     fn make_event(event_id: u32, provider: &str, data: &[(&str, &str)]) -> EventRecord {
         EventRecord {
             event_id,
-            time_created: Local::now(),
+            time_created: Timestamp::now(),
             provider: provider.to_string(),
             data: data.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
         }

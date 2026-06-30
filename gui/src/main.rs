@@ -17,6 +17,7 @@ use whyreboot::{
     events::{fetch_system_events, fetch_wer_events, list_minidumps},
     format::{cause_detail, cause_label, event_summary, fmt_secs, generate_explanation, short_provider},
     registry::check_audio_power_settings,
+    timestamp::Timestamp,
     types::{AudioPowerInfo, BootCycle, Cause},
 };
 
@@ -73,12 +74,12 @@ fn format_cycle_detail(c: &BootCycle, audio: &[AudioPowerInfo]) -> String {
 
     // ── Boot times ────────────────────────────────────────────────────────────
     let bt_str = c.boot_time
-        .map(|t| format!("{}", t.format("%Y-%m-%d  %H:%M:%S")))
+        .map(|t| t.format_dt())
         .unwrap_or_else(|| "(unknown — no Event 12 found)".into());
     s += &format!("Boot time:   {}\r\n", bt_str);
 
     if let Some(t) = c.boot_time {
-        let secs = chrono::Local::now().signed_duration_since(t).num_seconds().max(0);
+        let secs = Timestamp::now().secs_since(t).max(0);
         let ago = if secs < 120        { format!("{secs} seconds ago") }
             else if secs < 7200        { format!("{} minutes ago", secs / 60) }
             else if secs < 172_800     { format!("{} hours ago",   secs / 3600) }
@@ -87,10 +88,10 @@ fn format_cycle_detail(c: &BootCycle, audio: &[AudioPowerInfo]) -> String {
     }
 
     if let Some((sd, bt)) = c.shutdown_time.zip(c.boot_time) {
-        let secs = bt.signed_duration_since(sd).num_seconds();
+        let secs = bt.secs_since(sd);
         if secs >= 0 {
             s += &format!("Offline:     {}  \u{2192}  {}  ({})\r\n",
-                sd.format("%H:%M:%S"), bt.format("%H:%M:%S"), fmt_secs(secs));
+                sd.format_t(), bt.format_t(), fmt_secs(secs));
         }
     }
 
@@ -118,7 +119,7 @@ fn format_cycle_detail(c: &BootCycle, audio: &[AudioPowerInfo]) -> String {
         s += "\r\nTimeline:\r\n";
         for i in idxs {
             let (t, msg) = &c.timeline[i];
-            s += &format!("  {}  {}\r\n", t.format("%Y-%m-%d %H:%M:%S"), msg);
+            s += &format!("  {}  {}\r\n", t.format_dt(), msg);
         }
     }
 
@@ -126,7 +127,7 @@ fn format_cycle_detail(c: &BootCycle, audio: &[AudioPowerInfo]) -> String {
     if !c.minidumps.is_empty() {
         s += "\r\nMinidumps:\r\n";
         for (t, p) in &c.minidumps {
-            s += &format!("  {}  {}\r\n", t.format("%Y-%m-%d %H:%M:%S"), p.display());
+            s += &format!("  {}  {}\r\n", t.format_dt(), p.display());
         }
     }
 
@@ -166,7 +167,7 @@ fn format_cycle_detail(c: &BootCycle, audio: &[AudioPowerInfo]) -> String {
         for ev in &c.display_events {
             s += &format!(
                 "{:<20} {:>6}  {:<26.26}  {}\r\n",
-                ev.time_created.format("%Y-%m-%d %H:%M:%S"),
+                ev.time_created.format_dt(),
                 ev.event_id,
                 short_provider(&ev.provider),
                 event_summary(ev),
@@ -289,7 +290,7 @@ unsafe fn build_boot_history(parent: HWND, rc: RECT, hi: HINSTANCE, font: HGDIOB
     for (row, c) in cycles.iter().enumerate() {
         let mut num_w = wstr(&format!("{}", c.index + 1));
         let date_str = c.boot_time
-            .map(|t| format!("{}", t.format("%Y-%m-%d %H:%M")))
+            .map(|t| t.format_dt())
             .unwrap_or_else(|| "?".into());
         let mut date_w = wstr(&date_str);
         let cause_str = match &c.cause {
@@ -463,8 +464,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                     let cycles = CYCLES.get().map(|v| v.as_slice()).unwrap_or(&[]);
                     if let Some(c) = cycles.get(tip.item as usize) {
                         if let Some(t) = c.boot_time {
-                            let secs = chrono::Local::now()
-                                .signed_duration_since(t).num_seconds().max(0);
+                            let secs = Timestamp::now().secs_since(t).max(0);
                             let ago = if secs < 120       { format!("{secs} seconds ago") }
                                 else if secs < 7200       { format!("{} minutes ago", secs / 60) }
                                 else if secs < 172_800    { format!("{} hours ago",   secs / 3600) }

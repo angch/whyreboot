@@ -3,8 +3,8 @@
 
 use std::ffi::c_void;
 use std::path::PathBuf;
-use chrono::{DateTime, Local};
 use windows::Win32::System::EventLog::*;
+use crate::timestamp::Timestamp;
 use crate::types::{EventRecord, WerRecord};
 use crate::xml::parse_event;
 
@@ -107,26 +107,22 @@ pub fn fetch_wer_events() -> Vec<WerRecord> {
             if !prov.contains("error reporting") && !prov.contains("wer") {
                 return None;
             }
-            let event_name = ev.data.get("EventName").map(|s| s.as_str()).unwrap_or("");
+            let event_name = ev.get("EventName").unwrap_or("");
             if !event_name.eq_ignore_ascii_case("BlueScreen")
                 && !event_name.eq_ignore_ascii_case("BugCheck")
             {
                 return None;
             }
-            let p1 = ev
-                .data
-                .get("P1")
+            let p1 = ev.get("P1")
                 .and_then(|s| u64::from_str_radix(s.trim(), 16).ok())
                 .unwrap_or(0);
-            let bucket_id = ev
-                .data
-                .get("Bucket")
-                .or_else(|| ev.data.get("BucketId"))
-                .or_else(|| ev.data.get("HashedBucket"))
-                .or_else(|| ev.data.get("_0"))
-                .cloned()
-                .unwrap_or_default();
-            let minidump_path = ev.data.get("AttachedFiles").and_then(|s| {
+            let bucket_id = ev.get("Bucket")
+                .or_else(|| ev.get("BucketId"))
+                .or_else(|| ev.get("HashedBucket"))
+                .or_else(|| ev.get("_0"))
+                .unwrap_or_default()
+                .to_owned();
+            let minidump_path = ev.get("AttachedFiles").and_then(|s| {
                 s.lines()
                     .map(|l| l.trim())
                     .find(|l| l.to_lowercase().ends_with(".dmp"))
@@ -139,11 +135,11 @@ pub fn fetch_wer_events() -> Vec<WerRecord> {
 
 /// Lists `*.dmp` files in `%SystemRoot%\Minidump`, sorted newest first.
 /// Returns an empty vec if the directory cannot be read (no admin rights, or dir absent).
-pub fn list_minidumps() -> Vec<(DateTime<Local>, PathBuf)> {
+pub fn list_minidumps() -> Vec<(Timestamp, PathBuf)> {
     let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
     let dir = PathBuf::from(sysroot).join("Minidump");
     let Ok(rd) = std::fs::read_dir(&dir) else { return Vec::new() };
-    let mut v: Vec<(DateTime<Local>, PathBuf)> = rd
+    let mut v: Vec<(Timestamp, PathBuf)> = rd
         .filter_map(|e| e.ok())
         .filter(|e| {
             e.path()
@@ -152,7 +148,7 @@ pub fn list_minidumps() -> Vec<(DateTime<Local>, PathBuf)> {
         })
         .filter_map(|e| {
             let mt = e.metadata().ok()?.modified().ok()?;
-            Some((DateTime::<Local>::from(mt), e.path()))
+            Some((Timestamp::from_system_time(mt), e.path()))
         })
         .collect();
     v.sort_by(|a, b| b.0.cmp(&a.0));
