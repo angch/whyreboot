@@ -24,11 +24,28 @@ use whyreboot::{
 static CYCLES: OnceLock<Vec<BootCycle>>      = OnceLock::new();
 static AUDIO:  OnceLock<Vec<AudioPowerInfo>> = OnceLock::new();
 
+// ── Win32 constants not yet in windows 0.62 ───────────────────────────────────
+
+// LVN_FIRST - 58 (Unicode variant)
+const LVN_GETINFOTIPW_CODE: u32 = 0xFFFF_FF62;
+
+// Per-item tooltip data sent with LVN_GETINFOTIPW
+#[repr(C)]
+struct NMLVGETINFOTIPW {
+    hdr:        NMHDR,
+    dw_flags:   u32,
+    psz_text:   PWSTR,
+    cch_max:    i32,
+    item:       i32,
+    sub_item:   i32,
+    l_param:    LPARAM,
+}
+
 // ── Layout ────────────────────────────────────────────────────────────────────
 
 const WIN_W:  i32 = 660;
 const WIN_H:  i32 = 500;
-const LV_W:   i32 = 210;   // left-pane ListView width
+const LV_W:   i32 = 252;   // left-pane ListView width
 const PAD:    i32 = 4;      // gap between panes / edge margins
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -150,6 +167,13 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             SetTextColor(hdc, COLORREF(GetSysColor(COLOR_WINDOWTEXT)));
             LRESULT(GetSysColorBrush(COLOR_WINDOW).0 as isize)
         }
+        // Forward child notifications to the main window so wnd_proc sees them.
+        WM_NOTIFY => {
+            if let Ok(parent) = GetParent(hwnd) {
+                return SendMessageW(parent, WM_NOTIFY, Some(wp), Some(lp));
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
 }
@@ -198,17 +222,18 @@ unsafe fn build_boot_history(parent: HWND, rc: RECT, hi: HINSTANCE, font: HGDIOB
     ).unwrap_or(HWND(std::ptr::null_mut()));
     apply_font(lv, font);
 
-    // Full-row select extended style
+    // Full-row select + info-tip tooltips
+    let ex_style = LVS_EX_FULLROWSELECT | LVS_EX_INFOTIP;
     SendMessageW(lv, LVM_SETEXTENDEDLISTVIEWSTYLE,
-        Some(WPARAM(LVS_EX_FULLROWSELECT as usize)),
-        Some(LPARAM(LVS_EX_FULLROWSELECT as isize)));
+        Some(WPARAM(ex_style as usize)),
+        Some(LPARAM(ex_style as isize)));
 
     LV_H.with(|t| t.set(lv.0 as isize));
 
     let col_defs: &[(&str, i32)] = &[
-        ("#",      28),
-        ("Date",   88),
-        ("Cause",  80),
+        ("#",           26),
+        ("Date / Time", 118),
+        ("Cause",       100),
     ];
     for (i, (name, cx)) in col_defs.iter().enumerate() {
         let mut txt = wstr(name);
@@ -227,7 +252,7 @@ unsafe fn build_boot_history(parent: HWND, rc: RECT, hi: HINSTANCE, font: HGDIOB
     for (row, c) in cycles.iter().enumerate() {
         let mut num_w = wstr(&format!("{}", c.index + 1));
         let date_str = c.boot_time
-            .map(|t| format!("{}", t.format("%Y-%m-%d")))
+            .map(|t| format!("{}", t.format("%Y-%m-%d %H:%M")))
             .unwrap_or_else(|| "?".into());
         let mut date_w = wstr(&date_str);
         let cause_str = match &c.cause {
@@ -394,6 +419,28 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                     && nmlv.uNewState & LVIS_SELECTED.0 != 0
                 {
                     update_detail(nmlv.iItem as usize);
+                }
+            } else if hdr.hwndFrom == lv && hdr.code == LVN_GETINFOTIPW_CODE {
+                let tip = &mut *(lp.0 as *mut NMLVGETINFOTIPW);
+                if tip.item >= 0 {
+                    let cycles = CYCLES.get().map(|v| v.as_slice()).unwrap_or(&[]);
+                    if let Some(c) = cycles.get(tip.item as usize) {
+                        if let Some(t) = c.boot_time {
+                            let secs = chrono::Local::now()
+                                .signed_duration_since(t).num_seconds().max(0);
+                            let ago = if secs < 120       { format!("{secs} seconds ago") }
+                                else if secs < 7200       { format!("{} minutes ago", secs / 60) }
+                                else if secs < 172_800    { format!("{} hours ago",   secs / 3600) }
+                                else                      { format!("{} days ago",    secs / 86400) };
+                            let encoded: Vec<u16> = ago.encode_utf16().collect();
+                            let max = (tip.cch_max as usize).saturating_sub(1);
+                            let len = encoded.len().min(max);
+                            for (i, &ch) in encoded[..len].iter().enumerate() {
+                                *tip.psz_text.0.add(i) = ch;
+                            }
+                            *tip.psz_text.0.add(len) = 0;
+                        }
+                    }
                 }
             }
             LRESULT(0)
