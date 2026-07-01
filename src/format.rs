@@ -30,12 +30,12 @@ pub fn cause_detail(cause: &Cause) -> String {
             "System did not shut down cleanly (crash or power loss)".into(),
         Cause::WindowsUpdate { process } =>
             format!("Restart to apply updates ({})",
-                process.split('\\').last().unwrap_or(process)),
+                process.split('\\').next_back().unwrap_or(process)),
         Cause::UserAction { user, action, .. } =>
             format!("{} by {}", action, user),
         Cause::SystemProcess { process, action, .. } =>
             format!("{} by {}", action,
-                process.split('\\').last().unwrap_or(process)),
+                process.split('\\').next_back().unwrap_or(process)),
         Cause::NormalShutdown =>
             "System shut down cleanly; no specific initiator recorded".into(),
         Cause::Undetermined =>

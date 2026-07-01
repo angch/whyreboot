@@ -103,12 +103,11 @@ pub fn check_audio_power_settings() -> Vec<AudioPowerInfo> {
 
         for i in 0..=20u32 {
             let inst   = format!("{:04}", i);
-            let path   = format!("{}\\{}", BASE, inst);
-            let path_w: Vec<u16> = path.encode_utf16().chain([0]).collect();
+            let inst_w: Vec<u16> = inst.encode_utf16().chain([0]).collect();
             let mut hk = HKEY(std::ptr::null_mut());
             if RegOpenKeyExW(
-                HKEY_LOCAL_MACHINE,
-                windows::core::PCWSTR(path_w.as_ptr()),
+                hk_base,
+                windows::core::PCWSTR(inst_w.as_ptr()),
                 None,
                 KEY_READ,
                 &mut hk,

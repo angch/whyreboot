@@ -14,9 +14,10 @@ use crate::types::EventRecord;
 /// when searching for `<Data>`.
 pub fn xml_attr(xml: &str, tag: &str, attr: &str) -> Option<String> {
     let tag_prefix = format!("<{}", tag);
-    let mut from = 0;
-    loop {
-        let start = xml[from..].find(&tag_prefix).map(|i| from + i)?;
+    // A single forward sweep over all occurrences of `tag_prefix`, rather than
+    // restarting the search one byte later on each boundary-check failure —
+    // the latter is O(n^2) on adversarial input with many false-positive matches.
+    for (start, _) in xml.match_indices(&tag_prefix) {
         let after = start + tag_prefix.len();
         if xml[after..].starts_with(|c: char| c == '>' || c == '/' || c.is_ascii_whitespace()) {
             let region_end = xml[start..].find('>')?;
@@ -32,8 +33,8 @@ pub fn xml_attr(xml: &str, tag: &str, attr: &str) -> Option<String> {
             }
             return None;
         }
-        from = start + 1;
     }
+    None
 }
 
 /// Extracts the trimmed text content of `<tag>…</tag>` (first occurrence only).
@@ -49,39 +50,35 @@ pub fn xml_elem(xml: &str, tag: &str) -> Option<String> {
 /// Fields without a `Name` attribute are assigned anonymous keys `_0`, `_1`, etc.
 /// Self-closing `<Data … />` elements are skipped (empty values).
 pub fn xml_data(xml: &str) -> Vec<(String, String)> {
-    let mut map    = Vec::new();
-    let mut cursor = 0;
-    let mut anon   = 0usize;
-    while let Some(rel) = xml[cursor..].find("<Data") {
-        let abs  = cursor + rel;
+    let mut map  = Vec::new();
+    let mut anon = 0usize;
+    // Single forward sweep over all "<Data" occurrences (see `xml_attr` for why
+    // this replaces a restart-by-one-byte loop). `resume_from` skips matches that
+    // fall inside a region already consumed by a previously parsed element.
+    let mut resume_from = 0usize;
+    for (abs, _) in xml.match_indices("<Data") {
+        if abs < resume_from { continue; }
         let rest = &xml[abs..];
         // Guard against matching <DataSomethingElse> when we want only <Data …>.
         if !rest[5..].starts_with(|c: char| c == '>' || c == '/' || c.is_ascii_whitespace()) {
-            cursor = abs + 1;
             continue;
         }
         let name = xml_attr(rest, "Data", "Name");
-        if let Some(gt) = rest.find('>') {
-            if rest[..gt].ends_with('/') {
-                cursor = abs + gt + 1;
-                continue;
-            }
-            let cs = gt + 1;
-            if let Some(end) = rest[cs..].find("</Data>") {
-                let value = rest[cs..cs + end].trim().to_string();
-                let key = name.unwrap_or_else(|| {
-                    let k = format!("_{}", anon);
-                    anon += 1;
-                    k
-                });
-                map.push((key, value));
-                cursor = abs + cs + end + 7;
-            } else {
-                cursor = abs + 1;
-            }
-        } else {
-            cursor = abs + 1;
+        let Some(gt) = rest.find('>') else { continue };
+        if rest[..gt].ends_with('/') {
+            resume_from = abs + gt + 1;
+            continue;
         }
+        let cs = gt + 1;
+        let Some(end) = rest[cs..].find("</Data>") else { continue };
+        let value = rest[cs..cs + end].trim().to_string();
+        let key = name.unwrap_or_else(|| {
+            let k = format!("_{}", anon);
+            anon += 1;
+            k
+        });
+        map.push((key, value));
+        resume_from = abs + cs + end + 7;
     }
     map
 }

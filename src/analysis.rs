@@ -436,7 +436,7 @@ pub fn extract_boot_cycles(
 
 /// Runs both annotation passes (minidumps then WER module) over all cycles.
 fn annotate_with_wer_and_dumps(
-    cycles: &mut Vec<BootCycle>,
+    cycles: &mut [BootCycle],
     wer:    &[WerRecord],
     dumps:  &[(Timestamp, PathBuf)],
 ) {
@@ -494,10 +494,8 @@ fn annotate_wer_module(
         (!wr.bucket_id.is_empty()).then(|| format!("(bucket: {})", wr.bucket_id))
     });
 
-    if cycle.minidumps.is_empty() {
-        if let Some(ref p) = wr.minidump_path {
-            cycle.minidumps = vec![(wr.time_created, p.clone())];
-        }
+    if let (true, Some(p)) = (cycle.minidumps.is_empty(), &wr.minidump_path) {
+        cycle.minidumps = vec![(wr.time_created, p.clone())];
     }
 }
 

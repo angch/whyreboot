@@ -64,7 +64,7 @@ impl Timestamp {
 }
 
 fn to_ft(ts: Timestamp) -> FILETIME {
-    let v = (ts.0 + FT_EPOCH) * 10_000_000;
+    let v = ts.0.saturating_add(FT_EPOCH).saturating_mul(10_000_000);
     let v = v.max(0);
     FILETIME {
         dwLowDateTime:  (v & 0xFFFF_FFFF) as u32,

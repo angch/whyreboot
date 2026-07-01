@@ -38,7 +38,7 @@ pub fn fetch_channel(channel: &[u16], query_str: &[u16], limit: usize) -> Vec<Ev
                 let mut pc    = 0u32;
                 let _ = EvtRender(None, h_ev, EvtRenderEventXml.0, 0, None, &mut needed, &mut pc);
                 if needed > 0 {
-                    let mut buf = vec![0u16; (needed as usize + 1) / 2 + 1];
+                    let mut buf = vec![0u16; (needed as usize).div_ceil(2) + 1];
                     if EvtRender(
                         None,
                         h_ev,
@@ -96,11 +96,31 @@ pub fn fetch_system_events() -> Vec<EventRecord> {
     fetch_channel(&ch, &q, 300)
 }
 
+/// Maximum length kept for any single WER text field (see trust-boundary note below).
+const MAX_WER_FIELD_LEN: usize = 4096;
+
+/// Truncates `s` to at most `MAX_WER_FIELD_LEN` chars, on a char boundary.
+fn clamp_field(s: &str) -> String {
+    match s.char_indices().nth(MAX_WER_FIELD_LEN) {
+        Some((byte_idx, _)) => s[..byte_idx].to_string(),
+        None => s.to_string(),
+    }
+}
+
 /// Fetches WER BugCheck records from the Application log (Event 1001).
 /// Filters to records where the provider name contains "error reporting" or "wer"
 /// and `EventName` is `"BlueScreen"` or `"BugCheck"` (both accepted defensively).
 /// Parses `P1` as bare hex (no `0x` prefix) for the stop code.
 /// Falls back through `Bucket` → `BucketId` → `HashedBucket` → `_0` for the bucket field.
+///
+/// Trust boundary: any unprivileged local process can write an Event 1001 to the
+/// Application log via `ReportEvent` — these fields are not privileged. They are
+/// only ever displayed (never opened or executed), and `annotate_wer_module`
+/// additionally requires the stop code and time window to match a real Event 41
+/// before using them, so a spoofed record can at worst mislabel the faulting
+/// module in the diagnosis, not cause code execution or a file-system read.
+/// Field lengths are still clamped defensively so a malicious record can't bloat
+/// the displayed output.
 pub fn fetch_wer_events() -> Vec<WerRecord> {
     let ch: Vec<u16> = "Application\0".encode_utf16().collect();
     let q: Vec<u16>  = "*[System[EventID=1001]]\0".encode_utf16().collect();
@@ -125,13 +145,13 @@ pub fn fetch_wer_events() -> Vec<WerRecord> {
                 .or_else(|| ev.get("BucketId"))
                 .or_else(|| ev.get("HashedBucket"))
                 .or_else(|| ev.get("_0"))
-                .unwrap_or_default()
-                .to_owned();
+                .unwrap_or_default();
+            let bucket_id = clamp_field(bucket_id);
             let minidump_path = ev.get("AttachedFiles").and_then(|s| {
                 s.lines()
                     .map(|l| l.trim())
                     .find(|l| l.to_lowercase().ends_with(".dmp"))
-                    .map(|l| PathBuf::from(l.trim_start_matches(r"\\?\")))
+                    .map(|l| PathBuf::from(clamp_field(l.trim_start_matches(r"\\?\"))))
             });
             Some(WerRecord { time_created: ev.time_created, p1, bucket_id, minidump_path })
         })
@@ -149,13 +169,13 @@ pub fn list_minidumps() -> Vec<(Timestamp, PathBuf)> {
         .filter(|e| {
             e.path()
                 .extension()
-                .map_or(false, |x| x.eq_ignore_ascii_case("dmp"))
+                .is_some_and(|x| x.eq_ignore_ascii_case("dmp"))
         })
         .filter_map(|e| {
             let mt = e.metadata().ok()?.modified().ok()?;
             Some((Timestamp::from_system_time(mt), e.path()))
         })
         .collect();
-    v.sort_by(|a, b| b.0.cmp(&a.0));
+    v.sort_by_key(|b| std::cmp::Reverse(b.0));
     v
 }

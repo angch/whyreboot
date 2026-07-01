@@ -49,7 +49,8 @@ fn print_cycle_header(cycle: &BootCycle, pal: &Pal, total: usize, dline: &str) {
         } else {
             format!(" Boot Cycle {} of {} ", total - cycle.index, total)
         };
-        let pad  = w.saturating_sub(label.len());
+        // Pad by char count, not byte length — the em dash is 3 bytes but 1 column.
+        let pad  = w.saturating_sub(label.chars().count());
         let lpad = pad / 2;
         let rpad = pad - lpad;
         println!("{}{}{}{}{}",
@@ -164,7 +165,7 @@ fn print_event_table(cycle: &BootCycle, line: &str) {
     if cycle.display_events.is_empty() { return; }
     println!();
     println!("{}", line);
-    println!("{:<20} {:>6}  {:<26}  {}", "Time", "Event", "Provider", "Summary");
+    println!("{:<20} {:>6}  {:<26}  Summary", "Time", "Event", "Provider");
     println!("{}", line);
     for ev in &cycle.display_events {
         println!(

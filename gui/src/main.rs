@@ -32,6 +32,7 @@ static AUDIO:  OnceLock<Vec<AudioPowerInfo>> = OnceLock::new();
 const LVN_GETINFOTIPW_CODE: u32 = 0xFFFF_FF62;
 
 // Per-item tooltip data sent with LVN_GETINFOTIPW
+#[allow(clippy::upper_case_acronyms)]
 #[repr(C)]
 struct NMLVGETINFOTIPW {
     hdr:        NMHDR,
@@ -162,7 +163,7 @@ fn format_cycle_detail(c: &BootCycle, audio: &[AudioPowerInfo]) -> String {
     if !c.display_events.is_empty() {
         let line = "\u{2500}".repeat(69);
         s += &format!("\r\n{}\r\n", line);
-        s += &format!("{:<20} {:>6}  {:<26}  {}\r\n", "Time", "Event", "Provider", "Summary");
+        s += &format!("{:<20} {:>6}  {:<26}  Summary\r\n", "Time", "Event", "Provider");
         s += &format!("{}\r\n", line);
         for ev in &c.display_events {
             s += &format!(
@@ -253,8 +254,8 @@ unsafe fn build_boot_history(parent: HWND, rc: RECT, hi: HINSTANCE, font: HGDIOB
     let lv = CreateWindowExW(
         WS_EX_CLIENTEDGE, WC_LISTVIEWW, w!(""),
         WS_CHILD | WS_VISIBLE | WS_VSCROLL
-            | WINDOW_STYLE(LVS_REPORT as u32 | LVS_SINGLESEL as u32
-                         | LVS_NOSORTHEADER as u32 | LVS_SHOWSELALWAYS as u32),
+            | WINDOW_STYLE(LVS_REPORT | LVS_SINGLESEL
+                         | LVS_NOSORTHEADER | LVS_SHOWSELALWAYS),
         PAD, PAD, LV_W, ph - PAD * 2,
         Some(panel), hmenu_id(300), Some(hi), None,
     ).unwrap_or(HWND(std::ptr::null_mut()));
@@ -449,11 +450,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             let tab  = TAB_H.with(|t| as_hwnd(t.get()));
             let lv   = LV_H.with(|t| as_hwnd(t.get()));
 
-            if hdr.hwndFrom == tab && hdr.code == TCN_SELCHANGE as u32 {
+            if hdr.hwndFrom == tab && hdr.code == TCN_SELCHANGE {
                 let sel = SendMessageW(tab, TCM_GETCURSEL,
                     Some(WPARAM(0)), Some(LPARAM(0))).0 as usize;
                 switch_tab(sel);
-            } else if hdr.hwndFrom == lv && hdr.code == LVN_ITEMCHANGED as u32 {
+            } else if hdr.hwndFrom == lv && hdr.code == LVN_ITEMCHANGED {
                 let nmlv = &*(lp.0 as *const NMLISTVIEW);
                 // Only act when a row becomes selected (not deselected)
                 if nmlv.uChanged.0 & LVIF_STATE.0 != 0
@@ -465,21 +466,19 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 let tip = &mut *(lp.0 as *mut NMLVGETINFOTIPW);
                 if tip.item >= 0 && !tip.psz_text.0.is_null() && tip.cch_max > 0 {
                     let cycles = CYCLES.get().map(|v| v.as_slice()).unwrap_or(&[]);
-                    if let Some(c) = cycles.get(tip.item as usize) {
-                        if let Some(t) = c.boot_time {
-                            let secs = Timestamp::now().secs_since(t).max(0);
-                            let ago = if secs < 120       { format!("{secs} seconds ago") }
-                                else if secs < 7200       { format!("{} minutes ago", secs / 60) }
-                                else if secs < 172_800    { format!("{} hours ago",   secs / 3600) }
-                                else                      { format!("{} days ago",    secs / 86400) };
-                            let encoded: Vec<u16> = ago.encode_utf16().collect();
-                            let max = (tip.cch_max as usize).saturating_sub(1);
-                            let len = encoded.len().min(max);
-                            for (i, &ch) in encoded[..len].iter().enumerate() {
-                                *tip.psz_text.0.add(i) = ch;
-                            }
-                            *tip.psz_text.0.add(len) = 0;
+                    if let Some(t) = cycles.get(tip.item as usize).and_then(|c| c.boot_time) {
+                        let secs = Timestamp::now().secs_since(t).max(0);
+                        let ago = if secs < 120       { format!("{secs} seconds ago") }
+                            else if secs < 7200       { format!("{} minutes ago", secs / 60) }
+                            else if secs < 172_800    { format!("{} hours ago",   secs / 3600) }
+                            else                      { format!("{} days ago",    secs / 86400) };
+                        let encoded: Vec<u16> = ago.encode_utf16().collect();
+                        let max = (tip.cch_max as usize).saturating_sub(1);
+                        let len = encoded.len().min(max);
+                        for (i, &ch) in encoded[..len].iter().enumerate() {
+                            *tip.psz_text.0.add(i) = ch;
                         }
+                        *tip.psz_text.0.add(len) = 0;
                     }
                 }
             }
