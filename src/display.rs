@@ -3,7 +3,8 @@
 
 use crate::color::Pal;
 use whyreboot::format::{
-    cause_label, cause_detail, fmt_secs, short_provider, event_summary, generate_explanation,
+    audio_power_status_text, cause_label, cause_detail, event_row, event_table_header,
+    fmt_secs, generate_explanation, is_audio_power_crash, relative_ago,
 };
 use whyreboot::timestamp::Timestamp;
 use whyreboot::types::{AudioPowerInfo, BootCycle, Cause};
@@ -62,7 +63,7 @@ fn print_cycle_header(cycle: &BootCycle, pal: &Pal, total: usize, dline: &str) {
 
 fn print_boot_times(cycle: &BootCycle, pal: &Pal) {
     if let Some(bt) = cycle.boot_time {
-        let ago_s = secs_to_ago(Timestamp::now().secs_since(bt));
+        let ago_s = relative_ago(Timestamp::now().secs_since(bt));
         println!("  {}Last boot:{} {}  ({})", pal.bold, pal.reset, bt.format_dt(), ago_s);
     } else {
         println!("  {}Boot time:{} (unknown — no Event 12 in log window)", pal.bold, pal.reset);
@@ -76,13 +77,6 @@ fn print_boot_times(cycle: &BootCycle, pal: &Pal) {
                 sd.format_t(), bt.format_t(), fmt_secs(offline));
         }
     }
-}
-
-fn secs_to_ago(secs: i64) -> String {
-    let s = secs.max(0);
-    if s >= 2 * 86_400       { format!("{} days ago",    s / 86_400) }
-    else if s >= 2 * 3_600   { format!("{} hours ago",   s / 3_600)  }
-    else                      { format!("{} minutes ago", s / 60)     }
 }
 
 fn print_verdict(cycle: &BootCycle, pal: &Pal) {
@@ -131,22 +125,17 @@ fn print_minidumps(cycle: &BootCycle, pal: &Pal) {
 /// Prints audio class registry power state — only for power-related BSODs
 /// where the faulting module is audio-related (`portcls`, `audio`, `hdaud`).
 fn print_device_power(cycle: &BootCycle, pal: &Pal, audio: &[AudioPowerInfo]) {
-    let module_low = cycle.wer_module.as_deref().unwrap_or("").to_lowercase();
-    let is_power_crash = matches!(&cycle.cause, Cause::BlueScreen { stop_code, .. }
-        if *stop_code == 0x9F || *stop_code == 0x19C || *stop_code == 0xFE || *stop_code == 0x144);
-    let is_audio_crash = is_power_crash
-        && (module_low.contains("portcls") || module_low.contains("audio") || module_low.contains("hdaud"));
-
-    if !is_audio_crash || audio.is_empty() { return; }
+    if !is_audio_power_crash(&cycle.cause, &cycle.wer_module) || audio.is_empty() { return; }
 
     println!();
     println!("  {}Device Power Settings (audio class):{}", pal.bold, pal.reset);
     for dev in audio {
-        let (color, text) = match dev.allow_idle_d3 {
-            Some(0) => (pal.ok,    "AllowIdleIrpInD3=0  [safe — D3 idle disabled]"),
-            Some(_) => (pal.crash, "AllowIdleIrpInD3=1  [RISKY — D3 idle enabled]"),
-            None    => (pal.warn,  "AllowIdleIrpInD3: not set [driver default — risky]"),
+        let color = match dev.allow_idle_d3 {
+            Some(0) => pal.ok,
+            Some(_) => pal.crash,
+            None    => pal.warn,
         };
+        let text = audio_power_status_text(dev.allow_idle_d3);
         println!("    [{}] {:<32}  {}{}{}", dev.instance, dev.name, color, text, pal.reset);
     }
 }
@@ -165,16 +154,10 @@ fn print_event_table(cycle: &BootCycle, line: &str) {
     if cycle.display_events.is_empty() { return; }
     println!();
     println!("{}", line);
-    println!("{:<20} {:>6}  {:<26}  Summary", "Time", "Event", "Provider");
+    println!("{}", event_table_header());
     println!("{}", line);
     for ev in &cycle.display_events {
-        println!(
-            "{:<20} {:>6}  {:<26.26}  {}",
-            ev.time_created.format_dt(),
-            ev.event_id,
-            short_provider(&ev.provider),
-            event_summary(ev),
-        );
+        println!("{}", event_row(ev));
     }
     println!("{}", line);
 }

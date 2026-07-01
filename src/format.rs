@@ -53,11 +53,59 @@ pub fn fmt_secs(s: i64) -> String {
     else             { format!("{}h {:02}m", s / 3600, (s % 3600) / 60) }
 }
 
+/// Formats a past duration in seconds as a coarse "N units ago" phrase:
+/// seconds (<2m), minutes (<2h), hours (<2d), or days.
+pub fn relative_ago(secs: i64) -> String {
+    let s = secs.max(0);
+    if s < 120          { format!("{s} seconds ago") }
+    else if s < 7_200   { format!("{} minutes ago", s / 60) }
+    else if s < 172_800 { format!("{} hours ago",   s / 3_600) }
+    else                { format!("{} days ago",    s / 86_400) }
+}
+
+// ── Audio power-crash classification ──────────────────────────────────────────
+
+/// True if `cause` is a known power-transition BSOD (0x9F, 0x19C, 0xFE, 0x144)
+/// and `wer_module` names an audio driver (`portcls`, `audio`, `hdaud`).
+pub fn is_audio_power_crash(cause: &Cause, wer_module: &Option<String>) -> bool {
+    let is_power_crash = matches!(cause, Cause::BlueScreen { stop_code, .. }
+        if *stop_code == 0x9F || *stop_code == 0x19C || *stop_code == 0xFE || *stop_code == 0x144);
+    if !is_power_crash { return false; }
+    let module_low = wer_module.as_deref().unwrap_or("").to_lowercase();
+    module_low.contains("portcls") || module_low.contains("audio") || module_low.contains("hdaud")
+}
+
+/// Human-readable status text for one audio device's `AllowIdleIrpInD3` registry
+/// value: `Some(0)` is safe, `Some(_)` is risky, `None` is unset (driver default).
+pub fn audio_power_status_text(allow_idle_d3: Option<u32>) -> &'static str {
+    match allow_idle_d3 {
+        Some(0) => "AllowIdleIrpInD3=0  [safe — D3 idle disabled]",
+        Some(_) => "AllowIdleIrpInD3=1  [RISKY — D3 idle enabled]",
+        None    => "AllowIdleIrpInD3: not set [driver default — risky]",
+    }
+}
+
 // ── Event helpers ─────────────────────────────────────────────────────────────
 
 /// Returns the last `-`-delimited component of a provider name for compact display.
 pub fn short_provider(p: &str) -> &str {
     p.rfind('-').map(|i| &p[i + 1..]).unwrap_or(p)
+}
+
+/// Header row for the raw event table (pair with `event_row` for each entry).
+pub fn event_table_header() -> String {
+    format!("{:<20} {:>6}  {:<26}  Summary", "Time", "Event", "Provider")
+}
+
+/// One formatted row of the raw event table: time, event ID, short provider, summary.
+pub fn event_row(ev: &EventRecord) -> String {
+    format!(
+        "{:<20} {:>6}  {:<26.26}  {}",
+        ev.time_created.format_dt(),
+        ev.event_id,
+        short_provider(&ev.provider),
+        event_summary(ev),
+    )
 }
 
 /// Short human-readable summary for a raw event row in the event table.
@@ -245,6 +293,92 @@ mod tests {
     #[test]
     fn fmt_secs_negative_clamped_to_zero() {
         assert_eq!(fmt_secs(-100), "0s");
+    }
+
+    // ── relative_ago ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn relative_ago_seconds_range() {
+        assert_eq!(relative_ago(0),   "0 seconds ago");
+        assert_eq!(relative_ago(119), "119 seconds ago");
+    }
+
+    #[test]
+    fn relative_ago_minutes_range() {
+        assert_eq!(relative_ago(120),  "2 minutes ago");
+        assert_eq!(relative_ago(7199), "119 minutes ago");
+    }
+
+    #[test]
+    fn relative_ago_hours_range() {
+        assert_eq!(relative_ago(7200),   "2 hours ago");
+        assert_eq!(relative_ago(172_799), "47 hours ago");
+    }
+
+    #[test]
+    fn relative_ago_days_range() {
+        assert_eq!(relative_ago(172_800), "2 days ago");
+        assert_eq!(relative_ago(864_000), "10 days ago");
+    }
+
+    #[test]
+    fn relative_ago_negative_clamped_to_zero() {
+        assert_eq!(relative_ago(-100), "0 seconds ago");
+    }
+
+    // ── is_audio_power_crash ──────────────────────────────────────────────────
+
+    #[test]
+    fn audio_power_crash_true_for_portcls_0x9f() {
+        let c = Cause::BlueScreen { stop_code: 0x9F, stop_name: "X", params: [0; 4] };
+        assert!(is_audio_power_crash(&c, &Some("portcls".into())));
+    }
+
+    #[test]
+    fn audio_power_crash_false_for_non_power_stop_code() {
+        let c = Cause::BlueScreen { stop_code: 0x50, stop_name: "X", params: [0; 4] };
+        assert!(!is_audio_power_crash(&c, &Some("portcls".into())));
+    }
+
+    #[test]
+    fn audio_power_crash_false_for_non_audio_module() {
+        let c = Cause::BlueScreen { stop_code: 0x9F, stop_name: "X", params: [0; 4] };
+        assert!(!is_audio_power_crash(&c, &Some("usbccgp".into())));
+    }
+
+    #[test]
+    fn audio_power_crash_false_for_non_bsod() {
+        assert!(!is_audio_power_crash(&Cause::NormalShutdown, &Some("portcls".into())));
+    }
+
+    // ── audio_power_status_text ───────────────────────────────────────────────
+
+    #[test]
+    fn audio_power_status_text_variants() {
+        assert!(audio_power_status_text(Some(0)).contains("safe"));
+        assert!(audio_power_status_text(Some(1)).contains("RISKY"));
+        assert!(audio_power_status_text(None).contains("not set"));
+    }
+
+    // ── event_table_header / event_row ────────────────────────────────────────
+
+    #[test]
+    fn event_table_header_has_expected_columns() {
+        let h = event_table_header();
+        assert!(h.contains("Time") && h.contains("Event") && h.contains("Provider") && h.contains("Summary"));
+    }
+
+    #[test]
+    fn event_row_contains_provider_and_summary() {
+        let ev = EventRecord {
+            event_id: 12,
+            time_created: crate::timestamp::Timestamp(0),
+            provider: "Microsoft-Windows-Kernel-General".into(),
+            data: vec![],
+        };
+        let row = event_row(&ev);
+        assert!(row.contains("General"));
+        assert!(row.contains("System started"));
     }
 
     // ── cause_label ───────────────────────────────────────────────────────────

@@ -9,6 +9,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use whyreboot::format::relative_ago;
 use whyreboot::timestamp::Timestamp;
 
 use crate::panels::{build_about, build_boot_history, panel_proc, switch_tab, update_detail};
@@ -80,11 +81,7 @@ pub unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                 if tip.item >= 0 && !tip.psz_text.0.is_null() && tip.cch_max > 0 {
                     let cycles = CYCLES.get().map(|v| v.as_slice()).unwrap_or(&[]);
                     if let Some(t) = cycles.get(tip.item as usize).and_then(|c| c.boot_time) {
-                        let secs = Timestamp::now().secs_since(t).max(0);
-                        let ago = if secs < 120       { format!("{secs} seconds ago") }
-                            else if secs < 7200       { format!("{} minutes ago", secs / 60) }
-                            else if secs < 172_800    { format!("{} hours ago",   secs / 3600) }
-                            else                      { format!("{} days ago",    secs / 86400) };
+                        let ago = relative_ago(Timestamp::now().secs_since(t));
                         let encoded: Vec<u16> = ago.encode_utf16().collect();
                         let max = (tip.cch_max as usize).saturating_sub(1);
                         let len = encoded.len().min(max);
