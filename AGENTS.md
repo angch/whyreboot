@@ -25,7 +25,7 @@ src/events.rs     — System + WER event fetching, minidump listing
 src/analysis.rs   — boot cycle analysis, lookup tables, WER correlation
 src/registry.rs   — registry helpers + audio power settings check
 src/display.rs    — text/JSON output, explanation generation
-Cargo.toml        — deps: windows 0.62.2 + chrono 0.4
+Cargo.toml        — deps: windows 0.62.2 (timestamps handled by src/timestamp.rs)
 HowItWorks.md     — full narrative of the analysis pipeline and decision logic
 TODO.md           — feature tracking (most items done)
 HANDOFF.md        — early session notes (mostly superseded by this file)

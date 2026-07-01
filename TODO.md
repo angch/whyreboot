@@ -2,9 +2,7 @@
 
 ## Open
 
-- [ ] **Release build + install script**
-  `cargo build --release` then copy `target\release\whyreboot.exe` to
-  `C:\Users\angch\.local\bin\` (already on PATH).
+(none)
 
 ## Hardware investigation notes
 

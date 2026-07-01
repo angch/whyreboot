@@ -180,14 +180,25 @@ fn print_event_table(cycle: &BootCycle, line: &str) {
 
 // ── JSON output ───────────────────────────────────────────────────────────────
 
-/// Escapes a string for JSON output (backslash, quote, newlines, tabs).
+/// Escapes a string for JSON output: backslash, quote, the standard short
+/// escapes (`\n`, `\r`, `\t`), and any other ASCII control character (0x00-0x1F)
+/// via `\u00XX` so the output is valid JSON even with unexpected control bytes.
 fn json_str(s: &str) -> String {
-    format!("\"{}\"",
-        s.replace('\\', "\\\\")
-         .replace('"',  "\\\"")
-         .replace('\n', "\\n")
-         .replace('\r', "\\r")
-         .replace('\t', "\\t"))
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"'  => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Outputs all boot cycles as hand-built JSON to stdout (no serde dependency).

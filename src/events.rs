@@ -32,7 +32,7 @@ pub fn fetch_channel(channel: &[u16], query_str: &[u16], limit: usize) -> Vec<Ev
             {
                 break;
             }
-            for &h in &handles[..returned as usize] {
+            for (i, &h) in handles[..returned as usize].iter().enumerate() {
                 let h_ev = EVT_HANDLE(h);
                 let mut needed = 0u32;
                 let mut pc    = 0u32;
@@ -66,6 +66,11 @@ pub fn fetch_channel(channel: &[u16], query_str: &[u16], limit: usize) -> Vec<Ev
                 }
                 let _ = EvtClose(h_ev);
                 if records.len() >= limit {
+                    // EvtNext already handed us the rest of this batch; close
+                    // those handles too or they leak on early exit.
+                    for &h_rest in &handles[i + 1..returned as usize] {
+                        let _ = EvtClose(EVT_HANDLE(h_rest));
+                    }
                     break 'outer;
                 }
             }

@@ -442,6 +442,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             LRESULT(0)
         }
         WM_NOTIFY => {
+            if lp.0 == 0 {
+                return DefWindowProcW(hwnd, msg, wp, lp);
+            }
             let hdr  = &*(lp.0 as *const NMHDR);
             let tab  = TAB_H.with(|t| as_hwnd(t.get()));
             let lv   = LV_H.with(|t| as_hwnd(t.get()));
@@ -460,7 +463,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 }
             } else if hdr.hwndFrom == lv && hdr.code == LVN_GETINFOTIPW_CODE {
                 let tip = &mut *(lp.0 as *mut NMLVGETINFOTIPW);
-                if tip.item >= 0 {
+                if tip.item >= 0 && !tip.psz_text.0.is_null() && tip.cch_max > 0 {
                     let cycles = CYCLES.get().map(|v| v.as_slice()).unwrap_or(&[]);
                     if let Some(c) = cycles.get(tip.item as usize) {
                         if let Some(t) = c.boot_time {

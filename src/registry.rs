@@ -50,23 +50,23 @@ fn reg_read_string(hk: windows::Win32::System::Registry::HKEY, name: &str) -> Op
     }
     // sz=2 is just a null terminator (empty string); skip that too.
     if sz <= 2 { return None; }
-    let mut buf = vec![0u8; sz as usize + 2];
+    // Buffer as Vec<u16> (not Vec<u8>) so the allocation is 2-byte aligned;
+    // reading back through a misaligned *const u16 is undefined behavior.
+    let mut buf = vec![0u16; sz as usize / 2 + 2];
     let ok = unsafe {
         RegQueryValueExW(
             hk,
             windows::core::PCWSTR(w.as_ptr()),
             None,
             Some(&mut tp),
-            Some(buf.as_mut_ptr()),
+            Some(buf.as_mut_ptr() as *mut u8),
             Some(&mut sz),
         )
         .ok()
         .is_ok()
     };
     if ok && (tp.0 == 1 || tp.0 == 2) {
-        let chars = unsafe {
-            std::slice::from_raw_parts(buf.as_ptr() as *const u16, sz as usize / 2)
-        };
+        let chars = &buf[..sz as usize / 2];
         let trimmed = String::from_utf16_lossy(chars);
         let trimmed = trimmed.trim_end_matches('\0');
         if !trimmed.is_empty() { Some(trimmed.to_string()) } else { None }
