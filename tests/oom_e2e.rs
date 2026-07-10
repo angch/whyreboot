@@ -93,7 +93,7 @@ fn macos_ndjson_fixture_detects_shutdown_panic_crash_and_update() {
     // macOS `log show --style ndjson` format, parsed by the same shared code —
     // this runs on every platform, so the macOS path is regression-tested on Linux CI.
     let lines = fetch_from_file(&fixture("macos.jsonl")).expect("read fixture");
-    assert_eq!(lines.len(), 7, "all ndjson lines should parse");
+    assert_eq!(lines.len(), 8, "all ndjson lines should parse");
 
     let findings = scan(&lines);
     let cats: Vec<&str> = findings.iter().map(|f| f.category.as_str()).collect();
@@ -106,6 +106,11 @@ fn macos_ndjson_fixture_detects_shutdown_panic_crash_and_update() {
     // Clean shutdown (cause 5) and the benign Thunderbolt line yield nothing:
     // exactly one ShutdownCause finding (the -61 watchdog).
     assert_eq!(findings.iter().filter(|f| f.category == "ShutdownCause").count(), 1);
+
+    // Live-Mac regression: the kernel tcp_connection_summary line (with its
+    // literal "<IPv4-redacted>" and "so_error: 0") must yield NO finding.
+    assert!(!findings.iter().any(|f| f.category == "Hardware"),
+        "redacted tcp summary must not be a Hardware finding");
 
     // The watchdog panic names WindowServer, and the shutdown cause is Critical.
     let panic = findings.iter().find(|f| f.category == "KernelPanic").unwrap();

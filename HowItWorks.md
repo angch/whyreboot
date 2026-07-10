@@ -311,7 +311,7 @@ Three levels (each detector's doc comment in `detect.rs` carries its level):
 | GPU | **third-party logs — untested live** | verbatim from Ubuntu/Arch/NVIDIA/Framework reports (incl. Strix Halo gfx1151) |
 | Session | **third-party logs — untested live** | verbatim from GNOME GitLab / Mozilla / KDE / Arch reports; dev VM has no graphical session |
 | KernelPanic, Segfault, Lockup, Thermal, Hardware, Coredump | canonical format | fixture-tested only; benign EDAC/boot-banner baselines verified-live |
-| ShutdownCause, SleepWake, Crash, UpdateRestart (macOS) | **third-party logs — untested live** | formats from public reports/documentation; developed on Linux, CI smoke-runs on macOS runners |
+| ShutdownCause, SleepWake, Crash, UpdateRestart (macOS) | **third-party logs — untested live** | formats from public reports/documentation; the fetch/parse backend IS verified-live on a real Mac (which also surfaced and fixed the `<IPv4-redacted>`→EDAC false positive), but no real shutdown/panic/crash incident has been matched yet |
 
 A miss (wording drift on some kernel/driver version) silently yields no finding — it never misclassifies or crashes. If you hit a real incident that these patterns miss, capture it with `journalctl -o json > incident.jsonl` and replay with `--from-file`; extending the markers is a one-function change.
 
@@ -324,6 +324,8 @@ A miss (wording drift on some kernel/driver version) silently yields no finding 
 | `EXT4-fs (sda3): mounted filesystem … ro` → `re-mounted … r/w` | `EXT4-fs (` | Normal root-mount sequence (ro first, then r/w) |
 
 Rule: a marker that is a bare subsystem name/prefix (`EDAC`, `mce:`, `MCE `, `EXT4-fs (`, `XFS (`, `Btrfs`) must be **gated on an error indication** in the same message (`error`/`fail`/`corrupt`/`warning`, or an ` CE `/` UE ` event count). Unambiguous markers (`Hardware Error`, `EXT4-fs error`, `Kernel panic`, …) match directly. When adding a detector, check what the subsystem logs at boot (`journalctl -k -b | grep -i <name>`) before trusting a bare name. A quick way to vet the whole taxonomy: run `whyreboot --all` on a healthy machine — ideally it should report nothing from the kernel side.
+
+**Acronym markers must be case-sensitive** (found live on a real Mac): case-insensitive `EDAC` matches inside ordinary words — macOS kernel `tcp_connection_summary` lines contain the literal privacy token `<IPv4-redacted>`, and "red**edac**ted" contains "edac"; the same line's `so_error: 0` then satisfied the error gate, producing a bogus "Corrected hardware/memory error (ECC)" finding. The kernel always logs `EDAC`/`MCE` uppercase and `mce:` lowercase, so those markers now match exactly (`str::contains`, not the case-insensitive helper). Prefer case-sensitive matching for any short acronym marker.
 
 OOM specifics (`oom.rs`): the kernel detector keys on `Killed process <pid> (<comm>)` (also older `Kill process`), extracting pid, comm, and `anon-rss:`/`total-vm:`/`oom_score_adj:`; the `invoked oom-killer:`/`oom-kill:` context lines are deliberately **not** counted, so a single kill = one finding. The systemd-oomd detector (identifier `systemd-oomd`) parses `Killed <cgroup> due to <reason>`.
 

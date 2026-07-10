@@ -561,29 +561,44 @@ fn detect_thermal(line: &LogLine) -> Option<Finding> {
 /// Machine-check exceptions and other hardware-error reports.
 ///
 /// Provenance: **canonical format** (mce/EDAC/AER wording) — fixture tested;
-/// the EDAC boot-banner negative baseline is **verified-live** (this dev VM).
-/// No live hardware error reproduced during development.
+/// the EDAC boot-banner negative baseline is **verified-live** (this dev VM),
+/// and the case-sensitivity of the acronym markers is **verified-live on
+/// macOS**: a real Mac's kernel `tcp_connection_summary` lines contain
+/// `<IPv4-redacted>` — and case-insensitive "EDAC" matches inside
+/// "red**edac**ted"… inside "redACted". Acronyms must match exactly.
 fn detect_hardware(line: &LogLine) -> Option<Finding> {
-    let markers = [
-        "Hardware Error", "Machine check events logged", "mce:", "MCE ",
-        "Uncorrected error", "Corrected error", "EDAC", "PCIe Bus Error",
+    // EDAC and MCE are kernel subsystems; never attribute other sources.
+    if !is_kernel(line) { return None; }
+    let msg = &line.message;
+
+    // Phrase markers: case-insensitive is safe (multi-word, no acronym risk).
+    let phrases = [
+        "Hardware Error", "Machine check events logged",
+        "Uncorrected error", "Corrected error", "PCIe Bus Error",
     ];
-    let m = first_of(&line.message, &markers)?;
+    // Acronym markers: MUST be case-sensitive. The kernel always logs
+    // "EDAC"/"MCE" uppercase and "mce:" lowercase; case-insensitive matching
+    // hits ordinary words (macOS's literal "<IPv4-redacted>" contains "edac").
+    let acronym = ["EDAC", "MCE ", "mce:"].iter().any(|a| msg.contains(a));
+
+    let m = match first_of(msg, &phrases) {
+        Some(m) => m,
+        None if acronym => "acronym",
+        None => return None,
+    };
     // "EDAC" / "mce:" / "MCE " also appear in benign boot-time driver banners
-    // ("EDAC MC: Ver: 3.0.0", "mce: CPU supports 32 MCE banks"). For those
-    // ambiguous markers, require an actual error indication in the message;
-    // real reports carry "error"/"fail" or a CE/UE (corrected/uncorrected
-    // event) count, e.g. "EDAC MC0: 1 CE memory read error …".
-    if matches!(m, "EDAC" | "mce:" | "MCE ") {
-        let msg = &line.message;
+    // ("EDAC MC: Ver: 3.0.0", "mce: CPU supports 32 MCE banks"). Require an
+    // actual error indication; real reports carry "error"/"fail" or a CE/UE
+    // (corrected/uncorrected event) count, e.g. "EDAC MC0: 1 CE memory read …".
+    if m == "acronym" {
         let errorish = contains_ci(msg, "error") || contains_ci(msg, "fail")
             || msg.contains(" CE ") || msg.contains(" UE ");
         if !errorish { return None; }
     }
-    let uncorrected = has(&line.message, "uncorrected") || has(&line.message, "fatal");
+    let uncorrected = has(msg, "uncorrected") || has(msg, "fatal");
     let (sev, title) = if uncorrected {
         (Severity::Critical, "Uncorrected hardware (machine-check) error")
-    } else if has(&line.message, "corrected") || has(&line.message, "EDAC") {
+    } else if has(msg, "corrected") || msg.contains("EDAC") {
         (Severity::Warning, "Corrected hardware/memory error (ECC)")
     } else {
         (Severity::Critical, "Hardware error reported")
@@ -854,6 +869,31 @@ mod tests {
             "mce: [Hardware Error]: Machine check events logged"
         )).unwrap();
         assert_eq!(f.category, "Hardware");
+    }
+
+    #[test]
+    fn macos_redacted_tcp_summary_is_not_a_hardware_error() {
+        // Real false positive from a live Mac: "<IPv4-redacted>" contains
+        // "edac" case-insensitively, and "so_error: 0" satisfied the error
+        // gate. Acronym markers are now case-sensitive, so this must not match.
+        let msg = "tcp_connection_summary (tcp_usrclosed:3224)\
+                   [<IPv4-redacted>:58102<-><IPv4-redacted>:443] interface: en0 \
+                   (skipped: 56942)\nso_gencnt: 29767936 t_state: FIN_WAIT_1 \
+                   process: Google Chrome He:1532 Duration: 50.666 sec \
+                   so_error: 0 svc/tc: 0 flow: 0xa9a02aee";
+        assert!(classify(&kline(msg)).is_none(), "redacted tcp summary must not match");
+        // Lowercase "edac" in any message must not match either (kernel logs
+        // the subsystem uppercase, always).
+        assert!(classify(&kline("something edac-ish error happened")).is_none());
+        // But real uppercase EDAC error reports still detect.
+        assert!(classify(&kline("EDAC MC0: 1 CE memory read error on DIMM#0")).is_some());
+    }
+
+    #[test]
+    fn hardware_detector_requires_kernel_source() {
+        // Same text from a non-kernel source must not be a hardware finding.
+        let l = user_line("someapp", "mce: [Hardware Error]: Machine check events logged");
+        assert!(classify(&l).is_none());
     }
 
     #[test]
