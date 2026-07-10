@@ -27,6 +27,9 @@ from the window and convert to `Timestamp`.
   coalescing; Linux journal source (`linux.rs`, `journalctl -o json`).
 - Detectors: OOM (kernel + systemd-oomd), kernel panic, segfault, disk/I-O,
   lockup/hung-task, thermal, hardware/MCE, service failure, coredump.
+- Perf: `whyreboot --all` went from never-finishing (unindexed whole-journal
+  `--grep` over 2.3 GB) to ~0.5 s by querying only journald-indexed fields
+  (`_TRANSPORT`, `SYSLOG_IDENTIFIER`, `PRIORITY`) + `--output-fields`.
 
 ## Hardware investigation notes
 

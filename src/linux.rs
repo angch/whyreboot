@@ -20,36 +20,38 @@ use crate::timestamp::Timestamp;
 use crate::timewindow::TimeWindow;
 use crate::types::LogLine;
 
-/// Markers for userspace / systemd issues, queried across the whole journal as a
-/// `--grep` alternation. Unlike the kernel stream (which is small and fetched in
-/// full), the general journal is large, so a filter is required here.
-const USER_GREP: &str = "Failed with result|Main process exited|entered failed state|\
-Start request repeated too quickly|Failed to start|dumped core|\
-due to memory pressure|due to swap";
-
 /// Fetches journal records relevant to issue detection within `window`, merging
 /// the kernel stream, the systemd-oomd unit, and userspace/systemd issue lines.
+///
+/// **Performance:** every query matches only journald-*indexed* fields
+/// (`_TRANSPORT`, `_SYSTEMD_UNIT`, `SYSLOG_IDENTIFIER`, `PRIORITY`) — never
+/// `--grep`, which is an unindexed full-message scan that takes minutes over a
+/// multi-gigabyte journal (the old `--all` never finished). Field matches use the
+/// journal index, so `--all` returns in well under a second. The detectors then
+/// classify precisely; the queries only need to be a superset of what matters.
 pub fn fetch_journal(window: &TimeWindow) -> io::Result<Vec<LogLine>> {
     let mut lines = Vec::new();
 
-    // Kernel ring buffer, fetched UNFILTERED within the window. Deliberately no
-    // `--grep`: the detectors filter precisely, and a rejected/misparsed grep
-    // pattern makes journalctl exit 0 with empty output — silently blinding the
-    // correctness-critical kernel path (OOM, panic, disk errors). A windowed
-    // `-k` is small, so fetching it all is cheap and cannot silently drop events.
-    lines.append(&mut run_journalctl(&["-k"], window, None)?);
+    // Kernel ring buffer (`_TRANSPORT=kernel`), fetched UNFILTERED. Kernel lines
+    // are sparse even in a huge journal, so this is cheap, and taking all of them
+    // means a wording change in any kernel message can't silently drop an event.
+    lines.append(&mut run_journalctl(&["-k"], window)?);
 
     // systemd-oomd unit (userspace OOM killer). Absent unit → empty, not an error.
-    if let Ok(mut v) = run_journalctl(&["-u", "systemd-oomd"], window, None) {
+    if let Ok(mut v) = run_journalctl(&["-u", "systemd-oomd"], window) {
         lines.append(&mut v);
     }
 
-    // Userspace/systemd issues (service failures, coredumps) across the whole
-    // journal. --grep is a necessary volume filter here; if the local journalctl
-    // rejects it we retry unfiltered rather than silently drop these categories.
-    match run_journalctl(&[], window, Some(USER_GREP)) {
-        Ok(mut v) => lines.append(&mut v),
-        Err(_)    => { let _ = run_journalctl(&[], window, None).map(|mut v| lines.append(&mut v)); }
+    // Service failures and coredumps. These come only from the `systemd` (PID 1 /
+    // user manager) and `systemd-coredump` identifiers, and are always logged at
+    // priority notice (5) or higher — while the tens of thousands of routine
+    // unit start/stop lines are info (6). Intersecting the identifier and priority
+    // indexes collapses ~90k lines to a few dozen in ~0.5s. Best-effort: a missing
+    // identifier simply contributes nothing.
+    let user = &["-p", "notice",
+                 "SYSLOG_IDENTIFIER=systemd", "SYSLOG_IDENTIFIER=systemd-coredump"];
+    if let Ok(mut v) = run_journalctl(user, window) {
+        lines.append(&mut v);
     }
 
     dedup(&mut lines);
@@ -70,11 +72,14 @@ pub fn fetch_from_file(path: &Path) -> io::Result<Vec<LogLine>> {
 }
 
 /// Runs `journalctl` with the given extra args plus JSON output and the window
-/// bounds, returning parsed lines. `grep` (if any) is passed as `--grep`.
-fn run_journalctl(extra: &[&str], window: &TimeWindow, grep: Option<&str>) -> io::Result<Vec<LogLine>> {
+/// bounds, returning parsed lines. `--output-fields` trims each record to the
+/// four fields the detectors use, cutting journalctl's serialization and our
+/// parsing cost (journald always also emits `__REALTIME_TIMESTAMP`).
+fn run_journalctl(extra: &[&str], window: &TimeWindow) -> io::Result<Vec<LogLine>> {
     let mut cmd = Command::new("journalctl");
     cmd.args(extra);
-    cmd.args(["-o", "json", "--no-pager"]);
+    cmd.args(["-o", "json", "--no-pager",
+              "--output-fields=MESSAGE,SYSLOG_IDENTIFIER,_TRANSPORT"]);
 
     // journalctl accepts `@<unix-seconds>` for absolute since/until.
     let since;
@@ -86,9 +91,6 @@ fn run_journalctl(extra: &[&str], window: &TimeWindow, grep: Option<&str>) -> io
     if let Some(e) = window.end {
         until = format!("@{}", e.0);
         cmd.args(["--until", &until]);
-    }
-    if let Some(g) = grep {
-        cmd.args(["--grep", g]);
     }
 
     let out = cmd.output()?;

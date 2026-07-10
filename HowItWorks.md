@@ -277,9 +277,11 @@ The user's phrase becomes one concrete `TimeWindow` — the single source of tru
 
 Three `journalctl -o json` queries are issued and merged, each bounded by `--since @<unix>` / `--until @<unix>`:
 
-1. `journalctl -k` — the kernel stream, fetched **unfiltered**. Deliberately no `--grep`: a rejected or misparsed grep pattern makes journalctl exit 0 with empty stdout, which would silently blind the correctness-critical kernel path (OOM, panic, disk errors). A windowed `-k` is small, so fetching it whole is cheap and the detectors filter precisely.
+1. `journalctl -k` — the kernel stream (`_TRANSPORT=kernel`), fetched **unfiltered**. Kernel lines are sparse even in a multi-GB journal, so taking all of them is cheap and means a wording change in any kernel message can't silently drop an event; the detectors filter precisely.
 2. `journalctl -u systemd-oomd` — the userspace OOM killer's own unit.
-3. A `--grep` over the whole journal for userspace/systemd markers (`Failed with result`, `dumped core`, memory-pressure kills…) — a filter is needed here because the general journal is large; falls back to unfiltered if `--grep` is rejected.
+3. `journalctl -p notice SYSLOG_IDENTIFIER=systemd SYSLOG_IDENTIFIER=systemd-coredump` — service failures and coredumps. These come only from those two identifiers and are always logged at priority notice (5) or above, so intersecting the identifier and priority **indexes** returns a few dozen lines instead of the tens of thousands of routine unit start/stop lines.
+
+**All queries use indexed fields only — never `--grep`.** `--grep` is an unindexed full-message scan; over this machine's 2.3 GB journal it made `--all` never finish. The indexed queries plus `--output-fields` (trimming each record to the four fields the detectors read) bring `--all` down to ~0.5 s. The queries only need to be a *superset* of what matters — the detectors do the precise classification.
 
 Results are de-duplicated by `(time, message)`. Each JSON line is parsed by a minimal hand-rolled flat-object parser (no serde) that extracts the string-valued fields; `MESSAGE` and `__REALTIME_TIMESTAMP` (microseconds) are required, `SYSLOG_IDENTIFIER` and `_TRANSPORT` are optional. Binary/array-valued fields are skipped. `--from-file` reads the same line format from disk (test seam + offline analysis).
 
@@ -300,7 +302,7 @@ Findings are filtered by `TimeWindow::contains` (belt-and-suspenders with journa
 ## Adding a category
 
 1. Write a detector `fn(&LogLine) -> Option<Finding>` in `detect.rs` and add it to `DETECTORS`.
-2. Kernel-log categories need nothing else (the `-k` stream is fetched unfiltered). A userspace/systemd category must add its marker substrings to `USER_GREP` in `linux.rs` so the general-journal query fetches those lines.
+2. Kernel-log categories need nothing else (the `-k` stream is fetched unfiltered). A userspace/systemd category must be reachable by an **indexed** query in `fetch_journal` (by `SYSLOG_IDENTIFIER`/`_SYSTEMD_UNIT`/`PRIORITY`) — add one if your source isn't already covered. Never use `--grep` (see the performance note above).
 3. Add a fixture line to `tests/fixtures/` and an assertion in `tests/oom_e2e.rs`.
 
 ## Known limitations (Linux)
