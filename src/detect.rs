@@ -19,6 +19,25 @@
 //! cross-annotated with the segfaults/coredumps/session failures that follow it,
 //! and a compositor crash is cross-annotated with the client apps that lost
 //! their connection — so cascades read as one story, not scattered findings.
+//!
+//! # Provenance of marker strings
+//!
+//! Every detector below carries a `Provenance:` note with one of three levels,
+//! so readers know how battle-tested each pattern is:
+//!
+//! - **verified-live** — matched real events in a live journal on a real
+//!   machine during development (strongest).
+//! - **third-party logs** — marker strings copied verbatim from real captured
+//!   logs in public incident reports (bug trackers, forums); realistic, but
+//!   never reproduced against a live incident by us.
+//! - **canonical format** — taken from kernel/systemd source or documentation;
+//!   the format is authoritative but the detector has only ever seen
+//!   fixture data, not a live incident.
+//!
+//! Anything not verified-live should be treated as **untested in the wild**:
+//! wording drift across kernel versions may cause misses (never crashes — a
+//! miss just means no finding). Negative baselines (benign boot banners) ARE
+//! verified-live on this project's dev machines.
 
 use crate::oom;
 use crate::types::{Finding, LogLine, Severity};
@@ -214,6 +233,9 @@ fn is_kernel(line: &LogLine) -> bool {
 // ── Detectors ────────────────────────────────────────────────────────────────────
 
 /// Kernel panics, oopses, and BUGs — the system is (or was) in a fatal state.
+///
+/// Provenance: **canonical format** (kernel `panic()` / oops wording) — fixture
+/// tested only; no live panic reproduced during development.
 fn detect_kernel_panic(line: &LogLine) -> Option<Finding> {
     let markers = [
         "Kernel panic - not syncing", "BUG: unable to handle",
@@ -246,6 +268,12 @@ fn detect_kernel_panic(line: &LogLine) -> Option<Finding> {
 ///
 /// Benign init banners (`[drm] Initialized …`, `fbcon: …`) must not match —
 /// every marker here encodes an error, not a subsystem name.
+///
+/// Provenance: **third-party logs / UNTESTED LIVE** — every marker is copied
+/// verbatim from public incident reports (Ubuntu/Arch bug trackers, NVIDIA
+/// forums, a Framework Strix Halo gfx1151 thread), but no GPU hang has been
+/// reproduced against this detector on live hardware. The benign-banner
+/// negative baseline IS verified-live (this dev VM's journal).
 fn detect_gpu(line: &LogLine) -> Option<Finding> {
     if !is_kernel(line) { return None; }
     let msg = &line.message;
@@ -347,6 +375,10 @@ fn is_app_level_xid(msg: &str) -> bool {
 }
 
 /// Userspace crashes the kernel logs: segfaults, GPFs, and trap faults.
+///
+/// Provenance: **canonical format** (kernel `show_signal_msg()` wording is
+/// stable across many kernel versions) — fixture tested; no live segfault
+/// event observed during development.
 fn detect_segfault(line: &LogLine) -> Option<Finding> {
     let markers = ["segfault at", "general protection fault", "traps:", "trap invalid opcode"];
     let m = first_of(&line.message, &markers)?;
@@ -365,6 +397,12 @@ fn detect_segfault(line: &LogLine) -> Option<Finding> {
 
 /// Disk and filesystem errors: block-layer I/O errors, ATA/SATA link faults,
 /// filesystem corruption, and read-only remounts.
+///
+/// Provenance: mixed. The ATA/SATA burst markers are **third-party logs**
+/// (verbatim from a real captured SATA fault); block/filesystem error markers
+/// are **canonical format**. The EXT4 benign-mount negative baseline is
+/// **verified-live** (this dev VM's boot sequence). No live disk fault
+/// reproduced during development.
 fn detect_disk_io(line: &LogLine) -> Option<Finding> {
     let markers = [
         "I/O error", "Buffer I/O error", "critical medium error", "critical target error",
@@ -404,6 +442,9 @@ fn detect_disk_io(line: &LogLine) -> Option<Finding> {
 }
 
 /// CPU soft/hard lockups, RCU stalls, and hung tasks (D-state > 120s).
+///
+/// Provenance: **canonical format** (watchdog/hung_task/RCU wording from kernel
+/// source) — fixture tested only; untested against a live lockup.
 fn detect_lockup(line: &LogLine) -> Option<Finding> {
     let markers = [
         "soft lockup", "hard LOCKUP", "blocked for more than",
@@ -430,6 +471,9 @@ fn detect_lockup(line: &LogLine) -> Option<Finding> {
 }
 
 /// Thermal events: throttling and critical-temperature trips.
+///
+/// Provenance: **canonical format** (intel thermal / thermal_zone wording) —
+/// fixture tested only; untested against a live thermal event.
 fn detect_thermal(line: &LogLine) -> Option<Finding> {
     let markers = [
         "temperature above threshold", "critical temperature reached",
@@ -451,6 +495,10 @@ fn detect_thermal(line: &LogLine) -> Option<Finding> {
 }
 
 /// Machine-check exceptions and other hardware-error reports.
+///
+/// Provenance: **canonical format** (mce/EDAC/AER wording) — fixture tested;
+/// the EDAC boot-banner negative baseline is **verified-live** (this dev VM).
+/// No live hardware error reproduced during development.
 fn detect_hardware(line: &LogLine) -> Option<Finding> {
     let markers = [
         "Hardware Error", "Machine check events logged", "mce:", "MCE ",
@@ -486,6 +534,10 @@ fn detect_hardware(line: &LogLine) -> Option<Finding> {
 
 /// systemd units that failed. Anchored on the `systemd` identifier so ordinary
 /// application log lines that merely contain "failed" don't trip it.
+///
+/// Provenance: **verified-live** — matched real `Failed with result
+/// 'exit-code'` events (iperf3, openipmi, snap units) in this dev machine's
+/// journal during development.
 fn detect_service_failure(line: &LogLine) -> Option<Finding> {
     if !line.identifier.eq_ignore_ascii_case("systemd") { return None; }
     let markers = [
@@ -512,6 +564,9 @@ fn detect_service_failure(line: &LogLine) -> Option<Finding> {
 }
 
 /// Process coredumps captured by systemd-coredump.
+///
+/// Provenance: **canonical format** (systemd-coredump's fixed message) —
+/// fixture tested only; no live coredump observed during development.
 fn detect_coredump(line: &LogLine) -> Option<Finding> {
     let by_id = line.identifier.eq_ignore_ascii_case("systemd-coredump");
     if !by_id && !contains_ci(&line.message, "dumped core") { return None; }
@@ -536,6 +591,11 @@ fn detect_coredump(line: &LogLine) -> Option<Finding> {
 /// - gnome-session-binary: `Unrecoverable failure in required component X.desktop`
 /// - Xorg: `(EE) Segmentation fault at address …`, `(EE) Fatal server error:`,
 ///   `(EE) Server terminated with error (1)`
+///
+/// Provenance: **third-party logs / UNTESTED LIVE** — all marker strings are
+/// verbatim from public reports (GNOME/mutter GitLab, Mozilla bugzilla, Arch
+/// forums, KDE bugs); this dev VM has no graphical session, so none have been
+/// reproduced live.
 fn detect_session(line: &LogLine) -> Option<Finding> {
     if is_kernel(line) { return None; }
     let msg = &line.message;

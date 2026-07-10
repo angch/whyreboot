@@ -15,6 +15,13 @@
 //!
 //! Matching anchors on stable marker substrings and extracts fields tolerantly,
 //! rather than pinning a brittle full-line format.
+//!
+//! Provenance (see `detect.rs` module docs for the levels): **canonical
+//! format** — the kernel wording comes from `mm/oom_kill.c` and the
+//! systemd-oomd wording from its source/documentation. Parsing was exercised
+//! against a real `journalctl -o json` capture with the OOM message spliced
+//! in, but **no live OOM kill has been reproduced** against this detector
+//! during development.
 
 use crate::types::{Finding, LogLine, Severity};
 

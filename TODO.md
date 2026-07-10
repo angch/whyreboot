@@ -10,6 +10,14 @@ into a `LogLine` and run the existing detectors unchanged — only the source ad
 is new. Note syslog timestamps lack a year and are local time, so infer the year
 from the window and convert to `Timestamp`.
 
+### Validate internet-sourced detectors on live incidents
+GPU, Session, and most kernel-fault detectors are built from third-party
+incident reports / canonical formats and have **never seen a live incident**
+(see the provenance table in HowItWorks.md and `Provenance:` notes in
+detect.rs). When a real GPU hang / compositor crash / OOM happens on real
+hardware: capture `journalctl -o json` around it, replay with `--from-file`,
+fix any misses, and upgrade the detector's provenance note to verified-live.
+
 ### Other next steps
 - More detectors: filesystem-full (`No space left`), network link flaps, watchdog
   reboots, `systemd-coredump` truncation, apparmor/SELinux denials, USB resets.

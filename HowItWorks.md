@@ -295,6 +295,25 @@ GPU specifics (`detect_gpu`, kernel-only): amdgpu ring timeouts / `GPU reset beg
 
 Session specifics (`detect_session`, userspace-only): Wayland clients reporting `Lost connection to Wayland compositor` / `The Wayland connection broke` / `Error 71 (Protocol error) dispatching to Wayland display`; `gnome-session-binary`'s `Unrecoverable failure in required component <x>`; and Xorg fatals (`(EE)` plus `Fatal server error` / `Segmentation fault at address` / `Server terminated with error` / `Caught signal`). Non-fatal `(EE)` lines are ignored.
 
+### Marker provenance — how battle-tested is each detector?
+
+Three levels (each detector's doc comment in `detect.rs` carries its level):
+
+- **verified-live** — matched real events in a live journal during development.
+- **third-party logs** — markers copied verbatim from real captured logs in public incident reports; realistic, but never reproduced live by us.
+- **canonical format** — from kernel/systemd source or docs; only ever exercised on fixtures.
+
+| Category | Provenance | Notes |
+|---|---|---|
+| Service | **verified-live** | real `Failed with result` events on the dev machine |
+| OOM | canonical format | kernel `mm/oom_kill.c` + systemd-oomd wording; splice-tested through a real journalctl capture, no live OOM reproduced |
+| Disk | third-party logs + canonical | ATA burst verbatim from a real captured SATA fault; EXT4 benign baseline verified-live |
+| GPU | **third-party logs — untested live** | verbatim from Ubuntu/Arch/NVIDIA/Framework reports (incl. Strix Halo gfx1151) |
+| Session | **third-party logs — untested live** | verbatim from GNOME GitLab / Mozilla / KDE / Arch reports; dev VM has no graphical session |
+| KernelPanic, Segfault, Lockup, Thermal, Hardware, Coredump | canonical format | fixture-tested only; benign EDAC/boot-banner baselines verified-live |
+
+A miss (wording drift on some kernel/driver version) silently yields no finding — it never misclassifies or crashes. If you hit a real incident that these patterns miss, capture it with `journalctl -o json > incident.jsonl` and replay with `--from-file`; extending the markers is a one-function change.
+
 **Guarding against boot-banner false positives.** Several subsystem names appear in benign driver-init banners logged at *every* boot, not just in error reports — observed live on this machine:
 
 | Line (logged at boot) | Naïve marker that matched | Why it's benign |
