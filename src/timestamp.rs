@@ -109,6 +109,10 @@ fn local_civil(ts: Timestamp) -> Civil {
 /// database. Falls back to UTC if the conversion fails.
 #[cfg(unix)]
 fn local_civil(ts: Timestamp) -> Civil {
+    // libc deprecates `time_t` on musl pending its move to 64-bit (already
+    // 64-bit on x86_64). The `as` cast tracks whatever width the alias has,
+    // so this is the future-proof form — just quiet the advisory lint.
+    #[allow(deprecated)]
     let t = ts.0 as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let r = unsafe { libc::localtime_r(&t, &mut tm) };

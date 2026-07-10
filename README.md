@@ -82,6 +82,15 @@ $ cargo build --release
 
 The core binary lands at `target/release/whyreboot`. The Windows GUI (`whyreboot-gui`) is Windows-only; a bare `cargo build` skips it, so the workspace builds on Linux too.
 
+### Fully static Linux binary
+
+```console
+$ rustup target add x86_64-unknown-linux-musl
+$ cargo build --release --target x86_64-unknown-linux-musl
+```
+
+No `musl-tools` or C cross-toolchain needed — the crate has no C dependencies and Rust ships a prebuilt musl libc. The result is a static-pie binary (~520 KB) that runs on any x86-64 Linux regardless of glibc version; `upx --best --lzma` shrinks it to ~215 KB with no measurable startup cost. Release binaries built this way (and UPX-compressed) are published by the GitHub Actions release workflow alongside the Windows ones.
+
 ## Usage
 
 ```
