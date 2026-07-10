@@ -1,6 +1,33 @@
 # whyreboot
 
-A command-line tool for Windows that reads the Event Log and tells you *why* your machine last rebooted — crash, forced power-off, update restart, or clean shutdown — and which driver is likely to blame.
+A single-binary command-line tool that diagnoses system issues from the OS logs.
+
+- **Windows:** reads the Event Log and tells you *why* your machine last rebooted — crash, forced power-off, update restart, or clean shutdown — and which driver is likely to blame.
+- **Linux:** scans the systemd journal for logged system issues over a time window you choose (`"1 hour ago"`, `"today"`, `"2h"`, …) — starting with **out-of-memory (OOM) kills** and covering kernel panics, segfaults, disk/I-O errors, CPU lockups, thermal trips, hardware (machine-check) errors, failed systemd units, and coredumps. These issues need not have caused a reboot at all.
+
+The two platforms share one core: a normalized log stream feeds pluggable detectors that emit findings, rendered as the same text/JSON report.
+
+## Linux quick start
+
+```console
+$ whyreboot "1 hour ago"          # issues in the last hour
+$ whyreboot today                 # since local midnight
+$ whyreboot --since "2 days ago"  # explicit range
+$ whyreboot --all --json          # everything, as JSON
+
+Scanning system logs for issues (since 2026-07-09 13:00:00)…
+  Scanned 42 record(s); found 1 issue(s).
+
+  [CRITICAL] OOM  2026-07-09 13:22:41
+  Kernel OOM killer terminated process 'chrome' (pid 4242)
+  source: journald:kernel
+    • Victim anonymous RSS: 2.4 GB
+    • The kernel ran out of memory and killed the highest-scoring process…
+```
+
+Reads the journal via `journalctl` (no root needed if you're in the `systemd-journal` or `adm` group). Use `--from-file <f>` to analyze captured `journalctl -o json` output offline.
+
+## Windows
 
 ```
 Scanning Windows Event Log for shutdown/reboot events…
@@ -43,30 +70,35 @@ Scanning Windows Event Log for shutdown/reboot events…
 
 ## Requirements
 
-- Windows 10 or 11
 - Rust toolchain (stable, edition 2024)
-- No admin rights needed for Event Log or WER data
-- Admin rights needed only for reading `C:\Windows\Minidump\` directly (the tool falls back to WER-reported paths without admin)
+- **Windows:** 10 or 11. No admin rights for Event Log/WER data; admin only for reading `C:\Windows\Minidump\` directly (falls back to WER-reported paths without admin).
+- **Linux:** systemd with `journalctl` on `PATH`. No root if you're in the `systemd-journal` or `adm` group.
 
 ## Build
 
-```powershell
-cargo build --release
+```console
+$ cargo build --release
 ```
 
-The binary lands at `target\release\whyreboot.exe`. Copy it anywhere on your `PATH`.
+The core binary lands at `target/release/whyreboot`. The Windows GUI (`whyreboot-gui`) is Windows-only; a bare `cargo build` skips it, so the workspace builds on Linux too.
 
 ## Usage
 
 ```
-whyreboot [OPTIONS]
+whyreboot [OPTIONS] [TIME-RANGE]
+
+TIME-RANGE (Linux):
+  A duration or phrase: "1 hour ago", "30 minutes ago", "2h", "today",
+  "yesterday", or "all". Defaults to the last 24 hours.
 
 OPTIONS:
-  --history N   Show last N boot cycles (default: 1)
-  --all         Show all boot cycles in the log
-  --json        Output JSON instead of text
-  --no-color    Disable ANSI color output
-  --help, -h    Show this help
+  --since <expr>   Time range to analyze (aliases: --for, --window)
+  --all            Analyze all available history
+  --history N      [Windows] show last N boot cycles (default: 1)
+  --from-file <f>  [Linux] read journalctl -o json records from a file
+  --json           Output JSON instead of text
+  --no-color       Disable ANSI color output
+  --help, -h       Show this help
 ```
 
 **Examples**
@@ -87,6 +119,24 @@ whyreboot --all --json | jq '.cycles[].cause'
 
 ## What it detects
 
+### Linux (journal issue scan)
+
+| Category | Signals matched |
+|---|---|
+| OOM | kernel `Out of memory: Killed process …` / `oom-kill:`; `systemd-oomd` memory-pressure & swap kills |
+| Kernel panic | `Kernel panic - not syncing`, `BUG: unable to handle`, `Oops:`, `kernel BUG at` |
+| Segfault | `segfault at …`, `general protection fault`, `traps:` (extracts `comm[pid]`) |
+| Disk / filesystem | `I/O error`, `Buffer I/O error`, `critical medium error`, `EXT4-fs error`, XFS/Btrfs errors, ATA/SATA `exception Emask` / `failed command` / `hard resetting link`, read-only remounts |
+| CPU lockup / hung task | `soft lockup`, `hard LOCKUP`, `blocked for more than … seconds`, RCU stalls |
+| Thermal | `temperature above threshold`, `critical temperature reached`, clock throttling |
+| Hardware (MCE) | `Hardware Error`, `Machine check events logged`, `mce:`, EDAC, `PCIe Bus Error` |
+| Service failure | `systemd` unit `Failed with result`, `Main process exited, code=dumped`, `entered failed state` |
+| Coredump | `systemd-coredump` `Process … dumped core` |
+
+A burst of related lines from one incident (e.g. the ~10 lines a SATA fault emits) is coalesced into a single finding. Adding a category is one detector function in `src/detect.rs`.
+
+### Windows (reboot diagnosis)
+
 | Verdict | How |
 |---|---|
 | Blue Screen (BSOD) | Event 41 with non-zero bugcheck code; faulting driver from WER Event 1001 |
@@ -100,7 +150,7 @@ whyreboot --all --json | jq '.cycles[].cause'
 
 ## How it works
 
-See [HowItWorks.md](HowItWorks.md) for a detailed walkthrough of the 8-step pipeline: event fetching, boot-boundary detection, per-cycle slicing, cause classification, WER correlation, minidump matching, registry checks, and explanation generation.
+See [HowItWorks.md](HowItWorks.md). The **Windows** path runs an 8-step pipeline: event fetching, boot-boundary detection, per-cycle slicing, cause classification, WER correlation, minidump matching, registry checks, and explanation generation. The **Linux** path resolves the time window, pulls matching records from `journalctl -o json`, runs the detector framework over the normalized log stream, coalesces bursts, and renders findings.
 
 ## License
 

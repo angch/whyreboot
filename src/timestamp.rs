@@ -1,18 +1,21 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Minimal timestamp replacing chrono::DateTime<Local>.
-//! Stored as i64 (seconds since Unix epoch, UTC); formatted in local time via Win32 APIs.
+//! Stored as i64 (seconds since Unix epoch, UTC).
+//!
+//! Broken-down time is computed with pure-Rust civil-day algorithms (Hinnant's
+//! algorithms, in both directions). UTC rendering is fully portable; local-time
+//! rendering uses the platform timezone database — Win32 `FileTimeToLocalFileTime`
+//! on Windows and libc `localtime_r` on Unix.
 
 use std::time::{SystemTime, UNIX_EPOCH};
-use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
-use windows::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
-use windows::Win32::System::Time::FileTimeToSystemTime;
 
 /// Seconds since Unix epoch (1970-01-01 00:00:00 UTC).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub struct Timestamp(pub i64);
 
-/// 100-nanosecond intervals between 1601-01-01 and 1970-01-01.
-const FT_EPOCH: i64 = 11_644_473_600;
+/// Broken-down calendar time (either UTC or local, depending on how it was built).
+#[derive(Clone, Copy, Debug, Default)]
+struct Civil { y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64 }
 
 impl Timestamp {
     pub fn now() -> Self {
@@ -25,7 +28,8 @@ impl Timestamp {
         Timestamp(d.as_secs() as i64)
     }
 
-    /// Parse a Windows Event Log timestamp: "YYYY-MM-DDTHH:MM:SS…" (always UTC).
+    /// Parse an RFC-3339-ish timestamp: "YYYY-MM-DDTHH:MM:SS…" (assumed UTC).
+    /// Accepts a space separator as well as `T`. Windows Event Log times are UTC.
     pub fn from_rfc3339(s: &str) -> Option<Self> {
         let b = s.as_bytes();
         if b.len() < 19 { return None; }
@@ -42,55 +46,84 @@ impl Timestamp {
 
     pub fn add_secs(self, s: i64) -> Self { Timestamp(self.0 + s) }
 
+    /// Seconds elapsed since local-time midnight of the day this timestamp falls on.
+    /// Used to compute local day boundaries ("today", "yesterday") without a
+    /// timezone-math library: `self.add_secs(-self.secs_into_local_day())` is
+    /// local midnight.
+    pub fn secs_into_local_day(self) -> i64 {
+        let c = local_civil(self);
+        c.h * 3600 + c.mi * 60 + c.s
+    }
+
     /// "YYYY-MM-DD HH:MM:SS" in local time.
     pub fn format_dt(self) -> String {
-        let s = local_st(self);
-        format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-            s.wYear, s.wMonth, s.wDay, s.wHour, s.wMinute, s.wSecond)
+        let c = local_civil(self);
+        format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", c.y, c.mo, c.d, c.h, c.mi, c.s)
     }
 
     /// "HH:MM:SS" in local time.
     pub fn format_t(self) -> String {
-        let s = local_st(self);
-        format!("{:02}:{:02}:{:02}", s.wHour, s.wMinute, s.wSecond)
+        let c = local_civil(self);
+        format!("{:02}:{:02}:{:02}", c.h, c.mi, c.s)
     }
 
     /// RFC 3339 (UTC), for JSON output.
     pub fn to_rfc3339(self) -> String {
-        let s = utc_st(self);
-        format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-            s.wYear, s.wMonth, s.wDay, s.wHour, s.wMinute, s.wSecond)
+        let c = unix_to_civil(self.0);
+        format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", c.y, c.mo, c.d, c.h, c.mi, c.s)
     }
 }
 
-fn to_ft(ts: Timestamp) -> FILETIME {
-    let v = (ts.0 + FT_EPOCH) * 10_000_000;
-    let v = v.max(0);
-    FILETIME {
+// ── Local time (platform-specific) ──────────────────────────────────────────────
+
+/// Windows: convert via `FileTimeToLocalFileTime` + `FileTimeToSystemTime`.
+#[cfg(windows)]
+fn local_civil(ts: Timestamp) -> Civil {
+    use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
+    use windows::Win32::System::Time::FileTimeToSystemTime;
+
+    /// 100-nanosecond intervals between 1601-01-01 and 1970-01-01.
+    const FT_EPOCH: i64 = 11_644_473_600;
+    let v = ((ts.0 + FT_EPOCH) * 10_000_000).max(0);
+    let ft = FILETIME {
         dwLowDateTime:  (v & 0xFFFF_FFFF) as u32,
         dwHighDateTime: ((v >> 32) & 0xFFFF_FFFF) as u32,
-    }
-}
-
-fn local_st(ts: Timestamp) -> SYSTEMTIME {
-    let ft = to_ft(ts);
+    };
     unsafe {
         let mut lft = FILETIME::default();
         let mut st  = SYSTEMTIME::default();
-        let _ = FileTimeToLocalFileTime(&ft, &mut lft);
-        let _ = FileTimeToSystemTime(&lft, &mut st);
-        st
+        if FileTimeToLocalFileTime(&ft, &mut lft).is_err()
+            || FileTimeToSystemTime(&lft, &mut st).is_err()
+        {
+            return unix_to_civil(ts.0);
+        }
+        Civil {
+            y:  st.wYear   as i64, mo: st.wMonth  as i64, d:  st.wDay    as i64,
+            h:  st.wHour   as i64, mi: st.wMinute as i64, s:  st.wSecond as i64,
+        }
     }
 }
 
-fn utc_st(ts: Timestamp) -> SYSTEMTIME {
-    let ft = to_ft(ts);
-    unsafe {
-        let mut st = SYSTEMTIME::default();
-        let _ = FileTimeToSystemTime(&ft, &mut st);
-        st
+/// Unix: convert via libc `localtime_r`, which consults the system timezone
+/// database. Falls back to UTC if the conversion fails.
+#[cfg(unix)]
+fn local_civil(ts: Timestamp) -> Civil {
+    let t = ts.0 as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let r = unsafe { libc::localtime_r(&t, &mut tm) };
+    if r.is_null() { return unix_to_civil(ts.0); }
+    Civil {
+        y:  tm.tm_year as i64 + 1900, mo: tm.tm_mon as i64 + 1, d:  tm.tm_mday as i64,
+        h:  tm.tm_hour as i64,        mi: tm.tm_min as i64,     s:  tm.tm_sec  as i64,
     }
 }
+
+/// Platforms with neither Win32 nor libc: fall back to UTC.
+#[cfg(not(any(windows, unix)))]
+fn local_civil(ts: Timestamp) -> Civil { unix_to_civil(ts.0) }
+
+// ── Pure-Rust civil-day conversions (Hinnant) ───────────────────────────────────
 
 fn p4(b: &[u8]) -> Option<u32> {
     b.iter().try_fold(0u32, |a, &c| {
@@ -108,6 +141,26 @@ fn civil_to_unix(y: i64, m: i64, d: i64, h: i64, min: i64, s: i64) -> i64 {
     let doy = (153 * m + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     (era * 146_097 + doe - 719_468) * 86_400 + h * 3600 + min * 60 + s
+}
+
+/// Inverse of `civil_to_unix`: Unix seconds (UTC) → broken-down UTC calendar time.
+/// Hinnant's `civil_from_days`, extended to include the intra-day clock.
+fn unix_to_civil(secs: i64) -> Civil {
+    let days = secs.div_euclid(86_400);
+    let rem  = secs.rem_euclid(86_400);
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+
+    let z   = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;                         // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y   = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);   // [0, 365]
+    let mp  = (5 * doy + 2) / 153;                        // [0, 11]
+    let d   = doy - (153 * mp + 2) / 5 + 1;              // [1, 31]
+    let m   = if mp < 10 { mp + 3 } else { mp - 9 };     // [1, 12]
+
+    Civil { y: if m <= 2 { y + 1 } else { y }, mo: m, d, h, mi, s }
 }
 
 #[cfg(test)]
@@ -139,5 +192,29 @@ mod tests {
     fn add_secs_roundtrip() {
         let t = Timestamp(5000);
         assert_eq!(t.add_secs(200).secs_since(t), 200);
+    }
+
+    #[test]
+    fn to_rfc3339_is_portable_utc() {
+        // 2024-01-15T10:30:00Z → Unix 1705314600 (no platform APIs involved).
+        assert_eq!(Timestamp(1_705_314_600).to_rfc3339(), "2024-01-15T10:30:00Z");
+    }
+
+    #[test]
+    fn civil_roundtrip_over_many_dates() {
+        // Every conversion Unix→civil→Unix must be lossless across a wide range.
+        for &secs in &[
+            0i64, 1, 86_399, 86_400, 951_782_400, /* 2000-02-29 leap */
+            1_582_934_400, 1_705_314_600, 4_102_444_800, /* 2100-01-01 */
+        ] {
+            let c = unix_to_civil(secs);
+            assert_eq!(civil_to_unix(c.y, c.mo, c.d, c.h, c.mi, c.s), secs, "secs={secs}");
+        }
+    }
+
+    #[test]
+    fn unix_to_civil_known_leap_day() {
+        let c = unix_to_civil(951_782_400); // 2000-02-29T00:00:00Z
+        assert_eq!((c.y, c.mo, c.d), (2000, 2, 29));
     }
 }

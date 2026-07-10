@@ -1,15 +1,107 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Text and JSON output for boot cycles, including explanations and remediation advice.
+//! Text and JSON output.
+//!
+//! Two report styles share this module:
+//! - **Findings** (portable): generic [`Finding`] issues over a time window —
+//!   the Linux/OOM path, and the general model going forward.
+//! - **Boot cycles** (`cfg(windows)`): the Windows-specific reboot diagnosis.
 
 use crate::color::Pal;
+use whyreboot::timestamp::Timestamp;
+use whyreboot::timewindow::TimeWindow;
+use whyreboot::types::{Finding, Severity};
+
+#[cfg(windows)]
 use whyreboot::format::{
     cause_label, cause_detail, fmt_secs, short_provider, event_summary, generate_explanation,
 };
-use whyreboot::timestamp::Timestamp;
+#[cfg(windows)]
 use whyreboot::types::{AudioPowerInfo, BootCycle, Cause};
+
+// ── Finding output (portable) ───────────────────────────────────────────────────
+
+fn severity_color(sev: Severity, pal: &Pal) -> &str {
+    match sev {
+        Severity::Critical => pal.crash,
+        Severity::Warning  => pal.warn,
+        Severity::Info     => pal.info,
+    }
+}
+
+/// Prints the findings report: a header describing the scanned window, then one
+/// block per finding (newest first), or a clean-bill-of-health line if none.
+pub fn print_findings(findings: &[Finding], pal: &Pal, window: &TimeWindow, scanned: usize) {
+    let w = 74usize;
+    println!();
+    println!("{}{}{}", pal.bold, "═".repeat(w), pal.reset);
+    println!("  {}System Issue Report{} — {}", pal.bold, pal.reset, window.describe());
+    println!("  Scanned {} log record(s); found {}{}{} issue(s).",
+        scanned,
+        if findings.is_empty() { pal.ok } else { pal.crash },
+        findings.len(), pal.reset);
+    println!("{}{}{}", pal.bold, "═".repeat(w), pal.reset);
+
+    if findings.is_empty() {
+        println!();
+        println!("  {}No issues detected in this window.{}", pal.ok, pal.reset);
+        println!();
+        return;
+    }
+
+    for f in findings {
+        let color = severity_color(f.severity, pal);
+        println!();
+        println!("  {}[{}]{} {}{}{}  {}{}{}",
+            color, f.severity.label(), pal.reset,
+            pal.bold, f.category, pal.reset,
+            pal.dim, f.time.format_dt(), pal.reset);
+        println!("  {}{}{}", pal.bold, f.title, pal.reset);
+        println!("  {}source: {}{}", pal.dim, f.source, pal.reset);
+        for e in &f.evidence {
+            println!("    • {}", e);
+        }
+    }
+    println!();
+}
+
+/// Outputs findings as hand-built JSON (no serde dependency), mirroring the
+/// boot-cycle JSON shape.
+pub fn print_findings_json(findings: &[Finding], window: &TimeWindow, scanned: usize) {
+    println!("{{");
+    println!("  \"generated\": {},", json_str(&Timestamp::now().to_rfc3339()));
+    match window.start {
+        Some(s) => println!("  \"window_start\": {},", json_str(&s.to_rfc3339())),
+        None    => println!("  \"window_start\": null,"),
+    }
+    match window.end {
+        Some(e) => println!("  \"window_end\": {},", json_str(&e.to_rfc3339())),
+        None    => println!("  \"window_end\": null,"),
+    }
+    println!("  \"scanned\": {},", scanned);
+    println!("  \"issue_count\": {},", findings.len());
+    println!("  \"issues\": [");
+    for (i, f) in findings.iter().enumerate() {
+        println!("    {{");
+        println!("      \"time\": {},", json_str(&f.time.to_rfc3339()));
+        println!("      \"severity\": {},", json_str(f.severity.label()));
+        println!("      \"category\": {},", json_str(&f.category));
+        println!("      \"title\": {},", json_str(&f.title));
+        println!("      \"source\": {},", json_str(&f.source));
+        print!("      \"evidence\": [");
+        for (j, e) in f.evidence.iter().enumerate() {
+            if j > 0 { print!(", "); }
+            print!("{}", json_str(e));
+        }
+        println!("]");
+        if i + 1 < findings.len() { println!("    }},"); } else { println!("    }}"); }
+    }
+    println!("  ]");
+    println!("}}");
+}
 
 // ── Cause color ───────────────────────────────────────────────────────────────
 
+#[cfg(windows)]
 fn cause_color<'p>(cause: &Cause, pal: &'p Pal) -> &'p str {
     match cause {
         Cause::BlueScreen { .. } | Cause::ForcedPowerOff | Cause::UnexpectedShutdown => pal.crash,
@@ -23,6 +115,7 @@ fn cause_color<'p>(cause: &Cause, pal: &'p Pal) -> &'p str {
 /// Prints all sections for one boot cycle to stdout in order:
 /// header → boot times → verdict → evidence → timeline → minidumps →
 /// device power settings → explanation → event table.
+#[cfg(windows)]
 pub fn print_cycle(cycle: &BootCycle, pal: &Pal, total: usize, audio: &[AudioPowerInfo]) {
     let w     = 74usize;
     let line  = "─".repeat(w);
@@ -41,6 +134,7 @@ pub fn print_cycle(cycle: &BootCycle, pal: &Pal, total: usize, audio: &[AudioPow
 }
 
 /// Prints the cycle separator line with centered "Boot Cycle N of M" label.
+#[cfg(windows)]
 fn print_cycle_header(cycle: &BootCycle, pal: &Pal, total: usize, dline: &str) {
     let w = 74usize;
     if total > 1 {
@@ -59,6 +153,7 @@ fn print_cycle_header(cycle: &BootCycle, pal: &Pal, total: usize, dline: &str) {
     }
 }
 
+#[cfg(windows)]
 fn print_boot_times(cycle: &BootCycle, pal: &Pal) {
     if let Some(bt) = cycle.boot_time {
         let ago_s = secs_to_ago(Timestamp::now().secs_since(bt));
@@ -77,6 +172,7 @@ fn print_boot_times(cycle: &BootCycle, pal: &Pal) {
     }
 }
 
+#[cfg(windows)]
 fn secs_to_ago(secs: i64) -> String {
     let s = secs.max(0);
     if s >= 2 * 86_400       { format!("{} days ago",    s / 86_400) }
@@ -84,6 +180,7 @@ fn secs_to_ago(secs: i64) -> String {
     else                      { format!("{} minutes ago", s / 60)     }
 }
 
+#[cfg(windows)]
 fn print_verdict(cycle: &BootCycle, pal: &Pal) {
     println!();
     let color = cause_color(&cycle.cause, pal);
@@ -97,6 +194,7 @@ fn print_verdict(cycle: &BootCycle, pal: &Pal) {
     }
 }
 
+#[cfg(windows)]
 fn print_evidence(cycle: &BootCycle, pal: &Pal) {
     if cycle.evidence.is_empty() { return; }
     println!();
@@ -106,6 +204,7 @@ fn print_evidence(cycle: &BootCycle, pal: &Pal) {
     }
 }
 
+#[cfg(windows)]
 fn print_timeline(cycle: &BootCycle, pal: &Pal) {
     if cycle.timeline.len() <= 1 { return; }
     let mut idxs: Vec<usize> = (0..cycle.timeline.len()).collect();
@@ -118,6 +217,7 @@ fn print_timeline(cycle: &BootCycle, pal: &Pal) {
     }
 }
 
+#[cfg(windows)]
 fn print_minidumps(cycle: &BootCycle, pal: &Pal) {
     if cycle.minidumps.is_empty() { return; }
     println!();
@@ -129,6 +229,7 @@ fn print_minidumps(cycle: &BootCycle, pal: &Pal) {
 
 /// Prints audio class registry power state — only for power-related BSODs
 /// where the faulting module is audio-related (`portcls`, `audio`, `hdaud`).
+#[cfg(windows)]
 fn print_device_power(cycle: &BootCycle, pal: &Pal, audio: &[AudioPowerInfo]) {
     let module_low = cycle.wer_module.as_deref().unwrap_or("").to_lowercase();
     let is_power_crash = matches!(&cycle.cause, Cause::BlueScreen { stop_code, .. }
@@ -150,6 +251,7 @@ fn print_device_power(cycle: &BootCycle, pal: &Pal, audio: &[AudioPowerInfo]) {
     }
 }
 
+#[cfg(windows)]
 fn print_explanation(cycle: &BootCycle, pal: &Pal, audio: &[AudioPowerInfo]) {
     let lines = generate_explanation(&cycle.cause, &cycle.wer_module, audio);
     if lines.is_empty() { return; }
@@ -160,6 +262,7 @@ fn print_explanation(cycle: &BootCycle, pal: &Pal, audio: &[AudioPowerInfo]) {
     }
 }
 
+#[cfg(windows)]
 fn print_event_table(cycle: &BootCycle, line: &str) {
     if cycle.display_events.is_empty() { return; }
     println!();
@@ -202,6 +305,7 @@ fn json_str(s: &str) -> String {
 }
 
 /// Outputs all boot cycles as hand-built JSON to stdout (no serde dependency).
+#[cfg(windows)]
 pub fn print_json(cycles: &[BootCycle]) {
     let now = Timestamp::now().to_rfc3339();
     println!("{{");
@@ -252,6 +356,7 @@ pub fn print_json(cycles: &[BootCycle]) {
 
 /// Returns `(kind_string, extra_json_fields)` for a `Cause` variant.
 /// `extra_json_fields` is a fragment of pre-formatted JSON (with trailing comma).
+#[cfg(windows)]
 fn cause_json(cause: &Cause) -> (&'static str, String) {
     match cause {
         Cause::BlueScreen { stop_code, stop_name, params } => (

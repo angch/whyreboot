@@ -1,6 +1,8 @@
 # How whyreboot Works
 
-whyreboot turns raw Windows Event Log entries into a plain-English verdict. This document walks through each step of that pipeline. Keep it in sync with the source when logic changes.
+whyreboot turns raw OS logs into a plain-English verdict. On **Windows** it explains why the machine last rebooted; on **Linux** it scans the systemd journal over a time window for logged system issues. This document walks through each pipeline. Keep it in sync with the source when logic changes.
+
+The two share a portable core (`types.rs`, `timestamp.rs`, `timewindow.rs`, `detect.rs`, `oom.rs`, `analysis.rs`, `format.rs`); they differ in the log-source backend (`events.rs`/`registry.rs` on Windows, `linux.rs` on Linux) and the top-level report (`print_cycle` vs `print_findings`). See [the Linux section](#linux-journal-issue-scanning) below; the Windows pipeline follows.
 
 ---
 
@@ -242,3 +244,70 @@ Cycles print oldest-first so the most recent result appears at the bottom of the
 | Event 6008 without Event 41 | Rare — can happen if the kernel crashed before it had time to write Event 41. Classified as Unexpected Shutdown at 60% confidence. |
 | WER latency | WER processes dumps asynchronously. A very fast reboot after a crash may not have a WER event yet. |
 | Multiple crashes between boots | Not common, but the tool would only see the most recent boot boundary. The minidump directory may contain multiple files from that window. |
+
+---
+
+# Linux — journal issue scanning
+
+On Linux, `whyreboot` does not diagnose a single reboot; it reports **every logged system issue in a time window**, many of which never cause a reboot (an OOM kill, a failed service, a corrected ECC error). The pipeline:
+
+```
+ Time expression ("1 hour ago")  ──► parse_window()  ──► TimeWindow { start, end }
+                                              │
+ journalctl -o json (kernel -k,               ▼
+   systemd-oomd unit, service/coredump  ──► fetch_journal()  ──► Vec<LogLine>
+   greps)   [or --from-file <f>]                │
+                                              ▼
+                                    detect::scan()
+                                    ┌───────────────────────────┐
+                                    │ for each LogLine:         │
+                                    │   first matching detector │  fn(&LogLine)->Option<Finding>
+                                    │ coalesce() bursts         │
+                                    └───────────────────────────┘
+                                              │
+                                              ▼
+                                    print_findings() / print_findings_json()
+```
+
+## Step 1 — Resolve the time window (`timewindow.rs`)
+
+The user's phrase becomes one concrete `TimeWindow` — the single source of truth used both to bound the journal query and to render the header. Supported: relative durations (`"1 hour ago"`, `"30 minutes ago"`, `"2h"`, `"90s"`, `"1w"`), `"today"`/`"earlier today"` (since local midnight), `"yesterday"` (bounded prior day), and `"all"`. Local day boundaries are computed with `Timestamp::secs_into_local_day()` (no timezone-math library). Default when no range is given: last 24 hours. Unrecognized text is rejected (exit 2), not silently defaulted.
+
+## Step 2 — Fetch journal records (`linux.rs`)
+
+Three `journalctl -o json` queries are issued and merged, each bounded by `--since @<unix>` / `--until @<unix>`:
+
+1. `journalctl -k` — the kernel stream, fetched **unfiltered**. Deliberately no `--grep`: a rejected or misparsed grep pattern makes journalctl exit 0 with empty stdout, which would silently blind the correctness-critical kernel path (OOM, panic, disk errors). A windowed `-k` is small, so fetching it whole is cheap and the detectors filter precisely.
+2. `journalctl -u systemd-oomd` — the userspace OOM killer's own unit.
+3. A `--grep` over the whole journal for userspace/systemd markers (`Failed with result`, `dumped core`, memory-pressure kills…) — a filter is needed here because the general journal is large; falls back to unfiltered if `--grep` is rejected.
+
+Results are de-duplicated by `(time, message)`. Each JSON line is parsed by a minimal hand-rolled flat-object parser (no serde) that extracts the string-valued fields; `MESSAGE` and `__REALTIME_TIMESTAMP` (microseconds) are required, `SYSLOG_IDENTIFIER` and `_TRANSPORT` are optional. Binary/array-valued fields are skipped. `--from-file` reads the same line format from disk (test seam + offline analysis).
+
+## Step 3 — Detect (`detect.rs`, `oom.rs`)
+
+Each detector is `fn(&LogLine) -> Option<Finding>`. `classify()` runs them in order and takes the **first** match, so one line yields at most one finding. Detectors anchor on stable marker substrings (not brittle full-line regexes) and extract a few fields tolerantly. Categories: `OOM`, `KernelPanic`, `Segfault`, `Disk`, `Lockup`, `Thermal`, `Hardware`, `Service`, `Coredump`. Severity is `Critical` (system stability threatened) or `Warning` (single process/service).
+
+OOM specifics (`oom.rs`): the kernel detector keys on `Killed process <pid> (<comm>)` (also older `Kill process`), extracting pid, comm, and `anon-rss:`/`total-vm:`/`oom_score_adj:`; the `invoked oom-killer:`/`oom-kill:` context lines are deliberately **not** counted, so a single kill = one finding. The systemd-oomd detector (identifier `systemd-oomd`) parses `Killed <cgroup> due to <reason>`.
+
+## Step 4 — Coalesce bursts (`coalesce()`)
+
+A single incident often emits many lines (a SATA fault logs ~10). Consecutive findings of the **same category and source** within `COALESCE_SECS` (30s) are merged into the earliest, folding the rest in as `+ related:` evidence and appending `(N related log lines)` to the title. This keeps the report high-level. Distinct categories, and same-category events far apart in time, stay separate.
+
+## Step 5 — Window-filter and render
+
+Findings are filtered by `TimeWindow::contains` (belt-and-suspenders with journalctl's own `--since`, and the only filter for `--from-file`) and printed newest-first. Text output: a header (`System Issue Report — <window>`, scanned/found counts), then per finding a severity-colored `[LEVEL] CATEGORY time` line, title, `source:`, and evidence bullets; a clean-bill line when none. **JSON mode** emits `{ generated, window_start, window_end, scanned, issue_count, issues: [{ time, severity, category, title, source, evidence }] }`.
+
+## Adding a category
+
+1. Write a detector `fn(&LogLine) -> Option<Finding>` in `detect.rs` and add it to `DETECTORS`.
+2. Kernel-log categories need nothing else (the `-k` stream is fetched unfiltered). A userspace/systemd category must add its marker substrings to `USER_GREP` in `linux.rs` so the general-journal query fetches those lines.
+3. Add a fixture line to `tests/fixtures/` and an assertion in `tests/oom_e2e.rs`.
+
+## Known limitations (Linux)
+
+| Limitation | Detail |
+|---|---|
+| Requires journalctl | The journal is read via `journalctl`; systems using only classic `/var/log/*` files (no systemd journal) aren't yet supported. `--from-file` accepts captured `-o json` output. |
+| Permissions | Kernel and most messages need membership in `systemd-journal`/`adm`. Without it, queries may return nothing rather than erroring. |
+| Marker-based matching | Detection keys on known substrings; kernel wording changes across versions and unusual formats may be missed. Prefer adding markers over tightening to full-line formats. |
+| Non-persistent journal | If `Storage=volatile`, history is lost on reboot, so ranges spanning a reboot may be truncated. |

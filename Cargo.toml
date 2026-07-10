@@ -1,5 +1,9 @@
 [workspace]
 members = ["gui"]
+# The GUI is Windows-only (Win32). A bare `cargo build`/`cargo test` builds just
+# the core crate so the workspace is usable on Linux; the Windows release job
+# builds everything explicitly with `--workspace`.
+default-members = ["."]
 
 [package]
 name = "whyreboot"
@@ -16,6 +20,9 @@ name = "whyreboot"
 path = "src/main.rs"
 
 [dependencies]
+
+# Windows backend: Event Log, registry, console VTP, FILETIME conversion.
+[target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
@@ -24,6 +31,10 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Registry",
     "Win32_System_Time",
 ] }
+
+# Unix backend: localtime_r for local-time formatting and isatty for color detection.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [profile.release]
 opt-level   = "z"

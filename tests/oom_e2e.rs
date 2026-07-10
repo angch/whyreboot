@@ -1,0 +1,74 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! End-to-end test of the OOM path: fixture file → parse → detect → window filter.
+//! Exercises the same code the Linux CLI runs (minus the journalctl invocation),
+//! proving field extraction lines up with real journalctl `-o json` output.
+
+use whyreboot::detect::scan;
+use whyreboot::linux::fetch_from_file;
+use whyreboot::timestamp::Timestamp;
+use whyreboot::timewindow::TimeWindow;
+
+fn fixture(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
+}
+
+#[test]
+fn detects_kernel_and_oomd_kills_from_fixture() {
+    let lines = fetch_from_file(&fixture("oom.jsonl")).expect("read fixture");
+    // 6 records in the fixture, all parsed.
+    assert_eq!(lines.len(), 6, "all journal lines should parse");
+
+    let findings: Vec<_> = scan(&lines).into_iter().filter(|f| f.category == "OOM").collect();
+    assert_eq!(findings.len(), 2, "one kernel kill + one systemd-oomd kill");
+
+    // Newest first: the systemd-oomd kill (20:01) precedes the kernel kill (20:00).
+    assert_eq!(findings[0].source, "systemd-oomd");
+    assert!(findings[0].title.contains("Builder.service"));
+
+    let kernel = &findings[1];
+    assert_eq!(kernel.source, "journald:kernel");
+    assert!(kernel.title.contains("chrome"));
+    assert!(kernel.title.contains("4242"));
+    assert!(kernel.evidence.iter().any(|e| e.contains("2.4 GB")));
+
+    // The "invoked oom-killer" and "oom-kill:" context lines must NOT create
+    // extra findings (no double counting for a single kill).
+    assert!(findings.iter().all(|f| f.category == "OOM"));
+}
+
+#[test]
+fn detects_mixed_categories_and_coalesces_ata_burst() {
+    let lines = fetch_from_file(&fixture("mixed.jsonl")).expect("read fixture");
+    let findings = scan(&lines);
+
+    // Expect one finding per distinct incident: the 10-line ATA burst collapses
+    // to a single Disk finding, plus segfault, coredump, service failure, panic.
+    let cats: Vec<&str> = findings.iter().map(|f| f.category.as_str()).collect();
+    assert!(cats.contains(&"Disk"),      "categories: {cats:?}");
+    assert!(cats.contains(&"Segfault"),  "categories: {cats:?}");
+    assert!(cats.contains(&"Coredump"),  "categories: {cats:?}");
+    assert!(cats.contains(&"Service"),   "categories: {cats:?}");
+    assert!(cats.contains(&"KernelPanic"), "categories: {cats:?}");
+
+    // The ATA burst must be exactly one Disk finding, not ten.
+    assert_eq!(findings.iter().filter(|f| f.category == "Disk").count(), 1);
+    let disk = findings.iter().find(|f| f.category == "Disk").unwrap();
+    assert!(disk.title.contains("related log lines"), "title: {}", disk.title);
+}
+
+#[test]
+fn window_filter_excludes_out_of_range_findings() {
+    let lines = fetch_from_file(&fixture("oom.jsonl")).expect("read fixture");
+    let all = scan(&lines);
+
+    // A window ending before every fixture event yields nothing.
+    let empty = TimeWindow { start: None, end: Some(Timestamp(1_000_000_000)) };
+    assert_eq!(all.iter().filter(|f| empty.contains(f.time)).count(), 0);
+
+    // A window covering the fixture's day yields both.
+    let day = TimeWindow {
+        start: Some(Timestamp(1_783_598_000)),
+        end:   Some(Timestamp(1_783_599_000)),
+    };
+    assert_eq!(all.iter().filter(|f| day.contains(f.time)).count(), 2);
+}

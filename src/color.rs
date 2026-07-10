@@ -34,6 +34,7 @@ pub const COLORS: Pal = Pal {
 /// Windows does not parse escape codes unless `ENABLE_VIRTUAL_TERMINAL_PROCESSING`
 /// (0x0004) is set on the console handle; `print!` alone is not sufficient.
 /// Returns `false` if the handle is invalid (e.g. output is redirected to a file).
+#[cfg(windows)]
 pub fn enable_ansi_color() -> bool {
     use windows::Win32::System::Console::*;
     const VTP: u32 = 0x0004; // ENABLE_VIRTUAL_TERMINAL_PROCESSING
@@ -48,3 +49,14 @@ pub fn enable_ansi_color() -> bool {
         SetConsoleMode(h, CONSOLE_MODE(mode.0 | VTP)).is_ok()
     }
 }
+
+/// Unix terminals parse ANSI escapes natively; we only enable color when stdout
+/// is an interactive terminal (so piped/redirected output stays clean).
+#[cfg(unix)]
+pub fn enable_ansi_color() -> bool {
+    unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
+}
+
+/// Fallback for platforms with neither backend: assume ANSI is fine.
+#[cfg(not(any(windows, unix)))]
+pub fn enable_ansi_color() -> bool { true }
