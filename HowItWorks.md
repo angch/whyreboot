@@ -289,6 +289,16 @@ Results are de-duplicated by `(time, message)`. Each JSON line is parsed by a mi
 
 Each detector is `fn(&LogLine) -> Option<Finding>`. `classify()` runs them in order and takes the **first** match, so one line yields at most one finding. Detectors anchor on stable marker substrings (not brittle full-line regexes) and extract a few fields tolerantly. Categories: `OOM`, `KernelPanic`, `Segfault`, `Disk`, `Lockup`, `Thermal`, `Hardware`, `Service`, `Coredump`. Severity is `Critical` (system stability threatened) or `Warning` (single process/service).
 
+**Guarding against boot-banner false positives.** Several subsystem names appear in benign driver-init banners logged at *every* boot, not just in error reports — observed live on this machine:
+
+| Line (logged at boot) | Naïve marker that matched | Why it's benign |
+|---|---|---|
+| `EDAC MC: Ver: 3.0.0` | `EDAC` | EDAC driver version banner |
+| `mce: CPU supports 32 MCE banks` | `mce:` | MCE capability announcement |
+| `EXT4-fs (sda3): mounted filesystem … ro` → `re-mounted … r/w` | `EXT4-fs (` | Normal root-mount sequence (ro first, then r/w) |
+
+Rule: a marker that is a bare subsystem name/prefix (`EDAC`, `mce:`, `MCE `, `EXT4-fs (`, `XFS (`, `Btrfs`) must be **gated on an error indication** in the same message (`error`/`fail`/`corrupt`/`warning`, or an ` CE `/` UE ` event count). Unambiguous markers (`Hardware Error`, `EXT4-fs error`, `Kernel panic`, …) match directly. When adding a detector, check what the subsystem logs at boot (`journalctl -k -b | grep -i <name>`) before trusting a bare name. A quick way to vet the whole taxonomy: run `whyreboot --all` on a healthy machine — ideally it should report nothing from the kernel side.
+
 OOM specifics (`oom.rs`): the kernel detector keys on `Killed process <pid> (<comm>)` (also older `Kill process`), extracting pid, comm, and `anon-rss:`/`total-vm:`/`oom_score_adj:`; the `invoked oom-killer:`/`oom-kill:` context lines are deliberately **not** counted, so a single kill = one finding. The systemd-oomd detector (identifier `systemd-oomd`) parses `Killed <cgroup> due to <reason>`.
 
 ## Step 4 — Coalesce bursts (`coalesce()`)
