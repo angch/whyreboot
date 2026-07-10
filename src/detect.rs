@@ -49,6 +49,7 @@ type Detector = fn(&LogLine) -> Option<Finding>;
 const DETECTORS: &[Detector] = &[
     oom::detect,
     detect_kernel_panic,
+    detect_shutdown_cause,
     detect_gpu,
     detect_segfault,
     detect_disk_io,
@@ -58,6 +59,9 @@ const DETECTORS: &[Detector] = &[
     detect_service_failure,
     detect_coredump,
     detect_session,
+    detect_mac_crash_report,
+    detect_mac_sleep_wake,
+    detect_mac_update_restart,
 ];
 
 /// Findings within this many seconds, of the same category and source, are
@@ -233,24 +237,84 @@ fn is_kernel(line: &LogLine) -> bool {
 // ── Detectors ────────────────────────────────────────────────────────────────────
 
 /// Kernel panics, oopses, and BUGs — the system is (or was) in a fatal state.
+/// Covers Linux (`Kernel panic - not syncing`, oops) and macOS/XNU
+/// (`panic(cpu N caller …)`, `userspace watchdog timeout` panic strings).
 ///
-/// Provenance: **canonical format** (kernel `panic()` / oops wording) — fixture
-/// tested only; no live panic reproduced during development.
+/// Provenance: **canonical format** (Linux kernel `panic()` / oops wording; XNU
+/// panic string format) — fixture tested only; no live panic reproduced.
 fn detect_kernel_panic(line: &LogLine) -> Option<Finding> {
     let markers = [
         "Kernel panic - not syncing", "BUG: unable to handle",
         "kernel BUG at", "Oops:", "Internal error: Oops", "unable to handle kernel",
+        // macOS/XNU: "panic(cpu 4 caller 0xffffff…): userspace watchdog timeout…"
+        "panic(cpu ", "userspace watchdog timeout",
     ];
     let m = first_of(&line.message, &markers)?;
-    let title = if has(&line.message, "panic") {
+    let title = if has(&line.message, "userspace watchdog timeout") {
+        // A macOS watchdog panic names the process that stopped checking in
+        // (classically WindowServer) — the machine force-restarted because of it.
+        let who = line.message.find("no successful checkins from")
+            .map(|p| line.message[p + 27..].trim()
+                .split([' ', '(', '\n']).next().unwrap_or("").to_string())
+            .filter(|s| !s.is_empty());
+        match who {
+            Some(w) => format!("Forced restart: watchdog timeout — {w} stopped responding"),
+            None    => "Forced restart: userspace watchdog timeout".to_string(),
+        }
+    } else if has(&line.message, "panic") {
         "Kernel panic".to_string()
     } else {
         format!("Kernel {}", m.trim_end_matches(':'))
     };
     Some(finding(line, Severity::Critical, "KernelPanic", title,
         vec!["The kernel hit an unrecoverable fault. If the machine rebooted, this is \
-              almost certainly why; capture the full trace with `journalctl -k -b -1`.".into()],
-        "journald:kernel"))
+              almost certainly why. Linux: `journalctl -k -b -1`; macOS: check \
+              /Library/Logs/DiagnosticReports for the matching .panic file.".into()],
+        "kernel"))
+}
+
+/// macOS "Previous shutdown cause: N" — logged by the kernel at every boot and
+/// the canonical answer to "was the last shutdown unsafe?". Code table compiled
+/// from public documentation of observed values.
+///
+/// Provenance: **third-party logs / UNTESTED LIVE** — the message format and
+/// code meanings are widely documented (Apple support threads, eclecticlight.co),
+/// but no live macOS journal has been scanned during development.
+fn detect_shutdown_cause(line: &LogLine) -> Option<Finding> {
+    let msg = &line.message;
+    let p = msg.find("Previous shutdown cause:")?;
+    let code_str = msg[p + "Previous shutdown cause:".len()..].trim();
+    let code: i64 = code_str.split_whitespace().next()?.parse().ok()?;
+
+    let (sev, meaning) = match code {
+        5  => (Severity::Info, "normal shutdown (clean)"),
+        0  => (Severity::Critical, "power loss — the Mac lost power without shutting down"),
+        3  => (Severity::Warning, "hard shutdown — power button held down"),
+        -3 => (Severity::Critical, "multiple temperature sensors exceeded limits (thermal)"),
+        -60 => (Severity::Critical, "bad master directory block — serious disk corruption"),
+        -61 | -62 => (Severity::Critical,
+            "watchdog forced a restart — the system (often WindowServer) was unresponsive"),
+        -71 => (Severity::Critical, "memory (SO-DIMM) overtemperature"),
+        -74 => (Severity::Critical, "battery overtemperature"),
+        -75 => (Severity::Warning, "power adapter communication problem"),
+        -78 | -79 => (Severity::Critical, "incorrect current from power adapter/battery"),
+        -81 => (Severity::Critical, "thermal shutdown — system too hot"),
+        -95 => (Severity::Critical, "CPU thermal shutdown"),
+        -103 => (Severity::Warning, "battery voltage too low to keep running"),
+        -128 => (Severity::Warning, "unknown cause — often follows a panic or forced reset"),
+        _ => (Severity::Warning, "unlisted cause code — non-clean shutdown suspected"),
+    };
+
+    // A clean shutdown (5) is unremarkable; don't clutter the report with it.
+    if code == 5 { return None; }
+
+    Some(finding(line, sev, "ShutdownCause",
+        format!("Unsafe shutdown detected (cause {code}: {meaning})"),
+        vec!["macOS logs this at the boot AFTER the event — it describes how the \
+              PREVIOUS shutdown ended.".into(),
+             "Recurring thermal/battery codes point at hardware; watchdog codes \
+              (-61/-62) point at a hung process, often graphics-related.".into()],
+        "macos:kernel"))
 }
 
 /// GPU hangs, resets, and fatal driver errors (amdgpu, i915, nouveau, NVIDIA).
@@ -646,6 +710,61 @@ fn detect_session(line: &LogLine) -> Option<Finding> {
     None
 }
 
+/// macOS app crashes captured by ReportCrash:
+/// `Saved crash report for Safari[4242] version … to /Library/Logs/DiagnosticReports/….ips`.
+///
+/// Provenance: **third-party logs / UNTESTED LIVE** — format widely quoted in
+/// public reports; no live macOS crash scanned during development.
+fn detect_mac_crash_report(line: &LogLine) -> Option<Finding> {
+    if !line.identifier.eq_ignore_ascii_case("ReportCrash") { return None; }
+    let msg = &line.message;
+    let p = msg.find("Saved crash report for ")?;
+    let rest = &msg[p + "Saved crash report for ".len()..];
+    let app = rest[..rest.find('[').unwrap_or_else(|| rest.find(' ').unwrap_or(rest.len()))]
+        .trim().to_string();
+    let who = if app.is_empty() { "an app".to_string() } else { format!("'{app}'") };
+    Some(finding(line, Severity::Warning, "Crash",
+        format!("macOS app crash: {who}"),
+        vec!["ReportCrash captured a crash report. Open the .ips file in Console.app \
+              (Crash Reports) for the backtrace.".into()],
+        "macos:ReportCrash"))
+}
+
+/// macOS sleep/wake failures: `Sleep Wake failure in EFI` (and the follow-up
+/// `Failure code:: …` lines) — the machine failed to sleep or wake and was
+/// force-restarted.
+///
+/// Provenance: **third-party logs / UNTESTED LIVE**.
+fn detect_mac_sleep_wake(line: &LogLine) -> Option<Finding> {
+    if !contains_ci(&line.message, "Sleep Wake failure") { return None; }
+    Some(finding(line, Severity::Critical, "SleepWake",
+        "Sleep/wake failure — the Mac failed to sleep or wake and restarted".to_string(),
+        vec!["Often driver/peripheral related: disconnect USB/Thunderbolt devices, \
+              reset SMC/NVRAM on Intel Macs, and check for a matching Sleep Wake \
+              Failure report in Console.app.".into()],
+        "macos:kernel"))
+}
+
+/// Reboots initiated for software updates on macOS: softwareupdated /
+/// OSInstaller activity that arms or triggers a restart.
+///
+/// Provenance: **third-party logs / UNTESTED LIVE** — marker set is a
+/// best-effort union of strings quoted in public logs across macOS versions;
+/// wording here churns between releases more than the other categories.
+fn detect_mac_update_restart(line: &LogLine) -> Option<Finding> {
+    let ident_ok = line.identifier.eq_ignore_ascii_case("softwareupdated")
+        || line.identifier.eq_ignore_ascii_case("OSInstallerSetup")
+        || line.identifier.eq_ignore_ascii_case("osinstallersetupd");
+    if !ident_ok { return None; }
+    let markers = ["restart", "Restart", "reboot", "Installed macOS", "install-and-restart"];
+    first_of(&line.message, &markers)?;
+    Some(finding(line, Severity::Info, "UpdateRestart",
+        "Reboot for software update (softwareupdated/OSInstaller activity)".to_string(),
+        vec!["A macOS software update armed or performed a restart — an expected \
+              reboot, listed so unexplained reboots can be told apart from updates.".into()],
+        "macos:softwareupdate"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -947,6 +1066,79 @@ mod tests {
             "Gdk-Message: 10:11:12.000: Error 71 (Protocol error) dispatching to Wayland display."
         )).unwrap();
         assert_eq!(g.category, "Session");
+    }
+
+    // ── macOS detectors ───────────────────────────────────────────────────────
+
+    #[test]
+    fn shutdown_cause_watchdog_is_critical() {
+        let f = classify(&kline("Previous shutdown cause: -61")).unwrap();
+        assert_eq!(f.category, "ShutdownCause");
+        assert_eq!(f.severity, Severity::Critical);
+        assert!(f.title.contains("-61"));
+        assert!(f.title.to_lowercase().contains("unsafe"));
+    }
+
+    #[test]
+    fn shutdown_cause_power_loss_and_hard_button() {
+        assert_eq!(classify(&kline("Previous shutdown cause: 0")).unwrap().severity,
+                   Severity::Critical);
+        let hard = classify(&kline("Previous shutdown cause: 3")).unwrap();
+        assert_eq!(hard.severity, Severity::Warning);
+        assert!(hard.title.contains("power button"));
+    }
+
+    #[test]
+    fn shutdown_cause_clean_is_not_reported() {
+        assert!(classify(&kline("Previous shutdown cause: 5")).is_none());
+    }
+
+    #[test]
+    fn shutdown_cause_unknown_code_still_flagged() {
+        let f = classify(&kline("Previous shutdown cause: -112")).unwrap();
+        assert_eq!(f.category, "ShutdownCause");
+    }
+
+    #[test]
+    fn macos_panic_and_watchdog_panic_string() {
+        let p = classify(&kline(
+            "panic(cpu 4 caller 0xffffff8012345678): Kernel trap at 0x0, type 14"
+        )).unwrap();
+        assert_eq!(p.category, "KernelPanic");
+        let w = classify(&kline(
+            "panic(cpu 0 caller 0xfffffe001234): userspace watchdog timeout: no successful \
+             checkins from WindowServer in 120 seconds"
+        )).unwrap();
+        assert_eq!(w.category, "KernelPanic");
+        assert!(w.title.contains("WindowServer"), "title: {}", w.title);
+    }
+
+    #[test]
+    fn mac_crash_report_extracts_app() {
+        let l = user_line("ReportCrash",
+            "Saved crash report for Safari[4242] version 17.1 to \
+             /Library/Logs/DiagnosticReports/Safari-2026-07-10.ips");
+        let f = classify(&l).unwrap();
+        assert_eq!(f.category, "Crash");
+        assert!(f.title.contains("Safari"));
+    }
+
+    #[test]
+    fn mac_sleep_wake_failure() {
+        let f = classify(&kline("Sleep Wake failure in EFI")).unwrap();
+        assert_eq!(f.category, "SleepWake");
+        assert_eq!(f.severity, Severity::Critical);
+    }
+
+    #[test]
+    fn mac_update_restart_needs_identifier() {
+        let f = classify(&user_line("softwareupdated",
+            "SUOSUShimController: Armed: YES, with reason: install-and-restart")).unwrap();
+        assert_eq!(f.category, "UpdateRestart");
+        assert_eq!(f.severity, Severity::Info);
+        // The same text from another identifier must not match.
+        assert!(classify(&user_line("someapp",
+            "SUOSUShimController: Armed: YES, with reason: install-and-restart")).is_none());
     }
 
     // ── Correlation ───────────────────────────────────────────────────────────

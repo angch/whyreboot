@@ -10,6 +10,7 @@ Guidance for agentic coders working in this repository. Read this before touchin
 
 - **Windows:** diagnoses why the machine last rebooted, querying the Windows Event Log (System channel) and Windows Error Reporting (Application channel) for crash causes, faulting drivers, and power-management misconfigurations. This is the original tool; its logic is unchanged.
 - **Linux:** scans the systemd journal (`journalctl`) over a time window for logged system issues — OOM kills, kernel panics, segfaults, disk/I-O errors, lockups, thermal trips, hardware/MCE errors, failed units, coredumps — emitting generic `Finding`s. Issues need not have caused a reboot.
+- **macOS:** same findings pipeline over the unified log (`log show --style ndjson`): unsafe shutdowns (`Previous shutdown cause` code table), XNU panics (incl. WindowServer watchdog), sleep/wake failures, ReportCrash app crashes, update reboots. Backend in `macos.rs`; detectors are portable and fixture-tested on Linux CI; the release workflow builds/tests a universal binary on macOS runners. No live Mac was used in development — provenance is third-party.
 
 The two platforms share a portable core (data model, timestamp, analysis logic) and diverge only in the log-source backend and the top-level report style. `cfg(windows)` / `cfg(target_os = "linux")` gate the backends; a bare `cargo build`/`cargo test` builds the core crate on any platform (the Win32 GUI is excluded via `default-members`).
 
@@ -71,7 +72,9 @@ src/format.rs      — cause labels, explanations, formatting  [portable]
 src/color.rs       — ANSI palette; enable via Win32 VTP / unix isatty
 src/events.rs      — System + WER event fetching, minidump listing  [cfg(windows)]
 src/registry.rs    — registry helpers + audio power settings check  [cfg(windows)]
-src/linux.rs       — journalctl -o json source + flat-JSON parser  [cfg(linux)]
+src/jsonlog.rs     — shared ndjson parser: journald + macOS log-show formats  [portable]
+src/linux.rs       — journalctl -o json source (indexed queries)  [cfg(linux)]
+src/macos.rs       — macOS `log show --style ndjson` source  [cfg(macos)]
 src/display.rs     — findings output (portable) + boot-cycle output (cfg(windows))
 tests/oom_e2e.rs   — end-to-end: fixture → detect::scan
 tests/fixtures/    — journalctl -o json sample lines (oom.jsonl, mixed.jsonl)

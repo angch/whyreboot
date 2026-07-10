@@ -22,6 +22,7 @@
 pub mod analysis;
 pub mod detect;
 pub mod format;
+pub mod jsonlog;
 pub mod oom;
 pub mod timestamp;
 pub mod timewindow;
@@ -37,3 +38,7 @@ pub mod registry;
 // Linux journald backend.
 #[cfg(target_os = "linux")]
 pub mod linux;
+
+// macOS unified-log backend.
+#[cfg(target_os = "macos")]
+pub mod macos;

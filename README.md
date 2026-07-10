@@ -4,6 +4,7 @@ A single-binary command-line tool that diagnoses system issues from the OS logs.
 
 - **Windows:** reads the Event Log and tells you *why* your machine last rebooted — crash, forced power-off, update restart, or clean shutdown — and which driver is likely to blame.
 - **Linux:** scans the systemd journal for logged system issues over a time window you choose (`"1 hour ago"`, `"today"`, `"2h"`, …) — starting with **out-of-memory (OOM) kills** and covering kernel panics, segfaults, disk/I-O errors, CPU lockups, thermal trips, hardware (machine-check) errors, failed systemd units, and coredumps. These issues need not have caused a reboot at all.
+- **macOS:** scans the unified log (`log show`) over the same time windows for **unsafe shutdowns** (`Previous shutdown cause` codes: power loss, watchdog-forced restarts, thermal/battery trips), kernel panics (including WindowServer watchdog panics), sleep/wake failures, app crashes captured by ReportCrash, and **reboots for software updates** — so an unexplained restart can be told apart from an expected one.
 
 The two platforms share one core: a normalized log stream feeds pluggable detectors that emit findings, rendered as the same text/JSON report.
 
@@ -26,6 +27,18 @@ Scanning system logs for issues (since 2026-07-09 13:00:00)…
 ```
 
 Reads the journal via `journalctl` (no root needed if you're in the `systemd-journal` or `adm` group). Use `--from-file <f>` to analyze captured `journalctl -o json` output offline.
+
+## macOS quick start
+
+Same CLI, reading the unified log via `log show` (macOS 10.12+, no root needed):
+
+```console
+$ whyreboot "1 hour ago"        # issues in the last hour
+$ whyreboot today               # since local midnight
+$ whyreboot --json 2d           # last two days, as JSON
+```
+
+Note: `log show` scans (it has no field indexes like journald), so wide windows like `--all` can take a while on a long-lived install — prefer bounded ranges. `--from-file` accepts captured `log show --style ndjson` output.
 
 ## Windows
 
@@ -144,7 +157,17 @@ whyreboot --all --json | jq '.cycles[].cause'
 | GPU hang / reset † | amdgpu `ring … timeout` / `GPU reset begin!` / `VRAM is lost`, i915 `GPU HANG: ecode …` / `stopped heartbeat`, NVIDIA `NVRM: Xid` (app-level codes 13/31/43/45 → warning; `fallen off the bus` → critical), DRM `flip_done timed out` |
 | Wayland / X11 session † | clients' `Lost connection to Wayland compositor` / `Error 71 … dispatching to Wayland display`, `gnome-session` `Unrecoverable failure in required component`, Xorg `(EE) Fatal server error` / `(EE) Segmentation fault` |
 
-† Marker strings sourced verbatim from public incident reports but **not yet reproduced against a live incident** — see the provenance table in [HowItWorks.md](HowItWorks.md). A wording mismatch means a silent miss, never a wrong verdict; capture misses with `journalctl -o json` and replay via `--from-file`.
+### macOS (unified log scan) †
+
+| Category | Signals matched |
+|---|---|
+| Unsafe shutdown | kernel `Previous shutdown cause: N` with a decoded cause table — power loss (0), hard power-off (3), watchdog-forced restart (-61/-62), thermal (-3/-81/-95), battery (-74/-103), disk corruption (-60), … clean shutdowns (5) are not reported |
+| Kernel panic | `panic(cpu N caller …)`, incl. `userspace watchdog timeout: no successful checkins from <process>` (names the hung process, classically WindowServer) |
+| Sleep/wake failure | `Sleep Wake failure in EFI` |
+| App crash | ReportCrash `Saved crash report for App[pid] … .ips` |
+| Update reboot | `softwareupdated`/OSInstaller restart activity — expected reboots, listed to distinguish them from unexplained ones |
+
+† Marker strings sourced verbatim from public incident reports / platform documentation but **not yet reproduced against a live incident** — see the provenance table in [HowItWorks.md](HowItWorks.md). A wording mismatch means a silent miss, never a wrong verdict; capture misses with `journalctl -o json` (Linux) or `log show --style ndjson` (macOS) and replay via `--from-file`.
 
 A burst of related lines from one incident (e.g. the ~10 lines a SATA fault emits) is coalesced into a single finding, and a **correlation pass** links cascades: a GPU hang lists the segfaults/coredumps/session losses that followed it, and a compositor crash is linked to every client that lost its connection. Adding a category is one detector function in `src/detect.rs`.
 

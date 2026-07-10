@@ -1,8 +1,8 @@
 # How whyreboot Works
 
-whyreboot turns raw OS logs into a plain-English verdict. On **Windows** it explains why the machine last rebooted; on **Linux** it scans the systemd journal over a time window for logged system issues. This document walks through each pipeline. Keep it in sync with the source when logic changes.
+whyreboot turns raw OS logs into a plain-English verdict. On **Windows** it explains why the machine last rebooted; on **Linux** it scans the systemd journal over a time window for logged system issues; on **macOS** it scans the unified log the same way (unsafe shutdowns, panics, sleep/wake failures, app crashes, update reboots). This document walks through each pipeline. Keep it in sync with the source when logic changes.
 
-The two share a portable core (`types.rs`, `timestamp.rs`, `timewindow.rs`, `detect.rs`, `oom.rs`, `analysis.rs`, `format.rs`); they differ in the log-source backend (`events.rs`/`registry.rs` on Windows, `linux.rs` on Linux) and the top-level report (`print_cycle` vs `print_findings`). See [the Linux section](#linux-journal-issue-scanning) below; the Windows pipeline follows.
+All platforms share a portable core (`types.rs`, `timestamp.rs`, `timewindow.rs`, `detect.rs`, `oom.rs`, `jsonlog.rs`, `analysis.rs`, `format.rs`); they differ in the log-source backend (`events.rs`/`registry.rs` on Windows, `linux.rs` on Linux, `macos.rs` on macOS) and the top-level report (`print_cycle` vs `print_findings`). See [the Linux section](#linux-journal-issue-scanning) and [the macOS section](#macos-unified-log-scanning) below; the Windows pipeline follows.
 
 ---
 
@@ -311,6 +311,7 @@ Three levels (each detector's doc comment in `detect.rs` carries its level):
 | GPU | **third-party logs — untested live** | verbatim from Ubuntu/Arch/NVIDIA/Framework reports (incl. Strix Halo gfx1151) |
 | Session | **third-party logs — untested live** | verbatim from GNOME GitLab / Mozilla / KDE / Arch reports; dev VM has no graphical session |
 | KernelPanic, Segfault, Lockup, Thermal, Hardware, Coredump | canonical format | fixture-tested only; benign EDAC/boot-banner baselines verified-live |
+| ShutdownCause, SleepWake, Crash, UpdateRestart (macOS) | **third-party logs — untested live** | formats from public reports/documentation; developed on Linux, CI smoke-runs on macOS runners |
 
 A miss (wording drift on some kernel/driver version) silently yields no finding — it never misclassifies or crashes. If you hit a real incident that these patterns miss, capture it with `journalctl -o json > incident.jsonl` and replay with `--from-file`; extending the markers is a one-function change.
 
@@ -356,3 +357,36 @@ Findings are filtered by `TimeWindow::contains` (belt-and-suspenders with journa
 | Marker-based matching | Detection keys on known substrings; kernel wording changes across versions and unusual formats may be missed. Prefer adding markers over tightening to full-line formats. |
 | Non-persistent journal | If `Storage=volatile`, history is lost on reboot, so ranges spanning a reboot may be truncated. |
 | App-side Wayland-loss lines | Arbitrary apps log `Lost connection to Wayland compositor` under their own identifier at info priority, which the indexed live queries don't fetch (we can't enumerate every app). The compositor's own crash *is* fetched (coredump/segfault/session queries), so the incident is still reported; the client lines are picked up in `--from-file` captures. |
+
+---
+
+# macOS — unified log scanning
+
+The macOS path reuses the entire Linux findings pipeline — same `TimeWindow`, same detector framework and correlation pass, same report — with one different fetch backend (`macos.rs`) and a second input format handled by the shared parser (`jsonlog.rs`).
+
+## Fetch (`macos.rs`)
+
+One `log show --style ndjson` invocation, bounded by `--start`/`--end` (local-time `YYYY-MM-DD HH:MM:SS`, rendered by `Timestamp::format_dt`) and filtered with an NSPredicate over `process` (kernel, ReportCrash, softwareupdated, osinstallersetupd) plus `eventMessage CONTAINS` fallbacks for shutdown-cause / sleep-wake / panic strings. Unlike journald, the unified log has **no indexed field queries** — `log show` scans its window regardless — so keep windows bounded; `--all` on a long-lived install is inherently slow (this is `log show`, not us).
+
+Each ndjson record maps onto the shared `LogLine`: `eventMessage` → message, `process` → identifier (so kernel lines satisfy the detectors' kernel checks), `subsystem` → transport. The `timestamp` field is local time with an explicit UTC offset (`2026-07-10 08:00:05.123456+0800`), parsed offset-correctly by `Timestamp::from_log_show`.
+
+## macOS detectors (in the same `DETECTORS` list)
+
+| Category | Trigger | Severity |
+|---|---|---|
+| `ShutdownCause` | kernel `Previous shutdown cause: N`, logged at the boot **after** the event. Decoded: 0 power loss, 3 hard power-off, -60 disk corruption, -61/-62 watchdog restart, -3/-71/-74/-81/-95 thermal/battery, -103 battery low, -128 unknown; unlisted codes still flagged. Cause 5 (clean) is deliberately **not** reported. | Critical / Warning by code |
+| `KernelPanic` | XNU `panic(cpu N caller …)`; `userspace watchdog timeout: no successful checkins from <proc>` extracts the hung process (classically WindowServer) | Critical |
+| `SleepWake` | `Sleep Wake failure` | Critical |
+| `Crash` | ReportCrash identifier + `Saved crash report for App[pid] …` (app name extracted) | Warning |
+| `UpdateRestart` | softwareupdated/osinstallersetupd identifier + restart/install markers — expected reboots, reported at Info so unexplained restarts can be told apart from updates | Info |
+
+These detectors live in the portable `detect.rs`, so the macOS fixtures (`tests/fixtures/macos.jsonl`) are exercised on Linux CI as well; a journald stream never contains these markers, so they cost nothing cross-platform.
+
+## Known limitations (macOS)
+
+| Limitation | Detail |
+|---|---|
+| No field indexes | `log show` scans its whole window; wide ranges are slow by nature. Default window is 24h. |
+| Provenance | All macOS markers are third-party/documentation-sourced and **untested against a live Mac** (development happened on Linux; CI smoke-runs the binary against the macOS runner's live unified log). See the provenance table above. |
+| Log retention | The unified log typically retains days–weeks; `--all` cannot see past its retention. |
+| Update-restart wording | softwareupdated log phrasing churns across macOS releases more than the other categories; expect to extend markers. |

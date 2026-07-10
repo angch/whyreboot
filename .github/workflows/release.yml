@@ -10,8 +10,65 @@ permissions:
   contents: write
 
 jobs:
+  build-macos:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable (both Apple targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Run tests
+        run: cargo test --release
+
+      - name: Build release binaries (both architectures)
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+
+      - name: Create universal binary
+        run: |
+          lipo -create -output whyreboot-cli-macos-universal \
+            target/aarch64-apple-darwin/release/whyreboot \
+            target/x86_64-apple-darwin/release/whyreboot
+          file whyreboot-cli-macos-universal
+
+      # Smoke test: scan the runner's own unified log for the last hour.
+      - name: Smoke test on live unified log
+        run: |
+          ./whyreboot-cli-macos-universal --help
+          ./whyreboot-cli-macos-universal --since "1 hour ago" --no-color || true
+
+      - name: Show binary size
+        run: ls -la whyreboot-cli-macos-universal
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: whyreboot-cli-macos-universal
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   build-linux:
     runs-on: ubuntu-latest
+    # Serialized so the release-upload steps never race to create the tag's release.
+    needs: build-macos
 
     steps:
       - uses: actions/checkout@v4

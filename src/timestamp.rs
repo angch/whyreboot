@@ -42,6 +42,25 @@ impl Timestamp {
         Some(Timestamp(civil_to_unix(y, mo, d, h, min, s)))
     }
 
+    /// Parse a macOS unified-log timestamp: `"YYYY-MM-DD HH:MM:SS.ffffff±HHMM"`
+    /// (local time with an explicit UTC offset, as emitted by
+    /// `log show --style ndjson`). The offset is applied to yield UTC.
+    pub fn from_log_show(s: &str) -> Option<Self> {
+        let base = Self::from_rfc3339(s)?; // parses the fixed-position date/time
+        // Find the trailing ±HHMM offset (after the seconds/fraction).
+        let tail = &s[19..];
+        let sign_pos = tail.find(['+', '-'])?;
+        let sign = if tail.as_bytes()[sign_pos] == b'+' { 1 } else { -1 };
+        let digits = &tail[sign_pos + 1..];
+        if digits.len() < 4 || !digits.as_bytes()[..4].iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let hh: i64 = digits[..2].parse().ok()?;
+        let mm: i64 = digits[2..4].parse().ok()?;
+        // Local = UTC + offset ⇒ UTC = parsed-as-if-UTC − offset.
+        Some(Timestamp(base.0 - sign * (hh * 3600 + mm * 60)))
+    }
+
     pub fn secs_since(self, earlier: Self) -> i64 { self.0 - earlier.0 }
 
     pub fn add_secs(self, s: i64) -> Self { Timestamp(self.0 + s) }
@@ -196,6 +215,19 @@ mod tests {
     fn add_secs_roundtrip() {
         let t = Timestamp(5000);
         assert_eq!(t.add_secs(200).secs_since(t), 200);
+    }
+
+    #[test]
+    fn from_log_show_parses_offsets() {
+        // 2024-01-15T10:30:00Z reference point (Unix 1705314600).
+        assert_eq!(Timestamp::from_log_show("2024-01-15 10:30:00.000000+0000"),
+                   Some(Timestamp(1_705_314_600)));
+        assert_eq!(Timestamp::from_log_show("2024-01-15 18:30:00.123456+0800"),
+                   Some(Timestamp(1_705_314_600)));
+        assert_eq!(Timestamp::from_log_show("2024-01-15 05:30:00.000000-0500"),
+                   Some(Timestamp(1_705_314_600)));
+        assert_eq!(Timestamp::from_log_show("garbage"), None);
+        assert_eq!(Timestamp::from_log_show("2024-01-15 10:30:00"), None); // no offset
     }
 
     #[test]

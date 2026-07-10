@@ -100,9 +100,16 @@ fn main() {
     run_windows(&args, pal);
 
     #[cfg(target_os = "linux")]
-    run_linux(&args, pal);
+    run_issue_scan(&args, pal,
+        whyreboot::linux::fetch_journal,
+        "Ensure `journalctl` is available and readable (try the systemd-journal or adm group).");
 
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(target_os = "macos")]
+    run_issue_scan(&args, pal,
+        whyreboot::macos::fetch_unified_log,
+        "Ensure the `log` command is available (macOS 10.12+).");
+
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         let _ = (&args, pal);
         eprintln!("whyreboot: this platform is not supported yet.");
@@ -110,12 +117,21 @@ fn main() {
     }
 }
 
-// ── Linux: issue scanning ────────────────────────────────────────────────────────
+// ── Linux / macOS: issue scanning ───────────────────────────────────────────────
 
-#[cfg(target_os = "linux")]
-fn run_linux(args: &Args, pal: &color::Pal) {
+/// Shared unix issue-scan flow: resolve the time window, pull records from the
+/// platform log source (or a `--from-file` capture in either supported format),
+/// run the detectors, filter, and render.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run_issue_scan(
+    args: &Args,
+    pal: &color::Pal,
+    fetch: fn(&whyreboot::timewindow::TimeWindow)
+        -> std::io::Result<Vec<whyreboot::types::LogLine>>,
+    fetch_hint: &str,
+) {
     use whyreboot::detect::scan;
-    use whyreboot::linux::{fetch_from_file, fetch_journal};
+    use whyreboot::jsonlog::fetch_from_file;
     use whyreboot::timestamp::Timestamp;
     use whyreboot::timewindow::{parse_window, TimeWindow};
 
@@ -144,19 +160,19 @@ fn run_linux(args: &Args, pal: &color::Pal) {
 
     let lines = match &args.from_file {
         Some(p) => fetch_from_file(p),
-        None    => fetch_journal(&window),
+        None    => fetch(&window),
     };
     let lines = match lines {
         Ok(l) => l,
         Err(e) => {
             eprintln!("whyreboot: failed to read logs: {e}");
-            eprintln!("Ensure `journalctl` is available and readable (try the systemd-journal or adm group).");
+            eprintln!("{fetch_hint}");
             std::process::exit(1);
         }
     };
 
-    // Detect, then window-filter (belt-and-suspenders alongside journalctl's own
-    // --since/--until, and the only filter for --from-file).
+    // Detect, then window-filter (belt-and-suspenders alongside the source's own
+    // time bounds, and the only filter for --from-file).
     let findings: Vec<_> = scan(&lines)
         .into_iter()
         .filter(|f| window.contains(f.time))

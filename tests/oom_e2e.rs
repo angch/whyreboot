@@ -4,7 +4,7 @@
 //! proving field extraction lines up with real journalctl `-o json` output.
 
 use whyreboot::detect::scan;
-use whyreboot::linux::fetch_from_file;
+use whyreboot::jsonlog::fetch_from_file;
 use whyreboot::timestamp::Timestamp;
 use whyreboot::timewindow::TimeWindow;
 
@@ -86,6 +86,35 @@ fn gpu_cascade_detected_and_correlated() {
     // coalesce with the gnome-session failure into Session finding(s), never
     // one finding per app per line spamming the report.
     assert!(findings.len() <= 5, "expected a compact report, got: {cats:?}");
+}
+
+#[test]
+fn macos_ndjson_fixture_detects_shutdown_panic_crash_and_update() {
+    // macOS `log show --style ndjson` format, parsed by the same shared code —
+    // this runs on every platform, so the macOS path is regression-tested on Linux CI.
+    let lines = fetch_from_file(&fixture("macos.jsonl")).expect("read fixture");
+    assert_eq!(lines.len(), 7, "all ndjson lines should parse");
+
+    let findings = scan(&lines);
+    let cats: Vec<&str> = findings.iter().map(|f| f.category.as_str()).collect();
+    assert!(cats.contains(&"ShutdownCause"),  "categories: {cats:?}");
+    assert!(cats.contains(&"KernelPanic"),    "categories: {cats:?}");
+    assert!(cats.contains(&"Crash"),          "categories: {cats:?}");
+    assert!(cats.contains(&"SleepWake"),      "categories: {cats:?}");
+    assert!(cats.contains(&"UpdateRestart"),  "categories: {cats:?}");
+
+    // Clean shutdown (cause 5) and the benign Thunderbolt line yield nothing:
+    // exactly one ShutdownCause finding (the -61 watchdog).
+    assert_eq!(findings.iter().filter(|f| f.category == "ShutdownCause").count(), 1);
+
+    // The watchdog panic names WindowServer, and the shutdown cause is Critical.
+    let panic = findings.iter().find(|f| f.category == "KernelPanic").unwrap();
+    assert!(panic.title.contains("WindowServer"));
+    let sc = findings.iter().find(|f| f.category == "ShutdownCause").unwrap();
+    assert!(sc.title.contains("-61"));
+
+    // Timestamps parsed with offset: the -61 line is 2026-07-10T08:00:05Z.
+    assert_eq!(sc.time.to_rfc3339(), "2026-07-10T08:00:05Z");
 }
 
 #[test]

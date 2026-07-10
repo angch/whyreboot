@@ -42,6 +42,13 @@ fix any misses, and upgrade the detector's provenance note to verified-live.
   UPX → ~215 KB) built, tested, and published by the GitHub Actions release
   workflow as `whyreboot-cli-x86_64-linux`. If UPX ever trips AV false
   positives, ship the uncompressed musl binary alongside.
+- macOS backend: unified-log scan (`log show --style ndjson`) reusing the whole
+  findings pipeline — unsafe shutdowns (Previous shutdown cause code table),
+  XNU/watchdog panics, sleep/wake failures, ReportCrash app crashes, update
+  reboots. Shared ndjson parser (`jsonlog.rs`) auto-detects journald vs
+  log-show format, so `--from-file` and Linux CI cover the macOS path; release
+  workflow builds/tests a universal (arm64+x86_64) binary on macOS runners.
+  Untested on a live Mac — validate and upgrade provenance when one is handy.
 - GPU + Wayland/X11 session detection with cascade correlation: GPU
   hangs/resets (amdgpu incl. MES-era Strix Halo sequences, i915, NVIDIA Xid),
   compositor-loss and Xorg fatals; a correlation pass links a GPU incident to
