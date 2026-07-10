@@ -172,9 +172,13 @@ fn detect_disk_io(line: &LogLine) -> Option<Finding> {
         "Remounting filesystem read-only", "reset SATA link", "device offlined",
     ];
     let m = first_of(&line.message, &markers)?;
-    // XFS/Btrfs lines are only interesting when they signal an error.
-    if (m == "XFS (" || m == "Btrfs") && !contains_ci(&line.message, "error")
-        && !contains_ci(&line.message, "corrupt") {
+    // Filesystem-prefix markers also match routine mount/unmount chatter
+    // ("EXT4-fs (sda3): mounted filesystem … ro" is the normal boot sequence,
+    // not a fault). Those markers only count when the line signals an error.
+    if (m == "XFS (" || m == "Btrfs" || m == "EXT4-fs (")
+        && !contains_ci(&line.message, "error")
+        && !contains_ci(&line.message, "corrupt")
+        && !contains_ci(&line.message, "warning") {
         return None;
     }
     let (title, advice) = if has(&line.message, "read-only") {
@@ -252,6 +256,17 @@ fn detect_hardware(line: &LogLine) -> Option<Finding> {
         "Uncorrected error", "Corrected error", "EDAC", "PCIe Bus Error",
     ];
     let m = first_of(&line.message, &markers)?;
+    // "EDAC" / "mce:" / "MCE " also appear in benign boot-time driver banners
+    // ("EDAC MC: Ver: 3.0.0", "mce: CPU supports 32 MCE banks"). For those
+    // ambiguous markers, require an actual error indication in the message;
+    // real reports carry "error"/"fail" or a CE/UE (corrected/uncorrected
+    // event) count, e.g. "EDAC MC0: 1 CE memory read error …".
+    if matches!(m, "EDAC" | "mce:" | "MCE ") {
+        let msg = &line.message;
+        let errorish = contains_ci(msg, "error") || contains_ci(msg, "fail")
+            || msg.contains(" CE ") || msg.contains(" UE ");
+        if !errorish { return None; }
+    }
     let uncorrected = has(&line.message, "uncorrected") || has(&line.message, "fatal");
     let (sev, title) = if uncorrected {
         (Severity::Critical, "Uncorrected hardware (machine-check) error")
@@ -366,6 +381,15 @@ mod tests {
     }
 
     #[test]
+    fn ext4_normal_mount_lines_ignored() {
+        // Routine boot sequence: root mounts ro, then remounts r/w. Not faults.
+        assert!(classify(&kline(
+            "EXT4-fs (sda3): mounted filesystem 6a51901f with ordered data mode. Quota mode: none."
+        )).is_none());
+        assert!(classify(&kline("EXT4-fs (sda3): re-mounted 6a51901f r/w.")).is_none());
+    }
+
+    #[test]
     fn hung_task_detected() {
         let f = classify(&kline(
             "INFO: task kworker/1:2:1234 blocked for more than 120 seconds."
@@ -391,6 +415,23 @@ mod tests {
             "mce: [Hardware Error]: Machine check events logged"
         )).unwrap();
         assert_eq!(f.category, "Hardware");
+    }
+
+    #[test]
+    fn edac_and_mce_boot_banners_are_not_hardware_errors() {
+        // Driver-init banners logged at every boot must not be findings.
+        assert!(classify(&kline("EDAC MC: Ver: 3.0.0")).is_none());
+        assert!(classify(&kline("mce: CPU supports 32 MCE banks")).is_none());
+        assert!(classify(&kline("MCE banks initialized")).is_none());
+    }
+
+    #[test]
+    fn edac_real_ce_report_is_detected() {
+        let f = classify(&kline(
+            "EDAC MC0: 1 CE memory read error on CPU_SrcID#0_MC#0_Chan#1_DIMM#0"
+        )).unwrap();
+        assert_eq!(f.category, "Hardware");
+        assert_eq!(f.severity, Severity::Warning); // corrected → warning
     }
 
     #[test]
