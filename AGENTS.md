@@ -16,6 +16,7 @@ The two platforms share a portable core (data model, timestamp, analysis logic) 
 **Windows binary:** `C:\Users\angch\.local\bin\whyreboot.exe` (on PATH)  
 **Build (Windows):** `cargo build --release && copy target\release\whyreboot.exe C:\Users\angch\.local\bin\`  
 **Build/test (Linux):** `cargo build` / `cargo test` (skips the Windows-only GUI).  
+**Static Linux release:** `cargo build --release --target x86_64-unknown-linux-musl` — no `musl-tools`/C toolchain needed (no C deps; rust-std ships musl libc). Produces a static-pie binary (~520 KB; UPX → ~215 KB, no startup cost). The release workflow builds/tests/uploads this as `whyreboot-cli-x86_64-linux`; its `file`/`ldd` step asserts the binary really is static, so don't add a crate with a C build dependency without updating that job.  
 **No admin/root required** for most data — Windows System channel is readable by standard users (`C:\Windows\Minidump` needs admin, falls back to WER AttachedFiles); Linux `journalctl` is readable by the `systemd-journal`/`adm` groups.
 
 ---

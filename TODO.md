@@ -30,6 +30,10 @@ from the window and convert to `Timestamp`.
 - Perf: `whyreboot --all` went from never-finishing (unindexed whole-journal
   `--grep` over 2.3 GB) to ~0.5 s by querying only journald-indexed fields
   (`_TRANSPORT`, `SYSLOG_IDENTIFIER`, `PRIORITY`) + `--output-fields`.
+- Release: fully static Linux binary (x86_64 musl, static-pie, ~520 KB;
+  UPX → ~215 KB) built, tested, and published by the GitHub Actions release
+  workflow as `whyreboot-cli-x86_64-linux`. If UPX ever trips AV false
+  positives, ship the uncompressed musl binary alongside.
 
 ## Hardware investigation notes
 
