@@ -11,7 +11,14 @@
 //!
 //! Categories (beyond [`crate::oom`]): kernel panic/oops, userspace segfaults,
 //! disk & filesystem I/O errors, CPU lockups & hung tasks, thermal events,
-//! machine-check / hardware errors, failed systemd units, and process coredumps.
+//! machine-check / hardware errors, failed systemd units, process coredumps,
+//! GPU hangs/resets (amdgpu, i915, nouveau, NVIDIA NVRM), and display-session
+//! failures (Wayland compositor loss, X server crashes).
+//!
+//! After coalescing, [`scan`] runs a **correlation pass**: a GPU incident is
+//! cross-annotated with the segfaults/coredumps/session failures that follow it,
+//! and a compositor crash is cross-annotated with the client apps that lost
+//! their connection — so cascades read as one story, not scattered findings.
 
 use crate::oom;
 use crate::types::{Finding, LogLine, Severity};
@@ -23,6 +30,7 @@ type Detector = fn(&LogLine) -> Option<Finding>;
 const DETECTORS: &[Detector] = &[
     oom::detect,
     detect_kernel_panic,
+    detect_gpu,
     detect_segfault,
     detect_disk_io,
     detect_lockup,
@@ -30,18 +38,24 @@ const DETECTORS: &[Detector] = &[
     detect_hardware,
     detect_service_failure,
     detect_coredump,
+    detect_session,
 ];
 
 /// Findings within this many seconds, of the same category and source, are
 /// merged into a single finding (a burst = one incident).
 const COALESCE_SECS: i64 = 30;
 
-/// Runs all detectors over all lines, coalesces bursts, and returns findings
-/// newest-first.
+/// Findings within this many seconds of a GPU incident or compositor crash are
+/// considered part of the same cascade and cross-annotated.
+const CORRELATE_SECS: i64 = 120;
+
+/// Runs all detectors over all lines, coalesces bursts, correlates cascades,
+/// and returns findings newest-first.
 pub fn scan(lines: &[LogLine]) -> Vec<Finding> {
     let mut found: Vec<Finding> = lines.iter().filter_map(classify).collect();
     found.sort_by_key(|f| f.time); // ascending for coalescing
     let mut merged = coalesce(found);
+    correlate(&mut merged);
     merged.sort_by_key(|f| std::cmp::Reverse(f.time)); // present newest-first
     merged
 }
@@ -78,6 +92,78 @@ fn coalesce(findings: Vec<Finding>) -> Vec<Finding> {
         }
     }
     out
+}
+
+/// Compositor / display-server process names whose crash takes down every
+/// graphical client attached to them.
+const COMPOSITORS: &[&str] = &[
+    "gnome-shell", "kwin_wayland", "kwin_x11", "mutter", "plasmashell",
+    "Xorg", "Xwayland", "weston", "sway", "hyprland", "labwc",
+];
+
+/// Cross-annotates cascade relationships between findings (any order in the
+/// slice; time proximity decides):
+///
+/// 1. **GPU incident → casualties.** Segfaults, coredumps, session failures,
+///    lockups, and service failures within [`CORRELATE_SECS`] of a GPU finding
+///    are marked as likely consequences, and the GPU finding lists them.
+/// 2. **Compositor crash → orphaned clients.** A segfault/coredump whose title
+///    names a compositor is linked with `Session` connection-loss findings in
+///    the same window.
+fn correlate(findings: &mut [Finding]) {
+    let n = findings.len();
+    // (target index, note to append) — collected first, applied after, so we
+    // never annotate based on already-annotated state.
+    let mut notes: Vec<(usize, String)> = Vec::new();
+
+    let near = |a: &Finding, b: &Finding| a.time.secs_since(b.time).abs() <= CORRELATE_SECS;
+    let is_crash_of_compositor = |f: &Finding| {
+        matches!(f.category.as_str(), "Segfault" | "Coredump")
+            && COMPOSITORS.iter().any(|c| f.title.contains(c))
+    };
+
+    for i in 0..n {
+        match findings[i].category.as_str() {
+            "GPU" => {
+                for j in 0..n {
+                    if i == j || !near(&findings[i], &findings[j]) { continue; }
+                    if matches!(findings[j].category.as_str(),
+                        "Segfault" | "Coredump" | "Session" | "Service" | "Lockup")
+                    {
+                        notes.push((i, format!(
+                            "Correlated: {} at {} — likely a casualty of this GPU incident.",
+                            findings[j].title, findings[j].time.format_t())));
+                        notes.push((j, format!(
+                            "Correlated: GPU incident at {} ({}) — this failure likely \
+                             follows the GPU hang/reset.",
+                            findings[i].time.format_t(), findings[i].title)));
+                    }
+                }
+            }
+            "Session" => {
+                for j in 0..n {
+                    if i == j || !near(&findings[i], &findings[j]) { continue; }
+                    if is_crash_of_compositor(&findings[j]) {
+                        notes.push((i, format!(
+                            "Correlated: {} at {} — the compositor/display server died, \
+                             which explains the lost connection.",
+                            findings[j].title, findings[j].time.format_t())));
+                        notes.push((j, format!(
+                            "Correlated: {} at {} — graphical clients lost their \
+                             compositor connection when this process crashed.",
+                            findings[i].title, findings[i].time.format_t())));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    notes.sort_by_key(|(idx, _)| *idx);
+    notes.dedup();
+    for (idx, note) in notes {
+        findings[idx].evidence.push(note);
+    }
 }
 
 // ── Small matching helpers ──────────────────────────────────────────────────────
@@ -143,6 +229,121 @@ fn detect_kernel_panic(line: &LogLine) -> Option<Finding> {
         vec!["The kernel hit an unrecoverable fault. If the machine rebooted, this is \
               almost certainly why; capture the full trace with `journalctl -k -b -1`.".into()],
         "journald:kernel"))
+}
+
+/// GPU hangs, resets, and fatal driver errors (amdgpu, i915, nouveau, NVIDIA).
+/// Kernel-only. Marker strings verified against real reports:
+/// - amdgpu: `*ERROR* ring gfx_0.0.0 timeout`, `GPU reset begin!`,
+///   `GPU reset succeeded`, `VRAM is lost due to GPU reset!`, `soft recovered`
+/// - i915:   `GPU HANG: ecode …, in app [pid]`, `Resetting … for stopped heartbeat`
+/// - NVIDIA: `NVRM: Xid (PCI:…): 79, GPU has fallen off the bus`
+/// - generic DRM: `[drm:…] *ERROR* … flip_done timed out`
+/// - Strix Halo–era amdgpu MES/queue resets (verified against a real gfx1151
+///   incident report): `Starting gfx_0.0.0 ring reset`, `Ring gfx_0.0.0 reset
+///   failed`, `MES failed to respond to msg=RESET`, `failed to reset legacy
+///   queue`, `*ERROR* failed to halt cp gfx`, `[drm] device wedged`, and the
+///   culprit line `Process <comm> pid <n> thread <comm:cs0> pid <n>`
+///
+/// Benign init banners (`[drm] Initialized …`, `fbcon: …`) must not match —
+/// every marker here encodes an error, not a subsystem name.
+fn detect_gpu(line: &LogLine) -> Option<Finding> {
+    if !is_kernel(line) { return None; }
+    let msg = &line.message;
+    let markers = [
+        "GPU HANG", "GPU hang", "GPU reset", "gpu reset",
+        "stopped heartbeat", "NVRM: Xid", "fallen off the bus",
+        "VRAM is lost", "ring gfx", "ring sdma", "ring comp",
+        "flip_done timed out", "GPU recovery", "amdgpu_job_timedout",
+        "GPU lockup", "failed to initialize the GPU",
+        "ring reset", "MES failed", "failed to halt cp",
+        "legacy queue", "device wedged", "IB test failed",
+        "*ERROR*",
+    ];
+    let m = match first_of(msg, &markers) {
+        Some(m) => m,
+        None => {
+            // amdgpu's culprit line carries no error word of its own:
+            // "Process slack pid 17365 thread slack:cs0 pid 17389"
+            let t = msg.trim();
+            if t.starts_with("Process ") && t.contains(" pid ") && t.contains(" thread ") {
+                "Process"
+            } else {
+                return None;
+            }
+        }
+    };
+    // "ring …" markers also appear in benign topology prints; require a fault word.
+    if m.starts_with("ring")
+        && !(contains_ci(msg, "timeout") || contains_ci(msg, "timed out")
+             || contains_ci(msg, "error") || contains_ci(msg, "hang")
+             || contains_ci(msg, "fail") || contains_ci(msg, "reset")) {
+        return None;
+    }
+    // "legacy queue" only signals a fault when the operation on it failed.
+    if m == "legacy queue" && !contains_ci(msg, "fail") { return None; }
+
+    let driver = ["amdgpu", "i915", "nouveau", "radeon"].iter()
+        .find(|d| contains_ci(msg, d)).copied()
+        .or_else(|| msg.contains("NVRM").then_some("nvidia"))
+        .unwrap_or("drm");
+
+    // "*ERROR*" is drm-style logging, but only attribute it to the GPU when the
+    // line carries GPU context — otherwise unrelated subsystems using the same
+    // convention would land here.
+    if m == "*ERROR*" && !msg.contains("[drm") && driver == "drm" { return None; }
+
+    // Culprit extraction. i915 inlines it ("GPU HANG: ecode …, in kwin_wayland
+    // [1155]"); amdgpu logs a separate "Process slack pid 17365 thread slack:cs0
+    // pid 17389" line right after the ring timeout (it coalesces into the burst).
+    let culprit = msg.find(", in ").map(|p| {
+        let rest = &msg[p + 5..];
+        rest[..rest.find('[').unwrap_or(rest.len())].trim().to_string()
+    }).or_else(|| {
+        msg.trim().strip_prefix("Process ").and_then(|rest| {
+            rest.contains(" pid ").then(|| {
+                rest[..rest.find(" pid ").unwrap()].trim().to_string()
+            })
+        })
+    }).filter(|c| !c.is_empty());
+
+    let soft = contains_ci(msg, "soft recovered") || contains_ci(msg, "flip_done")
+        || is_app_level_xid(msg);
+    let (sev, what) = if contains_ci(msg, "fallen off the bus") {
+        (Severity::Critical, "GPU has fallen off the bus (device unreachable)".to_string())
+    } else if soft {
+        (Severity::Warning, format!("GPU fault ({driver}) — recovered/soft"))
+    } else {
+        (Severity::Critical, format!("GPU hang / reset ({driver})"))
+    };
+
+    let mut evidence = Vec::new();
+    if let Some(c) = &culprit {
+        evidence.push(format!("Workload at fault (per driver): {c}"));
+    }
+    evidence.push(match sev {
+        Severity::Critical =>
+            "The GPU stopped responding and the driver attempted a reset — the session \
+             may freeze or crash. Update GPU drivers/firmware (and BIOS); if recurring, \
+             check thermals and power delivery, and test with another kernel."
+                .to_string(),
+        _ =>
+            "The GPU driver recovered from a fault without a full reset. Occasional \
+             events can be an app bug; frequent ones point to a driver regression."
+                .to_string(),
+    });
+    Some(finding(line, sev, "GPU", what, evidence, "journald:kernel"))
+}
+
+/// NVIDIA Xid codes that indicate an application-level fault (kernel/driver and
+/// GPU stay healthy): 13 graphics exception, 31 MMU fault, 43 app error, 45 preempt.
+fn is_app_level_xid(msg: &str) -> bool {
+    let Some(p) = msg.find("NVRM: Xid") else { return false };
+    // "NVRM: Xid (PCI:0000:01:00): 79, GPU has fallen off the bus"
+    let rest = &msg[p..];
+    let after_paren = rest.find("):").map(|i| &rest[i + 2..]).unwrap_or(rest);
+    let code: String = after_paren.trim_start().chars()
+        .take_while(|c| c.is_ascii_digit()).collect();
+    matches!(code.as_str(), "13" | "31" | "43" | "45")
 }
 
 /// Userspace crashes the kernel logs: segfaults, GPFs, and trap faults.
@@ -326,6 +527,65 @@ fn detect_coredump(line: &LogLine) -> Option<Finding> {
         "systemd-coredump"))
 }
 
+/// Display-session failures: Wayland clients losing their compositor, GNOME
+/// session components dying, and X server fatal errors. Message shapes verified
+/// against real reports:
+/// - clients: `Lost connection to Wayland compositor.`,
+///   `The Wayland connection broke. Did the compositor die?`,
+///   `Error 71 (Protocol error) dispatching to Wayland display.`
+/// - gnome-session-binary: `Unrecoverable failure in required component X.desktop`
+/// - Xorg: `(EE) Segmentation fault at address …`, `(EE) Fatal server error:`,
+///   `(EE) Server terminated with error (1)`
+fn detect_session(line: &LogLine) -> Option<Finding> {
+    if is_kernel(line) { return None; }
+    let msg = &line.message;
+
+    // X server fatal errors — the "(EE)" prefix plus a fatal phrase.
+    if msg.contains("(EE)")
+        && (msg.contains("Segmentation fault at address")
+            || msg.contains("Fatal server error")
+            || msg.contains("Server terminated with error")
+            || msg.contains("Caught signal"))
+    {
+        return Some(finding(line, Severity::Critical, "Session",
+            "X server (Xorg) crashed".to_string(),
+            vec!["The X display server hit a fatal error — the whole graphical session \
+                  died with it. Check /var/log/Xorg.0.log.old and the GPU driver; the \
+                  (EE) Backtrace lines name the faulting module.".into()],
+            "journald:x11"));
+    }
+
+    // GNOME session component failure.
+    if line.identifier.eq_ignore_ascii_case("gnome-session-binary")
+        && contains_ci(msg, "Unrecoverable failure in required component")
+    {
+        let comp = msg.rsplit(' ').next().unwrap_or("a component").trim_end_matches('.');
+        return Some(finding(line, Severity::Warning, "Session",
+            format!("GNOME session lost required component {comp}"),
+            vec!["A core part of the GNOME session (often the gnome-shell compositor) \
+                  failed. Look for a matching coredump/segfault just before this.".into()],
+            "gnome-session"));
+    }
+
+    // Wayland clients reporting their compositor vanished.
+    let lost = ["Lost connection to Wayland compositor",
+                "The Wayland connection broke",
+                "Error 71 (Protocol error) dispatching to Wayland display",
+                "Wayland compositor died"];
+    if first_of(msg, &lost).is_some() {
+        let who = if line.identifier.is_empty() { "An app".to_string() }
+                  else { format!("'{}'", line.identifier) };
+        return Some(finding(line, Severity::Warning, "Session",
+            format!("{who} lost its Wayland compositor connection"),
+            vec!["The Wayland compositor (gnome-shell / kwin_wayland / …) went away — \
+                  usually because it crashed, killing every client attached to it. \
+                  Check for a compositor coredump/segfault at the same moment.".into()],
+            "journald:wayland"));
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,6 +719,215 @@ mod tests {
     #[test]
     fn ordinary_line_yields_nothing() {
         assert!(classify(&kline("usb 1-3: new high-speed USB device number 7")).is_none());
+    }
+
+    // ── GPU ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn amdgpu_ring_timeout_is_critical_gpu() {
+        let f = classify(&kline(
+            "[drm:amdgpu_job_timedout [amdgpu]] *ERROR* ring gfx_0.0.0 timeout, \
+             signaled seq=633, emitted seq=635"
+        )).unwrap();
+        assert_eq!(f.category, "GPU");
+        assert_eq!(f.severity, Severity::Critical);
+        assert!(f.title.contains("amdgpu"));
+    }
+
+    #[test]
+    fn amdgpu_reset_and_vram_lost_detected() {
+        assert_eq!(classify(&kline("amdgpu 0000:0c:00.0: amdgpu: GPU reset begin!"))
+            .unwrap().category, "GPU");
+        assert_eq!(classify(&kline("[drm] VRAM is lost due to GPU reset!"))
+            .unwrap().category, "GPU");
+    }
+
+    #[test]
+    fn amdgpu_soft_recovery_is_warning() {
+        let f = classify(&kline(
+            "[drm] ring gfx_0.0.0 timeout, but soft recovered"
+        )).unwrap();
+        assert_eq!(f.category, "GPU");
+        assert_eq!(f.severity, Severity::Warning);
+    }
+
+    #[test]
+    fn i915_gpu_hang_extracts_culprit() {
+        let f = classify(&kline(
+            "i915 0000:00:02.0: [drm] GPU HANG: ecode 9:1:85dffffa, in kwin_wayland [1155]"
+        )).unwrap();
+        assert_eq!(f.category, "GPU");
+        assert_eq!(f.severity, Severity::Critical);
+        assert!(f.evidence.iter().any(|e| e.contains("kwin_wayland")), "{:?}", f.evidence);
+    }
+
+    #[test]
+    fn i915_heartbeat_reset_detected() {
+        let f = classify(&kline(
+            "i915 0000:00:02.0: [drm] Resetting rcs0 for stopped heartbeat on rcs0"
+        )).unwrap();
+        assert_eq!(f.category, "GPU");
+    }
+
+    #[test]
+    fn nvidia_xid_79_fallen_off_bus_is_critical() {
+        let f = classify(&kline(
+            "NVRM: Xid (PCI:0000:01:00): 79, pid=1234, GPU has fallen off the bus."
+        )).unwrap();
+        assert_eq!(f.category, "GPU");
+        assert_eq!(f.severity, Severity::Critical);
+        assert!(f.title.contains("fallen off the bus"));
+    }
+
+    #[test]
+    fn nvidia_xid_13_app_level_is_warning() {
+        let f = classify(&kline(
+            "NVRM: Xid (PCI:0000:01:00): 13, pid=4242, Graphics Exception: ESR 0x404490=0x80000000"
+        )).unwrap();
+        assert_eq!(f.category, "GPU");
+        assert_eq!(f.severity, Severity::Warning);
+    }
+
+    #[test]
+    fn strix_halo_mes_ring_reset_burst_is_one_gpu_finding() {
+        // Verbatim sequence from a real Strix Halo (gfx1151) incident report:
+        // Slack under mundane GL load trips a gfx ring timeout; MES reset fails,
+        // MODE2 GPU reset recovers. Must collapse to ONE GPU finding naming slack.
+        let base = 1_700_000_000;
+        let burst = [
+            "ring gfx_0.0.0 timeout, signaled seq=17436214, emitted seq=17436217",
+            "Process slack pid 17365 thread slack:cs0 pid 17389",
+            "Starting gfx_0.0.0 ring reset",
+            "MES failed to respond to msg=RESET",
+            "failed to reset legacy queue",
+            "reset via MES failed and try pipe reset -110",
+            "Ring gfx_0.0.0 reset failed",
+            "GPU reset begin!. Source: 1",
+            "MES failed to respond to msg=REMOVE_QUEUE",
+            "failed to unmap legacy queue",
+            "[drm:gfx_v11_0_cp_gfx_enable.isra.0 [amdgpu]] *ERROR* failed to halt cp gfx",
+            "GPU reset succeeded, trying to resume",
+            "GPU reset(1) succeeded!",
+            "[drm] device wedged, but recovered through reset",
+        ];
+        // Every line must classify as GPU (none dropped, none misfiled).
+        for msg in burst {
+            let f = classify(&kline(msg));
+            assert_eq!(f.as_ref().map(|f| f.category.as_str()), Some("GPU"),
+                "line not detected as GPU: {msg}");
+        }
+        let lines: Vec<LogLine> = burst.iter().enumerate()
+            .map(|(i, m)| kline_at(base + i as i64, m)).collect();
+        let found = scan(&lines);
+        assert_eq!(found.len(), 1, "burst must coalesce to one finding");
+        assert_eq!(found[0].severity, Severity::Critical);
+        assert!(found[0].evidence.iter().any(|e| e.contains("slack")),
+            "culprit 'slack' should surface: {:?}", found[0].evidence);
+    }
+
+    #[test]
+    fn non_drm_error_convention_not_gpu() {
+        // "*ERROR*" without any drm/GPU context must not be attributed to the GPU.
+        assert!(classify(&kline("some_subsys: *ERROR* widget calibration failed"))
+            .is_none());
+    }
+
+    #[test]
+    fn drm_init_banners_are_not_gpu_findings() {
+        // Benign boot lines observed verbatim in this machine's journal.
+        for msg in [
+            "[drm] Initialized bochs-drm 1.0.0 20130925 for 0000:00:02.0 on minor 0",
+            "ACPI: bus type drm_connector registered",
+            "fbcon: bochs-drmdrmfb (fb0) is primary device",
+            "[drm] Found bochs VGA, ID 0xb0c5.",
+            "workqueue: drm_fb_helper_damage_work hogged CPU for >13333us 4 times",
+        ] {
+            assert!(classify(&kline(msg)).is_none(), "false positive on: {msg}");
+        }
+    }
+
+    // ── Session ───────────────────────────────────────────────────────────────
+
+    fn user_line(ident: &str, msg: &str) -> LogLine {
+        LogLine { time: Timestamp(1_700_000_000), message: msg.into(),
+                  identifier: ident.into(), transport: "journal".into() }
+    }
+
+    #[test]
+    fn xorg_fatal_ee_is_critical_session() {
+        let f = classify(&user_line("Xorg",
+            "(EE) Fatal server error: (EE) Caught signal 11 (Segmentation fault). Server aborting"
+        )).unwrap();
+        assert_eq!(f.category, "Session");
+        assert_eq!(f.severity, Severity::Critical);
+    }
+
+    #[test]
+    fn xorg_nonfatal_ee_line_ignored() {
+        assert!(classify(&user_line("Xorg",
+            "(EE) AIGLX: reverting to software rendering")).is_none());
+    }
+
+    #[test]
+    fn gnome_session_component_failure() {
+        let f = classify(&user_line("gnome-session-binary",
+            "Unrecoverable failure in required component org.gnome.Shell.desktop"
+        )).unwrap();
+        assert_eq!(f.category, "Session");
+        assert!(f.title.contains("org.gnome.Shell.desktop"));
+    }
+
+    #[test]
+    fn wayland_client_lost_compositor() {
+        let f = classify(&user_line("firefox",
+            "Lost connection to Wayland compositor.")).unwrap();
+        assert_eq!(f.category, "Session");
+        assert!(f.title.contains("firefox"));
+        let g = classify(&user_line("gimp",
+            "Gdk-Message: 10:11:12.000: Error 71 (Protocol error) dispatching to Wayland display."
+        )).unwrap();
+        assert_eq!(g.category, "Session");
+    }
+
+    // ── Correlation ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn gpu_incident_correlates_with_following_crashes() {
+        let base = 1_700_000_000;
+        let lines = vec![
+            kline_at(base, "[drm:amdgpu_job_timedout [amdgpu]] *ERROR* ring gfx_0.0.0 \
+                            timeout, signaled seq=633, emitted seq=635"),
+            kline_at(base + 40,
+                "gnome-shell[1500]: segfault at 0 ip 00007f00 sp 00007ffe error 4 in \
+                 libmutter.so[7f00+1a000]"),
+            LogLine { time: Timestamp(base + 55),
+                message: "Lost connection to Wayland compositor.".into(),
+                identifier: "firefox".into(), transport: "journal".into() },
+        ];
+        let found = scan(&lines);
+        assert_eq!(found.len(), 3);
+        let gpu = found.iter().find(|f| f.category == "GPU").unwrap();
+        let seg = found.iter().find(|f| f.category == "Segfault").unwrap();
+        let ses = found.iter().find(|f| f.category == "Session").unwrap();
+        assert!(gpu.evidence.iter().any(|e| e.contains("casualty")), "{:?}", gpu.evidence);
+        assert!(seg.evidence.iter().any(|e| e.contains("GPU incident")), "{:?}", seg.evidence);
+        // The session loss is correlated both to the GPU incident and to the
+        // compositor (gnome-shell) segfault.
+        assert!(ses.evidence.iter().any(|e| e.contains("GPU incident")), "{:?}", ses.evidence);
+        assert!(ses.evidence.iter().any(|e| e.contains("compositor")), "{:?}", ses.evidence);
+    }
+
+    #[test]
+    fn distant_crash_not_correlated_with_gpu() {
+        let base = 1_700_000_000;
+        let lines = vec![
+            kline_at(base, "amdgpu 0000:0c:00.0: amdgpu: GPU reset begin!"),
+            kline_at(base + 3600,
+                "chrome[4242]: segfault at 7f00 ip 00007f00 sp 00007ffe error 4 in libc.so[7f00+1a]"),
+        ];
+        let found = scan(&lines);
+        let seg = found.iter().find(|f| f.category == "Segfault").unwrap();
+        assert!(!seg.evidence.iter().any(|e| e.contains("GPU incident")));
     }
 
     #[test]

@@ -141,8 +141,10 @@ whyreboot --all --json | jq '.cycles[].cause'
 | Hardware (MCE) | `Hardware Error`, `Machine check events logged`, `mce:`, EDAC, `PCIe Bus Error` |
 | Service failure | `systemd` unit `Failed with result`, `Main process exited, code=dumped`, `entered failed state` |
 | Coredump | `systemd-coredump` `Process … dumped core` |
+| GPU hang / reset | amdgpu `ring … timeout` / `GPU reset begin!` / `VRAM is lost`, i915 `GPU HANG: ecode …` / `stopped heartbeat`, NVIDIA `NVRM: Xid` (app-level codes 13/31/43/45 → warning; `fallen off the bus` → critical), DRM `flip_done timed out` |
+| Wayland / X11 session | clients' `Lost connection to Wayland compositor` / `Error 71 … dispatching to Wayland display`, `gnome-session` `Unrecoverable failure in required component`, Xorg `(EE) Fatal server error` / `(EE) Segmentation fault` |
 
-A burst of related lines from one incident (e.g. the ~10 lines a SATA fault emits) is coalesced into a single finding. Adding a category is one detector function in `src/detect.rs`.
+A burst of related lines from one incident (e.g. the ~10 lines a SATA fault emits) is coalesced into a single finding, and a **correlation pass** links cascades: a GPU hang lists the segfaults/coredumps/session losses that followed it, and a compositor crash is linked to every client that lost its connection. Adding a category is one detector function in `src/detect.rs`.
 
 ### Windows (reboot diagnosis)
 

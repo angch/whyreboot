@@ -54,6 +54,25 @@ pub fn fetch_journal(window: &TimeWindow) -> io::Result<Vec<LogLine>> {
         lines.append(&mut v);
     }
 
+    // Graphical session: compositors and session managers, priority-gated because
+    // gnome-shell/kwin chat a lot at info. Identifiers absent on servers/headless
+    // boxes simply match nothing. (Best-effort, like the query above.)
+    let graphical = &["-p", "notice",
+                      "SYSLOG_IDENTIFIER=gnome-shell", "SYSLOG_IDENTIFIER=gnome-session-binary",
+                      "SYSLOG_IDENTIFIER=kwin_wayland", "SYSLOG_IDENTIFIER=kwin_x11",
+                      "SYSLOG_IDENTIFIER=plasmashell", "SYSLOG_IDENTIFIER=xdg-desktop-portal"];
+    if let Ok(mut v) = run_journalctl(graphical, window) {
+        lines.append(&mut v);
+    }
+
+    // X server logs arrive via gdm at info priority, so these two identifiers are
+    // fetched unfiltered — their volume is modest (hundreds of lines per boot).
+    let xorg = &["SYSLOG_IDENTIFIER=Xorg", "SYSLOG_IDENTIFIER=gdm-x-session",
+                 "SYSLOG_IDENTIFIER=Xorg.bin"];
+    if let Ok(mut v) = run_journalctl(xorg, window) {
+        lines.append(&mut v);
+    }
+
     dedup(&mut lines);
     Ok(lines)
 }

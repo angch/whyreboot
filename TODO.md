@@ -34,6 +34,11 @@ from the window and convert to `Timestamp`.
   UPX → ~215 KB) built, tested, and published by the GitHub Actions release
   workflow as `whyreboot-cli-x86_64-linux`. If UPX ever trips AV false
   positives, ship the uncompressed musl binary alongside.
+- GPU + Wayland/X11 session detection with cascade correlation: GPU
+  hangs/resets (amdgpu incl. MES-era Strix Halo sequences, i915, NVIDIA Xid),
+  compositor-loss and Xorg fatals; a correlation pass links a GPU incident to
+  the segfaults/coredumps/session losses that follow, and a compositor crash
+  to the clients it orphaned.
 
 ## Hardware investigation notes
 

@@ -280,6 +280,8 @@ Three `journalctl -o json` queries are issued and merged, each bounded by `--sin
 1. `journalctl -k` — the kernel stream (`_TRANSPORT=kernel`), fetched **unfiltered**. Kernel lines are sparse even in a multi-GB journal, so taking all of them is cheap and means a wording change in any kernel message can't silently drop an event; the detectors filter precisely.
 2. `journalctl -u systemd-oomd` — the userspace OOM killer's own unit.
 3. `journalctl -p notice SYSLOG_IDENTIFIER=systemd SYSLOG_IDENTIFIER=systemd-coredump` — service failures and coredumps. These come only from those two identifiers and are always logged at priority notice (5) or above, so intersecting the identifier and priority **indexes** returns a few dozen lines instead of the tens of thousands of routine unit start/stop lines.
+4. `journalctl -p notice SYSLOG_IDENTIFIER=gnome-shell … kwin_wayland … plasmashell … xdg-desktop-portal …` — graphical compositors/session managers, priority-gated because they chat heavily at info. Absent identifiers (servers, headless) match nothing.
+5. `journalctl SYSLOG_IDENTIFIER=Xorg SYSLOG_IDENTIFIER=gdm-x-session …` — the X server logs via gdm at info priority, so these low-volume identifiers are fetched unfiltered.
 
 **All queries use indexed fields only — never `--grep`.** `--grep` is an unindexed full-message scan; over this machine's 2.3 GB journal it made `--all` never finish. The indexed queries plus `--output-fields` (trimming each record to the four fields the detectors read) bring `--all` down to ~0.5 s. The queries only need to be a *superset* of what matters — the detectors do the precise classification.
 
@@ -287,7 +289,11 @@ Results are de-duplicated by `(time, message)`. Each JSON line is parsed by a mi
 
 ## Step 3 — Detect (`detect.rs`, `oom.rs`)
 
-Each detector is `fn(&LogLine) -> Option<Finding>`. `classify()` runs them in order and takes the **first** match, so one line yields at most one finding. Detectors anchor on stable marker substrings (not brittle full-line regexes) and extract a few fields tolerantly. Categories: `OOM`, `KernelPanic`, `Segfault`, `Disk`, `Lockup`, `Thermal`, `Hardware`, `Service`, `Coredump`. Severity is `Critical` (system stability threatened) or `Warning` (single process/service).
+Each detector is `fn(&LogLine) -> Option<Finding>`. `classify()` runs them in order and takes the **first** match, so one line yields at most one finding. Detectors anchor on stable marker substrings (not brittle full-line regexes) and extract a few fields tolerantly. Categories: `OOM`, `KernelPanic`, `GPU`, `Segfault`, `Disk`, `Lockup`, `Thermal`, `Hardware`, `Service`, `Coredump`, `Session`. Severity is `Critical` (system stability threatened) or `Warning` (single process/service).
+
+GPU specifics (`detect_gpu`, kernel-only): amdgpu ring timeouts / `GPU reset begin!` / `VRAM is lost`, i915 `GPU HANG: ecode …, in <app> [pid]` (the culprit workload is extracted) / stopped-heartbeat resets, NVIDIA `NVRM: Xid` (codes 13/31/43/45 are app-level → Warning; `fallen off the bus` and other codes → Critical), and DRM `flip_done timed out`. Modern-amdgpu (MES-era, e.g. Strix Halo gfx1151) reset sequences are covered too — `Starting … ring reset`, `Ring … reset failed`, `MES failed to respond to msg=…`, `failed to reset/unmap legacy queue`, `*ERROR* failed to halt cp gfx` (the `*ERROR*` marker requires drm/GPU context in the line), `[drm] device wedged` — plus amdgpu's separate culprit line `Process <comm> pid <n> thread …`, which coalesces into the burst and names the workload. `ring …` markers additionally require a fault word (`timeout`/`error`/`hang`/`fail`/`reset`) so topology prints don't match.
+
+Session specifics (`detect_session`, userspace-only): Wayland clients reporting `Lost connection to Wayland compositor` / `The Wayland connection broke` / `Error 71 (Protocol error) dispatching to Wayland display`; `gnome-session-binary`'s `Unrecoverable failure in required component <x>`; and Xorg fatals (`(EE)` plus `Fatal server error` / `Segmentation fault at address` / `Server terminated with error` / `Caught signal`). Non-fatal `(EE)` lines are ignored.
 
 **Guarding against boot-banner false positives.** Several subsystem names appear in benign driver-init banners logged at *every* boot, not just in error reports — observed live on this machine:
 
@@ -301,9 +307,16 @@ Rule: a marker that is a bare subsystem name/prefix (`EDAC`, `mce:`, `MCE `, `EX
 
 OOM specifics (`oom.rs`): the kernel detector keys on `Killed process <pid> (<comm>)` (also older `Kill process`), extracting pid, comm, and `anon-rss:`/`total-vm:`/`oom_score_adj:`; the `invoked oom-killer:`/`oom-kill:` context lines are deliberately **not** counted, so a single kill = one finding. The systemd-oomd detector (identifier `systemd-oomd`) parses `Killed <cgroup> due to <reason>`.
 
-## Step 4 — Coalesce bursts (`coalesce()`)
+## Step 4 — Coalesce bursts (`coalesce()`) and correlate cascades (`correlate()`)
 
 A single incident often emits many lines (a SATA fault logs ~10). Consecutive findings of the **same category and source** within `COALESCE_SECS` (30s) are merged into the earliest, folding the rest in as `+ related:` evidence and appending `(N related log lines)` to the title. This keeps the report high-level. Distinct categories, and same-category events far apart in time, stay separate.
+
+After coalescing, `correlate()` cross-annotates cascade relationships within `CORRELATE_SECS` (120s):
+
+1. **GPU incident → casualties.** Segfault/Coredump/Session/Service/Lockup findings near a `GPU` finding are marked "likely follows the GPU hang/reset", and the GPU finding lists each casualty. A GPU hang that takes down the compositor and its apps reads as one story.
+2. **Compositor crash → orphaned clients.** A Segfault/Coredump whose title names a compositor or display server (`gnome-shell`, `kwin_wayland`, `mutter`, `Xorg`, `Xwayland`, `sway`, …) is linked with the `Session` connection-loss findings around it.
+
+Annotations are appended to `evidence` on **both** sides of each link, so whichever finding the reader looks at first points at the rest of the cascade.
 
 ## Step 5 — Window-filter and render
 
@@ -323,3 +336,4 @@ Findings are filtered by `TimeWindow::contains` (belt-and-suspenders with journa
 | Permissions | Kernel and most messages need membership in `systemd-journal`/`adm`. Without it, queries may return nothing rather than erroring. |
 | Marker-based matching | Detection keys on known substrings; kernel wording changes across versions and unusual formats may be missed. Prefer adding markers over tightening to full-line formats. |
 | Non-persistent journal | If `Storage=volatile`, history is lost on reboot, so ranges spanning a reboot may be truncated. |
+| App-side Wayland-loss lines | Arbitrary apps log `Lost connection to Wayland compositor` under their own identifier at info priority, which the indexed live queries don't fetch (we can't enumerate every app). The compositor's own crash *is* fetched (coredump/segfault/session queries), so the incident is still reported; the client lines are picked up in `--from-file` captures. |

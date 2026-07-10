@@ -57,6 +57,38 @@ fn detects_mixed_categories_and_coalesces_ata_burst() {
 }
 
 #[test]
+fn gpu_cascade_detected_and_correlated() {
+    let lines = fetch_from_file(&fixture("gpu.jsonl")).expect("read fixture");
+    let findings = scan(&lines);
+
+    let cats: Vec<&str> = findings.iter().map(|f| f.category.as_str()).collect();
+    assert!(cats.contains(&"GPU"),      "categories: {cats:?}");
+    assert!(cats.contains(&"Segfault"), "categories: {cats:?}");
+    assert!(cats.contains(&"Coredump"), "categories: {cats:?}");
+    assert!(cats.contains(&"Session"),  "categories: {cats:?}");
+
+    // The GPU HANG + heartbeat-reset burst coalesces into one GPU finding.
+    assert_eq!(findings.iter().filter(|f| f.category == "GPU").count(), 1);
+    let gpu = findings.iter().find(|f| f.category == "GPU").unwrap();
+    assert!(gpu.evidence.iter().any(|e| e.contains("gnome-shell")),
+        "culprit workload should be extracted: {:?}", gpu.evidence);
+
+    // Correlation: the GPU incident lists its casualties, and the session-loss
+    // finding points back at both the GPU incident and the compositor crash.
+    assert!(gpu.evidence.iter().any(|e| e.contains("casualty")), "{:?}", gpu.evidence);
+    let ses = findings.iter().find(|f| f.category == "Session").unwrap();
+    assert!(ses.evidence.iter().any(|e| e.contains("GPU incident")), "{:?}", ses.evidence);
+
+    // The trailing benign "[drm] Initialized i915" boot banner must not match.
+    assert!(!findings.iter().any(|f| f.title.contains("Initialized")));
+
+    // The two client connection-loss lines (firefox + nautilus, 0.3s apart)
+    // coalesce with the gnome-session failure into Session finding(s), never
+    // one finding per app per line spamming the report.
+    assert!(findings.len() <= 5, "expected a compact report, got: {cats:?}");
+}
+
+#[test]
 fn window_filter_excludes_out_of_range_findings() {
     let lines = fetch_from_file(&fixture("oom.jsonl")).expect("read fixture");
     let all = scan(&lines);
