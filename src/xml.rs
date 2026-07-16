@@ -37,13 +37,24 @@ pub fn xml_attr(xml: &str, tag: &str, attr: &str) -> Option<String> {
     None
 }
 
-/// Extracts the trimmed text content of `<tag>…</tag>` (first occurrence only).
+/// Extracts the trimmed text content of `<tag …>…</tag>` (first occurrence only).
+/// Tolerates attributes on the opening tag (e.g. `<EventID Qualifiers='32768'>1074</EventID>`,
+/// as emitted for events from legacy providers like `User32` and `EventLog`) — matching
+/// only a bare `<tag>` would miss these entirely.
 pub fn xml_elem(xml: &str, tag: &str) -> Option<String> {
-    let open  = format!("<{}>", tag);
+    let tag_prefix = format!("<{}", tag);
     let close = format!("</{}>", tag);
-    let s = xml.find(&open)? + open.len();
-    let e = xml[s..].find(&close)?;
-    Some(xml[s..s + e].trim().to_string())
+    for (start, _) in xml.match_indices(&tag_prefix) {
+        let after = start + tag_prefix.len();
+        if !xml[after..].starts_with(|c: char| c == '>' || c.is_ascii_whitespace()) {
+            continue;
+        }
+        let Some(gt) = xml[start..].find('>') else { continue };
+        let s = start + gt + 1;
+        let Some(e) = xml[s..].find(&close) else { continue };
+        return Some(xml[s..s + e].trim().to_string());
+    }
+    None
 }
 
 /// Collects all `<Data Name="key">value</Data>` pairs from an event XML fragment.
@@ -175,6 +186,22 @@ mod tests {
     #[test]
     fn elem_first_occurrence_only() {
         let xml = "<EventID>41</EventID><EventID>42</EventID>";
+        assert_eq!(xml_elem(xml, "EventID"), Some("41".to_string()));
+    }
+
+    #[test]
+    fn elem_tolerates_attributes_on_opening_tag() {
+        // Legacy providers (User32, EventLog) emit `<EventID Qualifiers='32768'>1074</EventID>`.
+        assert_eq!(
+            xml_elem("<EventID Qualifiers='32768'>1074</EventID>", "EventID"),
+            Some("1074".to_string())
+        );
+    }
+
+    #[test]
+    fn elem_skips_longer_tag_name() {
+        // <EventIDFoo> must not be matched when searching for <EventID>.
+        let xml = "<EventIDFoo>99</EventIDFoo><EventID>41</EventID>";
         assert_eq!(xml_elem(xml, "EventID"), Some("41".to_string()));
     }
 

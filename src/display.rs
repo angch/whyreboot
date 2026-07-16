@@ -350,9 +350,14 @@ fn cause_json(cause: &Cause) -> (&'static str, String) {
                 params[0], params[1], params[2], params[3]
             ),
         ),
-        Cause::WindowsUpdate { process } => (
+        Cause::WindowsUpdate { process, old_version, new_version } => (
             "WindowsUpdate",
-            format!("\"process\": {},", json_str(process)),
+            format!(
+                "\"process\": {}, \"old_version\": {}, \"new_version\": {},",
+                json_str(process),
+                old_version.as_deref().map(json_str).unwrap_or_else(|| "null".to_string()),
+                new_version.as_deref().map(json_str).unwrap_or_else(|| "null".to_string()),
+            ),
         ),
         Cause::UserAction { user, action, comment } => (
             "UserAction",

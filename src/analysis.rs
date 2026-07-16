@@ -243,7 +243,10 @@ fn classify_event41(ev: &EventRecord, unexpected_flag: bool) -> (Cause, u8, Vec<
 /// Returns `(cause, confidence, evidence, timeline_message)`.
 fn classify_event1074(ev: &EventRecord) -> (Cause, u8, Vec<String>, String) {
     let process     = ev.get("param1").unwrap_or_default().to_owned();
-    let user        = ev.get("param3").unwrap_or_default().to_owned();
+    // param3 is the human-readable reason text (e.g. "Operating System: Upgrade
+    // (Planned)"); the initiating user is param7. (Confirmed against a live
+    // Event 1074 from User32 — the two are easy to mix up since both are strings.)
+    let user        = ev.get("param7").unwrap_or_default().to_owned();
     let reason_code = ev.get("param4").unwrap_or_default().to_owned();
     let action_raw  = ev.get("param5").unwrap_or_default().to_owned();
     let comment     = ev.get("param6").unwrap_or_default().to_owned();
@@ -276,12 +279,15 @@ fn classify_event1074(ev: &EventRecord) -> (Cause, u8, Vec<String>, String) {
         || pl.contains("trustedinstaller")
         || pl.contains("wuauclt")
         || pl.contains("windowsupdate")
+        || pl.contains("usoclient")
+        || pl.contains("mousocoreworker")
+        || pl.contains("updateorchestrator")
         || rc_norm == "80020002";
     let ul = user.to_lowercase();
     let is_system = ul.contains("system") || ul.contains("authority");
 
     let (cause, confidence) = if is_update {
-        (Cause::WindowsUpdate { process }, 92)
+        (Cause::WindowsUpdate { process, old_version: None, new_version: None }, 92)
     } else if is_system {
         (Cause::SystemProcess { process, reason: reason_code, action }, 87)
     } else {
@@ -290,6 +296,27 @@ fn classify_event1074(ev: &EventRecord) -> (Cause, u8, Vec<String>, String) {
 
     (cause, confidence, evidence, timeline_msg)
 }
+
+/// Extracts a numeric "major.minor.build" string (e.g. `"10.0.26200"`) from an
+/// Event 6009 startup version banner. Its `<Data>` fields are unnamed and keyed
+/// `_0`.._4` by `xml_data`: `_0` is "major.minor." (e.g. `"10.00."`), `_1` is the
+/// build number.
+///
+/// Returns `None` unless all three components parse as integers — the build field
+/// is validated too, so a non-numeric banner (e.g. an older layout carrying
+/// "Service Pack 0" in `_1`) yields `None` rather than a bogus "10.0.Service Pack 0".
+fn os_version_from_6009(ev: &EventRecord) -> Option<String> {
+    let major_minor = ev.get("_0")?.trim_matches('.');
+    let build       = ev.get("_1")?.trim();
+    if build.is_empty() || !build.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut parts = major_minor.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+    Some(format!("{major}.{minor}.{build}"))
+}
+
 
 // ── Core analysis ─────────────────────────────────────────────────────────────
 
@@ -328,6 +355,8 @@ pub fn analyze_slice(
     } else if let Some(ev) = e1074 {
         let (cause, confidence, evidence, msg) = classify_event1074(ev);
         timeline.push((ev.time_created, msg));
+        // old_version/new_version are filled in later by `annotate_os_version`,
+        // which scans the full (unsliced) event list — see its doc comment for why.
         (cause, confidence, evidence)
     } else if unexpected_flag {
         (Cause::UnexpectedShutdown, 60, vec![
@@ -430,8 +459,74 @@ pub fn extract_boot_cycles(
         })
         .collect();
 
+    // Cycles are ordered newest-first, so idx+1 is the boot before this one and
+    // idx-1 the boot after — the bounds `annotate_os_version` needs to confine
+    // each version lookup to the correct session.
+    let boot_times: Vec<Option<Timestamp>> = cycles.iter().map(|c| c.boot_time).collect();
+    for idx in 0..cycles.len() {
+        let prev_boot = boot_times.get(idx + 1).copied().flatten();
+        let next_boot = if idx > 0 { boot_times[idx - 1] } else { None };
+        annotate_os_version(&mut cycles[idx], events, prev_boot, next_boot);
+    }
     annotate_with_wer_and_dumps(&mut cycles, wer, dumps);
     cycles
+}
+
+/// Returns the OS version from the first *parseable* Event 6009 in the half-open
+/// time window `[lo, hi)` (either bound `None` = unbounded on that side).
+/// `prefer_latest` selects the newest such banner; otherwise the oldest.
+///
+/// Scans by `TimeCreated`, not array position: classic `EventLog`-sourced IDs
+/// like 6009 can be assigned an `EventRecordID` lower than concurrently-written
+/// modern-provider events (observed live: a 6009 timestamped 15s after boot had
+/// a lower RecordID than that same boot's own Event 12), so the newest-first
+/// fetch order can't be trusted to place a banner on the expected side of an
+/// Event 12 boundary. Falling through to the next parseable banner (rather than
+/// parsing only the single extreme record) means one malformed 6009 doesn't
+/// discard a perfectly good neighbor in range.
+fn nearest_os_version(
+    events:        &[EventRecord],
+    lo:            Option<Timestamp>,
+    hi:            Option<Timestamp>,
+    prefer_latest: bool,
+) -> Option<String> {
+    let mut in_range: Vec<&EventRecord> = events.iter()
+        .filter(|e| e.event_id == 6009)
+        .filter(|e| lo.is_none_or(|l| e.time_created >= l))
+        .filter(|e| hi.is_none_or(|h| e.time_created <  h))
+        .collect();
+    in_range.sort_by_key(|e| e.time_created);
+    if prefer_latest {
+        in_range.iter().rev().find_map(|e| os_version_from_6009(e))
+    } else {
+        in_range.iter().find_map(|e| os_version_from_6009(e))
+    }
+}
+
+/// Fills in `old_version`/`new_version` for a `Cause::WindowsUpdate` cycle from
+/// the Event 6009 version banners bracketing this boot.
+///
+/// Each lookup is confined to a single session so a neighbouring boot's banner
+/// can never leak in:
+/// - **old_version** — the newest banner in `[prev_boot, bt)`: the session that
+///   was shut down to apply the update.
+/// - **new_version** — the oldest banner in `[bt, next_boot)`: this boot's own.
+///
+/// Note this compares the build *at this specific boot*, not across an entire
+/// update chain. Feature/cumulative updates often reboot several times and only
+/// bump the build number on the final restart, so `old_version == new_version`
+/// here does **not** prove no upgrade occurred — it only means the build hadn't
+/// changed yet at this boot. `cause_detail` is careful not to overclaim on that.
+fn annotate_os_version(
+    cycle:     &mut BootCycle,
+    events:    &[EventRecord],
+    prev_boot: Option<Timestamp>,
+    next_boot: Option<Timestamp>,
+) {
+    let Cause::WindowsUpdate { old_version, new_version, .. } = &mut cycle.cause else { return };
+    let Some(bt) = cycle.boot_time else { return };
+    *old_version = nearest_os_version(events, prev_boot, Some(bt), true);
+    *new_version = nearest_os_version(events, Some(bt), next_boot, false);
 }
 
 /// Runs both annotation passes (minidumps then WER module) over all cycles.
@@ -505,14 +600,19 @@ mod tests {
         hex_u64, stop_name, decode_reason, module_from_bucket,
         bsod_evidence, classify_event41, classify_event1074,
         analyze_slice, collect_boot_indices, extract_boot_cycles,
+        annotate_os_version, os_version_from_6009,
     };
     use crate::timestamp::Timestamp;
-    use crate::types::{Cause, EventRecord};
+    use crate::types::{BootCycle, Cause, EventRecord};
 
     fn make_event(event_id: u32, provider: &str, data: &[(&str, &str)]) -> EventRecord {
+        make_event_at(event_id, provider, Timestamp::now(), data)
+    }
+
+    fn make_event_at(event_id: u32, provider: &str, time: Timestamp, data: &[(&str, &str)]) -> EventRecord {
         EventRecord {
             event_id,
-            time_created: Timestamp::now(),
+            time_created: time,
             provider: provider.to_string(),
             data: data.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
         }
@@ -729,7 +829,7 @@ mod tests {
     fn ev1074_tiworker_is_windows_update() {
         let ev = make_event(1074, "User32", &[
             ("param1", r"C:\Windows\System32\TiWorker.exe"),
-            ("param3", r"NT AUTHORITY\SYSTEM"),
+            ("param7", r"NT AUTHORITY\SYSTEM"),
             ("param4", "0x80020002"),
             ("param5", "restart"),
             ("param6", ""),
@@ -744,7 +844,7 @@ mod tests {
         // Even when the process is not TiWorker, the reason code overrides.
         let ev = make_event(1074, "User32", &[
             ("param1", "SomeProcess.exe"),
-            ("param3", r"DOMAIN\user"),
+            ("param7", r"DOMAIN\user"),
             ("param4", "0x80020002"),
             ("param5", "restart"),
             ("param6", ""),
@@ -758,7 +858,7 @@ mod tests {
         // param4 "80020002" (no 0x prefix) must still classify as WindowsUpdate.
         let ev = make_event(1074, "User32", &[
             ("param1", "SomeProcess.exe"),
-            ("param3", r"DOMAIN\user"),
+            ("param7", r"DOMAIN\user"),
             ("param4", "80020002"),
             ("param5", "restart"),
             ("param6", ""),
@@ -771,7 +871,7 @@ mod tests {
     fn ev1074_system_user_is_system_process() {
         let ev = make_event(1074, "User32", &[
             ("param1", "svchost.exe"),
-            ("param3", r"NT AUTHORITY\SYSTEM"),
+            ("param7", r"NT AUTHORITY\SYSTEM"),
             ("param4", "0x80040001"),
             ("param5", "power off"),
             ("param6", ""),
@@ -784,7 +884,7 @@ mod tests {
     fn ev1074_normal_user_is_user_action() {
         let ev = make_event(1074, "User32", &[
             ("param1", "explorer.exe"),
-            ("param3", r"DESKTOP-ABC\angch"),
+            ("param7", r"DESKTOP-ABC\angch"),
             ("param4", "0x00040000"),
             ("param5", "restart"),
             ("param6", "testing reboot"),
@@ -800,7 +900,7 @@ mod tests {
     fn ev1074_action_normalised() {
         let ev = make_event(1074, "User32", &[
             ("param1", "p.exe"),
-            ("param3", r"DOMAIN\bob"),
+            ("param7", r"DOMAIN\bob"),
             ("param4", "0"),
             ("param5", "power off"),
             ("param6", ""),
@@ -841,7 +941,7 @@ mod tests {
     fn analyze_windows_update_from_1074() {
         let pre = [make_event(1074, "User32", &[
             ("param1", "TiWorker.exe"),
-            ("param3", "SYSTEM"),
+            ("param7", "SYSTEM"),
             ("param4", "0x80020002"),
             ("param5", "restart"),
             ("param6", ""),
@@ -849,6 +949,171 @@ mod tests {
         let a = analyze_slice(None, &[], &pre);
         assert!(matches!(a.cause, Cause::WindowsUpdate { .. }));
         assert!(a.shutdown_time.is_some(), "clean shutdowns record shutdown_time");
+    }
+
+    fn make_cycle(cause: Cause, boot_time: Option<Timestamp>) -> BootCycle {
+        BootCycle {
+            index: 0, boot_time, shutdown_time: None, cause, confidence: 0,
+            evidence: Vec::new(), timeline: Vec::new(), wer_module: None,
+            minidumps: Vec::new(), display_events: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn annotate_os_version_finds_versions_on_each_side_of_boot() {
+        let boot_time = Timestamp(1_705_314_600);
+        let events = [
+            make_event_at(6009, "EventLog", boot_time.add_secs(15),
+                &[("_0", "10.00."), ("_1", "26100")]),
+            make_event_at(6009, "EventLog", boot_time.add_secs(-90),
+                &[("_0", "10.00."), ("_1", "25900")]),
+        ];
+        let mut cycle = make_cycle(
+            Cause::WindowsUpdate { process: "TrustedInstaller.exe".into(), old_version: None, new_version: None },
+            Some(boot_time),
+        );
+        annotate_os_version(&mut cycle, &events,
+            Some(boot_time.add_secs(-300)), Some(boot_time.add_secs(300)));
+        match cycle.cause {
+            Cause::WindowsUpdate { old_version, new_version, .. } => {
+                assert_eq!(old_version.as_deref(), Some("10.0.25900"));
+                assert_eq!(new_version.as_deref(), Some("10.0.26100"));
+            }
+            other => panic!("expected WindowsUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn annotate_os_version_ignores_array_position_uses_timestamp_only() {
+        // Regression: a boot's own 6009 can be assigned a lower EventRecordID
+        // than events written around the same instant by modern providers (see
+        // `annotate_os_version` doc comment), so it can end up anywhere in the
+        // fetched event list relative to the Event 12 boundary. Deliberately put
+        // the "new" (post-boot) banner earlier in the array than the "old" one
+        // to confirm the lookup keys off TimeCreated, not array position.
+        let boot_time = Timestamp(1_705_314_600);
+        let events = [
+            make_event_at(6009, "EventLog", boot_time.add_secs(15),
+                &[("_0", "10.00."), ("_1", "26200")]),
+            make_event_at(6009, "EventLog", boot_time.add_secs(-120),
+                &[("_0", "10.00."), ("_1", "26100")]),
+        ];
+        let mut cycle = make_cycle(
+            Cause::WindowsUpdate { process: "TrustedInstaller.exe".into(), old_version: None, new_version: None },
+            Some(boot_time),
+        );
+        annotate_os_version(&mut cycle, &events,
+            Some(boot_time.add_secs(-300)), Some(boot_time.add_secs(300)));
+        match cycle.cause {
+            Cause::WindowsUpdate { old_version, new_version, .. } => {
+                assert_eq!(old_version.as_deref(), Some("10.0.26100"));
+                assert_eq!(new_version.as_deref(), Some("10.0.26200"));
+            }
+            other => panic!("expected WindowsUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn annotate_os_version_no_op_for_non_windows_update_cause() {
+        let mut cycle = make_cycle(Cause::NormalShutdown, Some(Timestamp(1_705_314_600)));
+        annotate_os_version(&mut cycle, &[], None, None);
+        assert!(matches!(cycle.cause, Cause::NormalShutdown));
+    }
+
+    #[test]
+    fn annotate_os_version_no_op_without_boot_time() {
+        let mut cycle = make_cycle(
+            Cause::WindowsUpdate { process: "x".into(), old_version: None, new_version: None },
+            None,
+        );
+        let events = [make_event_at(6009, "EventLog", Timestamp(1_705_314_600),
+            &[("_0", "10.00."), ("_1", "26100")])];
+        annotate_os_version(&mut cycle, &events, None, None);
+        match cycle.cause {
+            Cause::WindowsUpdate { old_version, new_version, .. } => {
+                assert!(old_version.is_none() && new_version.is_none());
+            }
+            other => panic!("expected WindowsUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn annotate_os_version_bounds_new_version_to_this_boots_session() {
+        // Regression (#1): this update cycle's OWN post-boot 6009 is missing. A
+        // later, unrelated cycle's banner sits just past next_boot; it must NOT
+        // be borrowed as this cycle's new_version, or we'd report a version from
+        // a different reboot as if it were this update's result.
+        let bt = Timestamp(1_705_314_600);
+        let next_boot = bt.add_secs(3600);
+        let events = [
+            make_event_at(6009, "EventLog", bt.add_secs(-60),
+                &[("_0", "10.00."), ("_1", "26100")]),
+            // A different, later cycle's banner — outside [bt, next_boot).
+            make_event_at(6009, "EventLog", next_boot.add_secs(15),
+                &[("_0", "10.00."), ("_1", "26300")]),
+        ];
+        let mut cycle = make_cycle(
+            Cause::WindowsUpdate { process: "TrustedInstaller.exe".into(), old_version: None, new_version: None },
+            Some(bt),
+        );
+        annotate_os_version(&mut cycle, &events, Some(bt.add_secs(-300)), Some(next_boot));
+        match cycle.cause {
+            Cause::WindowsUpdate { old_version, new_version, .. } => {
+                assert_eq!(old_version.as_deref(), Some("10.0.26100"));
+                assert_eq!(new_version, None, "must not borrow a later cycle's banner");
+            }
+            other => panic!("expected WindowsUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn annotate_os_version_falls_back_past_unparseable_banner() {
+        // Regression (A1): the newest in-range 6009 is malformed; a valid earlier
+        // one still in range must be used rather than dropping old_version.
+        let bt = Timestamp(1_705_314_600);
+        let events = [
+            make_event_at(6009, "EventLog", bt.add_secs(-30),
+                &[("_0", "10.00."), ("_1", "Service Pack 0")]),
+            make_event_at(6009, "EventLog", bt.add_secs(-120),
+                &[("_0", "10.00."), ("_1", "19045")]),
+        ];
+        let mut cycle = make_cycle(
+            Cause::WindowsUpdate { process: "TiWorker.exe".into(), old_version: None, new_version: None },
+            Some(bt),
+        );
+        annotate_os_version(&mut cycle, &events, Some(bt.add_secs(-300)), None);
+        match cycle.cause {
+            Cause::WindowsUpdate { old_version, .. } =>
+                assert_eq!(old_version.as_deref(), Some("10.0.19045")),
+            other => panic!("expected WindowsUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn os_version_from_6009_rejects_non_numeric_build() {
+        // Guards against "10.0.Service Pack 0"-style bogus version strings (#3).
+        let good = make_event(6009, "EventLog", &[("_0", "10.00."), ("_1", "26200")]);
+        assert_eq!(os_version_from_6009(&good).as_deref(), Some("10.0.26200"));
+        let bad = make_event(6009, "EventLog", &[("_0", "10.00."), ("_1", "Service Pack 0")]);
+        assert_eq!(os_version_from_6009(&bad), None);
+        let empty = make_event(6009, "EventLog", &[("_0", "10.00."), ("_1", "")]);
+        assert_eq!(os_version_from_6009(&empty), None);
+    }
+
+    #[test]
+    fn ev1074_mousocoreworker_is_windows_update() {
+        // Update Orchestrator worker restarts don't always carry the 0x80020002
+        // reason code (this one is 0x80020010, "Service pack (Planned)") — the
+        // process name alone must still be recognized as Windows Update.
+        let ev = make_event(1074, "User32", &[
+            ("param1", r"C:\WINDOWS\uus\AMD64\MoUsoCoreWorker.exe"),
+            ("param7", r"NT AUTHORITY\SYSTEM"),
+            ("param4", "0x80020010"),
+            ("param5", "restart"),
+            ("param6", ""),
+        ]);
+        let (cause, _, _, _) = classify_event1074(&ev);
+        assert!(matches!(cause, Cause::WindowsUpdate { .. }));
     }
 
     #[test]

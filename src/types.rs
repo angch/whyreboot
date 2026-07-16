@@ -54,8 +54,12 @@ pub enum Cause {
     ForcedPowerOff,
     /// Event 41 with no stop code, or Event 6008 without Event 41.
     UnexpectedShutdown,
-    /// Event 1074 from TiWorker / TrustedInstaller, or reason code 0x80020002.
-    WindowsUpdate  { process: String },
+    /// Event 1074 from TiWorker / TrustedInstaller / the Update Orchestrator, or
+    /// reason code 0x80020002. `old_version`/`new_version` are "major.minor.build"
+    /// strings read from the Event 6009 banner logged just after each boot
+    /// (before and after this restart, respectively) — `None` if not found in
+    /// the scanned log window.
+    WindowsUpdate  { process: String, old_version: Option<String>, new_version: Option<String> },
     /// Event 1074 from an interactive user account.
     UserAction     { user: String, action: String, comment: String },
     /// Event 1074 from NT AUTHORITY\SYSTEM or similar.

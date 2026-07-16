@@ -28,9 +28,25 @@ pub fn cause_detail(cause: &Cause) -> String {
             "Power button held down or power cable pulled".into(),
         Cause::UnexpectedShutdown =>
             "System did not shut down cleanly (crash or power loss)".into(),
-        Cause::WindowsUpdate { process } =>
-            format!("Restart to apply updates ({})",
-                process.split('\\').next_back().unwrap_or(process)),
+        Cause::WindowsUpdate { process, old_version, new_version } => {
+            let base = format!("Restart to apply updates ({})",
+                process.split('\\').next_back().unwrap_or(process));
+            match (old_version, new_version) {
+                (Some(o), Some(n)) if o != n =>
+                    format!("{base} — {} → {}", win_product(o), win_product(n)),
+                // Same build before and after this boot. Update chains often
+                // reboot several times and only bump the build on the final
+                // restart, so this does not prove no upgrade — just that the
+                // build hadn't changed yet at this boot. Don't overclaim.
+                (Some(_), Some(n)) =>
+                    format!("{base} — running {}", win_product(n)),
+                (None, Some(n)) =>
+                    format!("{base} — now running {} (prior version not in log window)", win_product(n)),
+                (Some(o), None) =>
+                    format!("{base} — was running {}", win_product(o)),
+                (None, None) => base,
+            }
+        }
         Cause::UserAction { user, action, .. } =>
             format!("{} by {}", action, user),
         Cause::SystemProcess { process, action, .. } =>
@@ -40,6 +56,22 @@ pub fn cause_detail(cause: &Cause) -> String {
             "System shut down cleanly; no specific initiator recorded".into(),
         Cause::Undetermined =>
             "Insufficient event log data to determine cause".into(),
+    }
+}
+
+/// Maps an OS version string `"major.minor.build"` to a friendly product name.
+///
+/// Windows 11 shares NT version `10.0` with Windows 10 — only the build number
+/// distinguishes them (Windows 11 starts at build 22000). Surfacing the raw NT
+/// version as "Windows 10.0.26200" reads as "Windows 10" to a user actually on
+/// Windows 11, so map the build to the marketing name and keep the build for
+/// precision. Anything outside the known Win10/11 build ranges falls back to the
+/// raw NT version rather than guessing.
+pub fn win_product(version: &str) -> String {
+    match version.rsplit('.').next().and_then(|b| b.parse::<u32>().ok()) {
+        Some(b) if b >= 22_000                  => format!("Windows 11 (build {b})"),
+        Some(b) if (10_240..22_000).contains(&b) => format!("Windows 10 (build {b})"),
+        _                                        => format!("Windows {version}"),
     }
 }
 
@@ -121,7 +153,7 @@ pub fn event_summary(ev: &EventRecord) -> String {
         1074 => format!(
             "{} by {}",
             ev.get("param5").unwrap_or("action"),
-            ev.get("param3").unwrap_or("?")
+            ev.get("param7").unwrap_or("?")
         ),
         1076 => "Shutdown reason documented".into(),
         6006 => "Event log stopped cleanly (shutdown)".into(),
@@ -389,7 +421,8 @@ mod tests {
         assert!(cause_label(&bsod).contains("BLUE SCREEN"));
         assert!(cause_label(&Cause::ForcedPowerOff).contains("FORCED"));
         assert!(cause_label(&Cause::UnexpectedShutdown).contains("UNEXPECTED"));
-        assert!(cause_label(&Cause::WindowsUpdate { process: "x".into() })
+        assert!(cause_label(&Cause::WindowsUpdate {
+            process: "x".into(), old_version: None, new_version: None })
             .contains("WINDOWS UPDATE"));
         assert!(cause_label(&Cause::UserAction {
             user: "u".into(), action: "a".into(), comment: "c".into() })
@@ -414,10 +447,55 @@ mod tests {
 
     #[test]
     fn cause_detail_windows_update_uses_last_path_component() {
-        let c = Cause::WindowsUpdate { process: r"C:\Windows\TiWorker.exe".into() };
+        let c = Cause::WindowsUpdate {
+            process: r"C:\Windows\TiWorker.exe".into(), old_version: None, new_version: None };
         let d = cause_detail(&c);
         assert!(d.contains("TiWorker.exe"));
         assert!(!d.contains(r"C:\Windows\"));
+    }
+
+    #[test]
+    fn cause_detail_windows_update_shows_version_change() {
+        // A real Win10→Win11 feature upgrade: both report NT 10.0, only the
+        // build distinguishes them, so the friendly product names must differ.
+        let c = Cause::WindowsUpdate {
+            process: r"C:\Windows\TiWorker.exe".into(),
+            old_version: Some("10.0.19045".into()),
+            new_version: Some("10.0.26100".into()),
+        };
+        let d = cause_detail(&c);
+        assert!(d.contains("Windows 10"));
+        assert!(d.contains("Windows 11"));
+        assert!(d.contains("19045"));
+        assert!(d.contains("26100"));
+        assert!(d.contains("→"));
+    }
+
+    #[test]
+    fn cause_detail_windows_update_same_build_no_arrow_no_upgrade_claim() {
+        let c = Cause::WindowsUpdate {
+            process: r"C:\Windows\TiWorker.exe".into(),
+            old_version: Some("10.0.26200".into()),
+            new_version: Some("10.0.26200".into()),
+        };
+        let d = cause_detail(&c);
+        assert!(d.contains("26200"));
+        assert!(!d.contains("→"));
+        // Must not assert a revision/upgrade the data can't confirm.
+        assert!(!d.to_lowercase().contains("revision"));
+    }
+
+    #[test]
+    fn win_product_maps_build_to_marketing_name() {
+        assert!(win_product("10.0.26200").contains("Windows 11"));
+        assert!(win_product("10.0.26200").contains("26200"));
+        assert!(win_product("10.0.22000").contains("Windows 11"));
+        assert!(win_product("10.0.19045").contains("Windows 10"));
+        assert!(win_product("10.0.10240").contains("Windows 10"));
+        // Pre-Win10 build (Windows 7 SP1 = NT 6.1.7601): fall back to raw NT version.
+        assert_eq!(win_product("6.1.7601"), "Windows 6.1.7601");
+        // Unparseable build: fall back to raw string.
+        assert_eq!(win_product("garbage"), "Windows garbage");
     }
 
     #[test]

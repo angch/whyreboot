@@ -50,6 +50,8 @@ Calls `EvtQuery` with `EvtQueryReverseDirection` so events arrive **newest first
 
 > **Important timing note:** Event 41 and Event 6008 are *retrospective* — Windows logs them at the start of the recovery boot to describe what happened in the *previous* session. Events 1074, 13, and 6006 are *prospective* — logged during the shutdown itself.
 
+> **XML parsing gotcha:** Classic providers (`User32`, `EventLog` — i.e. Events 1074, 6006, 6008, 6009, 6013) render the ID as `<EventID Qualifiers='32768'>1074</EventID>`, with an attribute, whereas modern ETW providers emit a bare `<EventID>12</EventID>`. `xml_elem` must therefore match the opening tag allowing for attributes; an exact-`<EventID>`-literal match silently drops every legacy-provider event — which previously made update reboots (Event 1074) invisible and caused them to fall through to the weaker Event 13 "normal shutdown" verdict. Relatedly, these classic events' `EventRecordID`s are **not** reliably ordered against modern-provider records written at the same instant, so time-sensitive lookups compare `TimeCreated` rather than trusting array position.
+
 ### Windows Error Reporting (`fetch_wer_events`)
 
 Queries Event ID 1001 from the Application log, filtered to WER provider records where `EventName == "BlueScreen"`. These appear after every BSOD, once WER has finished processing the crash dump during the recovery boot.
@@ -103,7 +105,8 @@ This two-bucket split is the key insight that lets the tool correctly associate 
           + Event 6008 also present?  →  (same verdict, evidence noted)
 
  2.  Event 1074 in pre_boot?
-     ├─ process = TiWorker / TrustedInstaller / wuauclt
+     ├─ process = TiWorker / TrustedInstaller / wuauclt / usoclient
+     │   / MoUsoCoreWorker / UpdateOrchestrator
      │   OR reason code = 0x80020002  →  WINDOWS UPDATE  (92%)
      ├─ user contains "SYSTEM" / "NT AUTHORITY"
      │                                →  SYSTEM PROCESS  (87%)
@@ -143,6 +146,31 @@ For stop code `0x9F` (DRIVER_POWER_STATE_FAILURE), Parameter 1 narrows the failu
 | 2 | Device failed `IRP_MN_SET_POWER` for system power state |
 | 3 | Device stalled on `IRP_MN_SET_POWER` — check P4 for the device object |
 | 4 | Device stalled powering down — check P4 |
+
+### Event 1074 field layout
+
+`classify_event1074` reads the `<Data>` insertion strings by name. The order is easy to get wrong because several are free-form text:
+
+| Field | Meaning |
+|---|---|
+| `param1` | Initiating process (full path) |
+| `param2` | Computer name |
+| `param3` | Reason **text** (e.g. "Operating System: Upgrade (Planned)") |
+| `param4` | Reason **code** (hex, e.g. `0x80020002`) |
+| `param5` | Shutdown type (`restart` / `power off`) |
+| `param6` | Comment |
+| `param7` | **Initiating user** (e.g. `NT AUTHORITY\SYSTEM`) |
+
+The user is `param7`, *not* `param3` — `param3` is the human-readable reason string. Reading the user from `param3` (an earlier bug) put the reason text into the user field and broke the SYSTEM-vs-interactive-user branch.
+
+### Windows Update OS version
+
+For a `WINDOWS UPDATE` cycle, `annotate_os_version` records the OS build on each side of the reboot from the Event 6009 startup banner (`_0` = "major.minor.", `_1` = build; both must be numeric or the banner is ignored):
+
+- **`old_version`** — newest 6009 in `[prev_boot, boot_time)` (the session shut down to update).
+- **`new_version`** — oldest 6009 in `[bt, next_boot)` (this boot's own banner).
+
+Each lookup is bounded to a single session so a neighbouring boot's banner can't leak in, and it falls through to the next *parseable* 6009 rather than trusting a single record. Because 6009 carries only `major.minor.build` (no UBR/revision), and update chains often reboot several times before the build changes, `old_version == new_version` does **not** prove no upgrade occurred — the render layer (`cause_detail` → `win_product`) therefore maps the build to a marketing name (build ≥ 22000 ⇒ Windows 11) and avoids claiming a version change it can't observe.
 
 ### Shutdown time
 
@@ -230,7 +258,7 @@ The actual registry state from Step 7 is woven in: if all audio devices already 
 
 Cycles print oldest-first so the most recent result appears at the bottom of the terminal.
 
-**JSON mode** (`--json`) outputs a single object with `generated`, `cycle_count`, and a `cycles` array. Each cycle includes `index`, `boot_time`, `shutdown_time`, `confidence`, `cause`, `stop_code`, `params`, `faulting_module`, `evidence`, and `minidumps`.
+**JSON mode** (`--json`) outputs a single object with `generated`, `cycle_count`, and a `cycles` array. Each cycle includes `index`, `boot_time`, `shutdown_time`, `confidence`, `cause`, `stop_code`, `params`, `faulting_module`, `evidence`, and `minidumps`. A `WindowsUpdate` cause additionally carries `process` and the raw `old_version` / `new_version` build strings (`"major.minor.build"`, or `null` when not found in the log window).
 
 ---
 
