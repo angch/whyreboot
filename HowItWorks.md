@@ -1,6 +1,8 @@
 # How whyreboot Works
 
-whyreboot turns raw Windows Event Log entries into a plain-English verdict. This document walks through each step of that pipeline. Keep it in sync with the source when logic changes.
+whyreboot turns raw OS logs into a plain-English verdict. On **Windows** it explains why the machine last rebooted; on **Linux** it scans the systemd journal over a time window for logged system issues; on **macOS** it scans the unified log the same way (unsafe shutdowns, panics, sleep/wake failures, app crashes, update reboots). This document walks through each pipeline. Keep it in sync with the source when logic changes.
+
+All platforms share a portable core (`types.rs`, `timestamp.rs`, `timewindow.rs`, `detect.rs`, `oom.rs`, `jsonlog.rs`, `analysis.rs`, `format.rs`); they differ in the log-source backend (`events.rs`/`registry.rs` on Windows, `linux.rs` on Linux, `macos.rs` on macOS) and the top-level report (`print_cycle` vs `print_findings`). See [the Linux section](#linux-journal-issue-scanning) and [the macOS section](#macos-unified-log-scanning) below; the Windows pipeline follows.
 
 ---
 
@@ -242,3 +244,151 @@ Cycles print oldest-first so the most recent result appears at the bottom of the
 | Event 6008 without Event 41 | Rare — can happen if the kernel crashed before it had time to write Event 41. Classified as Unexpected Shutdown at 60% confidence. |
 | WER latency | WER processes dumps asynchronously. A very fast reboot after a crash may not have a WER event yet. |
 | Multiple crashes between boots | Not common, but the tool would only see the most recent boot boundary. The minidump directory may contain multiple files from that window. |
+
+---
+
+# Linux — journal issue scanning
+
+On Linux, `whyreboot` does not diagnose a single reboot; it reports **every logged system issue in a time window**, many of which never cause a reboot (an OOM kill, a failed service, a corrected ECC error). The pipeline:
+
+```
+ Time expression ("1 hour ago")  ──► parse_window()  ──► TimeWindow { start, end }
+                                              │
+ journalctl -o json (kernel -k,               ▼
+   systemd-oomd unit, service/coredump  ──► fetch_journal()  ──► Vec<LogLine>
+   greps)   [or --from-file <f>]                │
+                                              ▼
+                                    detect::scan()
+                                    ┌───────────────────────────┐
+                                    │ for each LogLine:         │
+                                    │   first matching detector │  fn(&LogLine)->Option<Finding>
+                                    │ coalesce() bursts         │
+                                    └───────────────────────────┘
+                                              │
+                                              ▼
+                                    print_findings() / print_findings_json()
+```
+
+## Step 1 — Resolve the time window (`timewindow.rs`)
+
+The user's phrase becomes one concrete `TimeWindow` — the single source of truth used both to bound the journal query and to render the header. Supported: relative durations (`"1 hour ago"`, `"30 minutes ago"`, `"2h"`, `"90s"`, `"1w"`), `"today"`/`"earlier today"` (since local midnight), `"yesterday"` (bounded prior day), and `"all"`. Local day boundaries are computed with `Timestamp::secs_into_local_day()` (no timezone-math library). Default when no range is given: last 24 hours. Unrecognized text is rejected (exit 2), not silently defaulted.
+
+## Step 2 — Fetch journal records (`linux.rs`)
+
+Three `journalctl -o json` queries are issued and merged, each bounded by `--since @<unix>` / `--until @<unix>`:
+
+1. `journalctl -k` — the kernel stream (`_TRANSPORT=kernel`), fetched **unfiltered**. Kernel lines are sparse even in a multi-GB journal, so taking all of them is cheap and means a wording change in any kernel message can't silently drop an event; the detectors filter precisely.
+2. `journalctl -u systemd-oomd` — the userspace OOM killer's own unit.
+3. `journalctl -p notice SYSLOG_IDENTIFIER=systemd SYSLOG_IDENTIFIER=systemd-coredump` — service failures and coredumps. These come only from those two identifiers and are always logged at priority notice (5) or above, so intersecting the identifier and priority **indexes** returns a few dozen lines instead of the tens of thousands of routine unit start/stop lines.
+4. `journalctl -p notice SYSLOG_IDENTIFIER=gnome-shell … kwin_wayland … plasmashell … xdg-desktop-portal …` — graphical compositors/session managers, priority-gated because they chat heavily at info. Absent identifiers (servers, headless) match nothing.
+5. `journalctl SYSLOG_IDENTIFIER=Xorg SYSLOG_IDENTIFIER=gdm-x-session …` — the X server logs via gdm at info priority, so these low-volume identifiers are fetched unfiltered.
+
+**All queries use indexed fields only — never `--grep`.** `--grep` is an unindexed full-message scan; over this machine's 2.3 GB journal it made `--all` never finish. The indexed queries plus `--output-fields` (trimming each record to the four fields the detectors read) bring `--all` down to ~0.5 s. The queries only need to be a *superset* of what matters — the detectors do the precise classification.
+
+Results are de-duplicated by `(time, message)`. Each JSON line is parsed by a minimal hand-rolled flat-object parser (no serde) that extracts the string-valued fields; `MESSAGE` and `__REALTIME_TIMESTAMP` (microseconds) are required, `SYSLOG_IDENTIFIER` and `_TRANSPORT` are optional. Binary/array-valued fields are skipped. `--from-file` reads the same line format from disk (test seam + offline analysis).
+
+## Step 3 — Detect (`detect.rs`, `oom.rs`)
+
+Each detector is `fn(&LogLine) -> Option<Finding>`. `classify()` runs them in order and takes the **first** match, so one line yields at most one finding. Detectors anchor on stable marker substrings (not brittle full-line regexes) and extract a few fields tolerantly. Categories: `OOM`, `KernelPanic`, `GPU`, `Segfault`, `Disk`, `Lockup`, `Thermal`, `Hardware`, `Service`, `Coredump`, `Session`. Severity is `Critical` (system stability threatened) or `Warning` (single process/service).
+
+GPU specifics (`detect_gpu`, kernel-only): amdgpu ring timeouts / `GPU reset begin!` / `VRAM is lost`, i915 `GPU HANG: ecode …, in <app> [pid]` (the culprit workload is extracted) / stopped-heartbeat resets, NVIDIA `NVRM: Xid` (codes 13/31/43/45 are app-level → Warning; `fallen off the bus` and other codes → Critical), and DRM `flip_done timed out`. Modern-amdgpu (MES-era, e.g. Strix Halo gfx1151) reset sequences are covered too — `Starting … ring reset`, `Ring … reset failed`, `MES failed to respond to msg=…`, `failed to reset/unmap legacy queue`, `*ERROR* failed to halt cp gfx` (the `*ERROR*` marker requires drm/GPU context in the line), `[drm] device wedged` — plus amdgpu's separate culprit line `Process <comm> pid <n> thread …`, which coalesces into the burst and names the workload. `ring …` markers additionally require a fault word (`timeout`/`error`/`hang`/`fail`/`reset`) so topology prints don't match.
+
+Session specifics (`detect_session`, userspace-only): Wayland clients reporting `Lost connection to Wayland compositor` / `The Wayland connection broke` / `Error 71 (Protocol error) dispatching to Wayland display`; `gnome-session-binary`'s `Unrecoverable failure in required component <x>`; and Xorg fatals (`(EE)` plus `Fatal server error` / `Segmentation fault at address` / `Server terminated with error` / `Caught signal`). Non-fatal `(EE)` lines are ignored.
+
+### Marker provenance — how battle-tested is each detector?
+
+Three levels (each detector's doc comment in `detect.rs` carries its level):
+
+- **verified-live** — matched real events in a live journal during development.
+- **third-party logs** — markers copied verbatim from real captured logs in public incident reports; realistic, but never reproduced live by us.
+- **canonical format** — from kernel/systemd source or docs; only ever exercised on fixtures.
+
+| Category | Provenance | Notes |
+|---|---|---|
+| Service | **verified-live** | real `Failed with result` events on the dev machine |
+| OOM | canonical format | kernel `mm/oom_kill.c` + systemd-oomd wording; splice-tested through a real journalctl capture, no live OOM reproduced |
+| Disk | third-party logs + canonical | ATA burst verbatim from a real captured SATA fault; EXT4 benign baseline verified-live |
+| GPU | **third-party logs — untested live** | verbatim from Ubuntu/Arch/NVIDIA/Framework reports (incl. Strix Halo gfx1151) |
+| Session | **third-party logs — untested live** | verbatim from GNOME GitLab / Mozilla / KDE / Arch reports; dev VM has no graphical session |
+| KernelPanic, Segfault, Lockup, Thermal, Hardware, Coredump | canonical format | fixture-tested only; benign EDAC/boot-banner baselines verified-live |
+| ShutdownCause, SleepWake, Crash, UpdateRestart (macOS) | **third-party logs — untested live** | formats from public reports/documentation; the fetch/parse backend IS verified-live on a real Mac (which also surfaced and fixed the `<IPv4-redacted>`→EDAC false positive), but no real shutdown/panic/crash incident has been matched yet |
+
+A miss (wording drift on some kernel/driver version) silently yields no finding — it never misclassifies or crashes. If you hit a real incident that these patterns miss, capture it with `journalctl -o json > incident.jsonl` and replay with `--from-file`; extending the markers is a one-function change.
+
+**Guarding against boot-banner false positives.** Several subsystem names appear in benign driver-init banners logged at *every* boot, not just in error reports — observed live on this machine:
+
+| Line (logged at boot) | Naïve marker that matched | Why it's benign |
+|---|---|---|
+| `EDAC MC: Ver: 3.0.0` | `EDAC` | EDAC driver version banner |
+| `mce: CPU supports 32 MCE banks` | `mce:` | MCE capability announcement |
+| `EXT4-fs (sda3): mounted filesystem … ro` → `re-mounted … r/w` | `EXT4-fs (` | Normal root-mount sequence (ro first, then r/w) |
+
+Rule: a marker that is a bare subsystem name/prefix (`EDAC`, `mce:`, `MCE `, `EXT4-fs (`, `XFS (`, `Btrfs`) must be **gated on an error indication** in the same message (`error`/`fail`/`corrupt`/`warning`, or an ` CE `/` UE ` event count). Unambiguous markers (`Hardware Error`, `EXT4-fs error`, `Kernel panic`, …) match directly. When adding a detector, check what the subsystem logs at boot (`journalctl -k -b | grep -i <name>`) before trusting a bare name. A quick way to vet the whole taxonomy: run `whyreboot --all` on a healthy machine — ideally it should report nothing from the kernel side.
+
+**Acronym markers must be case-sensitive** (found live on a real Mac): case-insensitive `EDAC` matches inside ordinary words — macOS kernel `tcp_connection_summary` lines contain the literal privacy token `<IPv4-redacted>`, and "red**edac**ted" contains "edac"; the same line's `so_error: 0` then satisfied the error gate, producing a bogus "Corrected hardware/memory error (ECC)" finding. The kernel always logs `EDAC`/`MCE` uppercase and `mce:` lowercase, so those markers now match exactly (`str::contains`, not the case-insensitive helper). Prefer case-sensitive matching for any short acronym marker.
+
+OOM specifics (`oom.rs`): the kernel detector keys on `Killed process <pid> (<comm>)` (also older `Kill process`), extracting pid, comm, and `anon-rss:`/`total-vm:`/`oom_score_adj:`; the `invoked oom-killer:`/`oom-kill:` context lines are deliberately **not** counted, so a single kill = one finding. The systemd-oomd detector (identifier `systemd-oomd`) parses `Killed <cgroup> due to <reason>`.
+
+## Step 4 — Coalesce bursts (`coalesce()`) and correlate cascades (`correlate()`)
+
+A single incident often emits many lines (a SATA fault logs ~10). Consecutive findings of the **same category and source** within `COALESCE_SECS` (30s) are merged into the earliest, folding the rest in as `+ related:` evidence and appending `(N related log lines)` to the title. This keeps the report high-level. Distinct categories, and same-category events far apart in time, stay separate.
+
+After coalescing, `correlate()` cross-annotates cascade relationships within `CORRELATE_SECS` (120s):
+
+1. **GPU incident → casualties.** Segfault/Coredump/Session/Service/Lockup findings near a `GPU` finding are marked "likely follows the GPU hang/reset", and the GPU finding lists each casualty. A GPU hang that takes down the compositor and its apps reads as one story.
+2. **Compositor crash → orphaned clients.** A Segfault/Coredump whose title names a compositor or display server (`gnome-shell`, `kwin_wayland`, `mutter`, `Xorg`, `Xwayland`, `sway`, …) is linked with the `Session` connection-loss findings around it.
+
+Annotations are appended to `evidence` on **both** sides of each link, so whichever finding the reader looks at first points at the rest of the cascade.
+
+## Step 5 — Window-filter and render
+
+Findings are filtered by `TimeWindow::contains` (belt-and-suspenders with journalctl's own `--since`, and the only filter for `--from-file`) and printed newest-first. Text output: a header (`System Issue Report — <window>`, scanned/found counts), then per finding a severity-colored `[LEVEL] CATEGORY time` line, title, `source:`, and evidence bullets; a clean-bill line when none. **JSON mode** emits `{ generated, window_start, window_end, scanned, issue_count, issues: [{ time, severity, category, title, source, evidence }] }`.
+
+## Adding a category
+
+1. Write a detector `fn(&LogLine) -> Option<Finding>` in `detect.rs` and add it to `DETECTORS`.
+2. Kernel-log categories need nothing else (the `-k` stream is fetched unfiltered). A userspace/systemd category must be reachable by an **indexed** query in `fetch_journal` (by `SYSLOG_IDENTIFIER`/`_SYSTEMD_UNIT`/`PRIORITY`) — add one if your source isn't already covered. Never use `--grep` (see the performance note above).
+3. Add a fixture line to `tests/fixtures/` and an assertion in `tests/oom_e2e.rs`.
+
+## Known limitations (Linux)
+
+| Limitation | Detail |
+|---|---|
+| Requires journalctl | The journal is read via `journalctl`; systems using only classic `/var/log/*` files (no systemd journal) aren't yet supported. `--from-file` accepts captured `-o json` output. |
+| Permissions | Kernel and most messages need membership in `systemd-journal`/`adm`. Without it, queries may return nothing rather than erroring. |
+| Marker-based matching | Detection keys on known substrings; kernel wording changes across versions and unusual formats may be missed. Prefer adding markers over tightening to full-line formats. |
+| Non-persistent journal | If `Storage=volatile`, history is lost on reboot, so ranges spanning a reboot may be truncated. |
+| App-side Wayland-loss lines | Arbitrary apps log `Lost connection to Wayland compositor` under their own identifier at info priority, which the indexed live queries don't fetch (we can't enumerate every app). The compositor's own crash *is* fetched (coredump/segfault/session queries), so the incident is still reported; the client lines are picked up in `--from-file` captures. |
+
+---
+
+# macOS — unified log scanning
+
+The macOS path reuses the entire Linux findings pipeline — same `TimeWindow`, same detector framework and correlation pass, same report — with one different fetch backend (`macos.rs`) and a second input format handled by the shared parser (`jsonlog.rs`).
+
+## Fetch (`macos.rs`)
+
+One `log show --style ndjson` invocation, bounded by `--start`/`--end` (local-time `YYYY-MM-DD HH:MM:SS`, rendered by `Timestamp::format_dt`) and filtered with an NSPredicate over `process` (kernel, ReportCrash, softwareupdated, osinstallersetupd) plus `eventMessage CONTAINS` fallbacks for shutdown-cause / sleep-wake / panic strings. Unlike journald, the unified log has **no indexed field queries** — `log show` scans its window regardless — so keep windows bounded; `--all` on a long-lived install is inherently slow (this is `log show`, not us).
+
+Each ndjson record maps onto the shared `LogLine`: `eventMessage` → message, `process` → identifier (so kernel lines satisfy the detectors' kernel checks), `subsystem` → transport. The `timestamp` field is local time with an explicit UTC offset (`2026-07-10 08:00:05.123456+0800`), parsed offset-correctly by `Timestamp::from_log_show`.
+
+## macOS detectors (in the same `DETECTORS` list)
+
+| Category | Trigger | Severity |
+|---|---|---|
+| `ShutdownCause` | kernel `Previous shutdown cause: N`, logged at the boot **after** the event. Decoded: 0 power loss, 3 hard power-off, -60 disk corruption, -61/-62 watchdog restart, -3/-71/-74/-81/-95 thermal/battery, -103 battery low, -128 unknown; unlisted codes still flagged. Cause 5 (clean) is deliberately **not** reported. | Critical / Warning by code |
+| `KernelPanic` | XNU `panic(cpu N caller …)`; `userspace watchdog timeout: no successful checkins from <proc>` extracts the hung process (classically WindowServer) | Critical |
+| `SleepWake` | `Sleep Wake failure` | Critical |
+| `Crash` | ReportCrash identifier + `Saved crash report for App[pid] …` (app name extracted) | Warning |
+| `UpdateRestart` | softwareupdated/osinstallersetupd identifier + restart/install markers — expected reboots, reported at Info so unexplained restarts can be told apart from updates | Info |
+
+These detectors live in the portable `detect.rs`, so the macOS fixtures (`tests/fixtures/macos.jsonl`) are exercised on Linux CI as well; a journald stream never contains these markers, so they cost nothing cross-platform.
+
+## Known limitations (macOS)
+
+| Limitation | Detail |
+|---|---|
+| No field indexes | `log show` scans its whole window; wide ranges are slow by nature. Default window is 24h. |
+| Provenance | All macOS markers are third-party/documentation-sourced and **untested against a live Mac** (development happened on Linux; CI smoke-runs the binary against the macOS runner's live unified log). See the provenance table above. |
+| Log retention | The unified log typically retains days–weeks; `--all` cannot see past its retention. |
+| Update-restart wording | softwareupdated log phrasing churns across macOS releases more than the other categories; expect to extend markers. |

@@ -1,0 +1,8 @@
+{"__REALTIME_TIMESTAMP":"1783700000000000","_TRANSPORT":"kernel","SYSLOG_IDENTIFIER":"kernel","MESSAGE":"i915 0000:00:02.0: [drm] GPU HANG: ecode 9:1:85dffffa, in gnome-shell [1500]"}
+{"__REALTIME_TIMESTAMP":"1783700000500000","_TRANSPORT":"kernel","SYSLOG_IDENTIFIER":"kernel","MESSAGE":"i915 0000:00:02.0: [drm] Resetting rcs0 for stopped heartbeat on rcs0"}
+{"__REALTIME_TIMESTAMP":"1783700002000000","_TRANSPORT":"kernel","SYSLOG_IDENTIFIER":"kernel","MESSAGE":"gnome-shell[1500]: segfault at 18 ip 00007f2a331bbf10 sp 00007ffc0a1a2af0 error 4 in libmutter-14.so.0[7f2a33100000+180000]"}
+{"__REALTIME_TIMESTAMP":"1783700003000000","_TRANSPORT":"journal","SYSLOG_IDENTIFIER":"systemd-coredump","MESSAGE":"Process 1500 (gnome-shell) of user 1000 dumped core."}
+{"__REALTIME_TIMESTAMP":"1783700004000000","_TRANSPORT":"journal","SYSLOG_IDENTIFIER":"gnome-session-binary","MESSAGE":"Unrecoverable failure in required component org.gnome.Shell.desktop"}
+{"__REALTIME_TIMESTAMP":"1783700004500000","_TRANSPORT":"journal","SYSLOG_IDENTIFIER":"firefox","MESSAGE":"Lost connection to Wayland compositor."}
+{"__REALTIME_TIMESTAMP":"1783700004800000","_TRANSPORT":"journal","SYSLOG_IDENTIFIER":"org.gnome.Nautilus","MESSAGE":"Gdk-Message: 14:33:24.802: Error 71 (Protocol error) dispatching to Wayland display."}
+{"__REALTIME_TIMESTAMP":"1783700100000000","_TRANSPORT":"kernel","SYSLOG_IDENTIFIER":"kernel","MESSAGE":"[drm] Initialized i915 1.6.0 20230929 for 0000:00:02.0 on minor 0"}

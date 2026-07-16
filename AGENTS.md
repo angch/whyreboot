@@ -6,29 +6,84 @@ Guidance for agentic coders working in this repository. Read this before touchin
 
 ## What this is
 
-`whyreboot` is a single-binary Rust CLI for Windows that diagnoses why the machine last rebooted. It queries the Windows Event Log (System channel) and Windows Error Reporting (Application channel) to identify crash causes, faulting drivers, and power management misconfigurations.
+`whyreboot` is a single-binary **cross-platform** Rust CLI that diagnoses system issues from OS logs.
 
-**Binary is installed at:** `C:\Users\angch\.local\bin\whyreboot.exe` (on PATH for that user)  
-**Build:** `cargo build --release && copy target\release\whyreboot.exe C:\Users\angch\.local\bin\`  
-**No admin required** for most data — System channel readable by standard users; `C:\Windows\Minidump` requires admin (app gracefully falls back to WER AttachedFiles for dump paths).
+- **Windows:** diagnoses why the machine last rebooted, querying the Windows Event Log (System channel) and Windows Error Reporting (Application channel) for crash causes, faulting drivers, and power-management misconfigurations. This is the original tool; its logic is unchanged.
+- **Linux:** scans the systemd journal (`journalctl`) over a time window for logged system issues — OOM kills, kernel panics, segfaults, disk/I-O errors, lockups, thermal trips, hardware/MCE errors, failed units, coredumps — emitting generic `Finding`s. Issues need not have caused a reboot.
+- **macOS:** same findings pipeline over the unified log (`log show --style ndjson`): unsafe shutdowns (`Previous shutdown cause` code table), XNU panics (incl. WindowServer watchdog), sleep/wake failures, ReportCrash app crashes, update reboots. Backend in `macos.rs`; detectors are portable and fixture-tested on Linux CI; the release workflow builds/tests a universal binary on macOS runners. No live Mac was used in development — provenance is third-party.
+
+The two platforms share a portable core (data model, timestamp, analysis logic) and diverge only in the log-source backend and the top-level report style. `cfg(windows)` / `cfg(target_os = "linux")` gate the backends; a bare `cargo build`/`cargo test` builds the core crate on any platform (the Win32 GUI is excluded via `default-members`).
+
+**Windows binary:** `C:\Users\angch\.local\bin\whyreboot.exe` (on PATH)  
+**Build (Windows):** `cargo build --release && copy target\release\whyreboot.exe C:\Users\angch\.local\bin\`  
+**Build/test (Linux):** `cargo build` / `cargo test` (skips the Windows-only GUI).  
+**Static Linux release:** `cargo build --release --target x86_64-unknown-linux-musl` — no `musl-tools`/C toolchain needed (no C deps; rust-std ships musl libc). Produces a static-pie binary (~520 KB; UPX → ~215 KB, no startup cost). The release workflow builds/tests/uploads this as `whyreboot-cli-x86_64-linux`; its `file`/`ldd` step asserts the binary really is static, so don't add a crate with a C build dependency without updating that job.  
+**No admin/root required** for most data — Windows System channel is readable by standard users (`C:\Windows\Minidump` needs admin, falls back to WER AttachedFiles); Linux `journalctl` is readable by the `systemd-journal`/`adm` groups.
+
+---
+
+## Cross-platform architecture (read this first)
+
+```
+Portable core (compiles + unit-tested on every platform):
+  types.rs      — data model: EventRecord/BootCycle/Cause (Windows) AND
+                  the generic Finding/Severity/LogLine (both)
+  timestamp.rs  — i64 Unix-epoch Timestamp; portable UTC formatting (pure-Rust
+                  Hinnant civil-day algos), local time via Win32 OR libc localtime_r
+  timewindow.rs — parse "1 hour ago" / "today" / "2h" → concrete TimeWindow
+  detect.rs     — detector framework: fn(&LogLine)->Option<Finding>, runs all,
+                  coalesces bursts; the Linux issue taxonomy lives here
+  oom.rs        — OOM detectors (kernel oom-killer + systemd-oomd)
+  analysis.rs/format.rs/xml.rs — Windows boot-cycle logic (pure; still tested on Linux)
+
+Windows backend  (#[cfg(windows)]):        events.rs, registry.rs
+Linux backend    (#[cfg(target_os="linux")]): linux.rs (journalctl -o json source)
+Binary (main.rs): cfg-dispatch — run_windows() vs run_linux()
+display.rs (binary module): print_findings[_json] (portable) + print_cycle/print_json (#[cfg(windows)])
+```
+
+**Adding a Linux detector:** write one `fn(&LogLine) -> Option<Finding>` in `detect.rs` and add it to the `DETECTORS` array. Kernel-log categories need nothing more — `fetch_journal` pulls `-k` **unfiltered** within the window, so any kernel line reaches the detectors. A *userspace/systemd* category (non-kernel) must be reachable by one of the **indexed** queries in `fetch_journal` — currently `SYSLOG_IDENTIFIER=systemd`/`systemd-coredump` at priority ≥ notice. If your source is a different identifier or logs below notice, add an indexed query for it (see the perf note below). Add a fixture line to `tests/fixtures/`. Nothing else changes — display/JSON/CLI already handle arbitrary findings.
+
+**Provenance discipline:** every detector in `detect.rs` carries a `Provenance:` doc note — `verified-live` (matched a real event in a live journal), `third-party logs` (markers verbatim from public incident reports, never reproduced live), or `canonical format` (from kernel/systemd source/docs, fixture-tested only). When adding or editing a detector, set this honestly; when a real incident validates a pattern, upgrade the note. The user-facing summary lives in HowItWorks.md ("Marker provenance").
+
+**False positives — gate bare subsystem markers:** driver-init banners logged at every boot contain subsystem names without any error (`EDAC MC: Ver: 3.0.0`, `mce: CPU supports 32 MCE banks`, `EXT4-fs (sda3): mounted filesystem … ro`). A detector marker that is a bare name/prefix must require an error indication in the same message (`error`/`fail`/`corrupt`/`warning` or ` CE `/` UE `); see `detect_hardware`/`detect_disk_io`. Before adding a marker, check what that subsystem logs at boot (`journalctl -k -b | grep -i <name>`), and vet with `whyreboot --all` on a healthy machine — the kernel side should report nothing.
+
+**Acronym markers: case-sensitive only.** Found live on a real Mac: case-insensitive `EDAC` matched inside macOS's literal `<IPv4-redacted>` privacy token ("red-edac-ted") in kernel tcp_connection_summary lines, and `so_error: 0` satisfied the error gate → bogus ECC finding. The kernel logs `EDAC`/`MCE` uppercase, `mce:` lowercase — match acronyms with plain `str::contains`, never `first_of`/`contains_ci`.
+
+**Performance — never `--grep`:** `fetch_journal` matches only journald-*indexed* fields (`_TRANSPORT`, `_SYSTEMD_UNIT`, `SYSLOG_IDENTIFIER`, `PRIORITY`) and uses `--output-fields` to trim records. `--grep` is an unindexed full-message scan: on this machine's 2.3 GB journal it never finished for `--all`; the indexed queries return in ~0.5 s. Do **not** reintroduce `--grep` to widen coverage — add an indexed query instead, and let the detectors filter precisely.
+
+**Timestamp gotcha:** only `now`/arithmetic/`from_rfc3339`/`to_rfc3339` are portable. Local-time rendering (`format_dt`/`format_t`) is platform-specific (Win32 vs libc). chrono was deliberately removed (commit 97f106b); do not reintroduce it — libc `localtime_r` covers local time at near-zero weight.
+
+**Testing the Linux path:** detectors and the journal JSON parser are pure and unit-tested. End-to-end coverage runs fixtures through `fetch_from_file` → `detect::scan` (`tests/oom_e2e.rs`, fixtures in `tests/fixtures/*.jsonl` — one `journalctl -o json` object per line). The `--from-file` flag is the injectable seam; use it to analyze captured journals offline too.
 
 ---
 
 ## Repository layout
 
 ```
-src/main.rs       — CLI args and entry point (~70 lines)
-src/types.rs      — shared structs and enums
-src/xml.rs        — hand-rolled XML parsing (no external dep)
-src/color.rs      — ANSI palette and Win32 VTP enable
-src/events.rs     — System + WER event fetching, minidump listing
-src/analysis.rs   — boot cycle analysis, lookup tables, WER correlation
-src/registry.rs   — registry helpers + audio power settings check
-src/display.rs    — text/JSON output, explanation generation
-Cargo.toml        — deps: windows 0.62.2 (timestamps handled by src/timestamp.rs)
-HowItWorks.md     — full narrative of the analysis pipeline and decision logic
-TODO.md           — feature tracking (most items done)
-HANDOFF.md        — early session notes (mostly superseded by this file)
+src/main.rs        — CLI args + cfg-dispatched entry (run_windows / run_linux)
+src/types.rs       — shared structs/enums: Windows (EventRecord/BootCycle/Cause)
+                     + generic (Finding/Severity/LogLine)
+src/timestamp.rs   — portable Timestamp; UTC pure-Rust, local via Win32/libc
+src/timewindow.rs  — parse human time ranges → TimeWindow  [portable]
+src/detect.rs      — detector framework + Linux issue taxonomy  [portable]
+src/oom.rs         — OOM detectors (kernel + systemd-oomd)  [portable]
+src/xml.rs         — hand-rolled XML parsing (no external dep)  [portable]
+src/analysis.rs    — boot cycle analysis, lookup tables, WER correlation  [portable]
+src/format.rs      — cause labels, explanations, formatting  [portable]
+src/color.rs       — ANSI palette; enable via Win32 VTP / unix isatty
+src/events.rs      — System + WER event fetching, minidump listing  [cfg(windows)]
+src/registry.rs    — registry helpers + audio power settings check  [cfg(windows)]
+src/jsonlog.rs     — shared ndjson parser: journald + macOS log-show formats  [portable]
+src/linux.rs       — journalctl -o json source (indexed queries)  [cfg(linux)]
+src/macos.rs       — macOS `log show --style ndjson` source  [cfg(macos)]
+src/display.rs     — findings output (portable) + boot-cycle output (cfg(windows))
+tests/oom_e2e.rs   — end-to-end: fixture → detect::scan
+tests/fixtures/    — journalctl -o json sample lines (oom.jsonl, mixed.jsonl)
+Cargo.toml         — windows dep is target-gated; libc for unix; default-members=["."]
+HowItWorks.md      — full narrative of the analysis pipeline and decision logic
+TODO.md            — feature tracking
+HANDOFF.md         — early session notes (mostly superseded by this file)
 ```
 
 **Keep `HowItWorks.md` in sync** when modifying the analysis decision tree (`analyze_slice`, `classify_event41`, `classify_event1074`), the WER/minidump correlation windows, the device power check logic, or the explanation patterns in `generate_explanation`. The doc describes the exact logic, not just the concept.
