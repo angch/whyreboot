@@ -33,20 +33,24 @@ All platforms share a portable core (`types.rs`, `timestamp.rs`, `timewindow.rs`
 
 ### System log (`fetch_system_events`)
 
-Calls `EvtQuery` with `EvtQueryReverseDirection` so events arrive **newest first** (index 0 = most recent). Pulls up to 300 events matching these IDs:
+Calls `EvtQuery` with `EvtQueryReverseDirection` so events arrive **newest first** (index 0 = most recent). Pulls up to 500 events matching these IDs:
 
 | ID | Provider | What it means |
 |---|---|---|
 | 12 | Kernel-General | System started — one per boot |
 | 13 | Kernel-General | OS shutdown initiated |
+| 19 | WindowsUpdateClient | Update install succeeded — title embeds the KB (reboot-cause correlation) |
 | 41 | Kernel-Power | Unexpected shutdown — written at the *next* boot |
 | 109 | Kernel-Power | Power button state transition |
 | 1074 | User32 | Process-initiated shutdown or restart |
 | 1076 | User32 | Shutdown reason documented |
+| 7045 | Service Control Manager | A service/driver was installed (bugcheck-cause correlation) |
 | 6006 | EventLog | Event log stopped cleanly |
 | 6008 | EventLog | Previous shutdown was unexpected |
 | 6009 | EventLog | Windows version at startup |
 | 6013 | EventLog | System uptime in seconds |
+
+> **Reboot-cause correlation (Events 19 and 7045):** These don't classify a reboot; they explain it, following Microsoft's [*Troubleshoot unexpected reboots using system event logs*](https://learn.microsoft.com/en-us/troubleshoot/windows-server/performance/troubleshoot-unexpected-reboots-system-event-logs). For a **Windows Update** cycle, `annotate_update_installs` names the update(s) from Event 19 installed in the shut-down session plus a one-hour post-boot grace (deliberately *not* out to the next boot, so a day of unrelated Store/Defender updates isn't swept in); frequent Defender "Security Intelligence" definition updates are de-prioritized. For a **BSOD** cycle, `annotate_service_installs` lists any driver/service installed *during the session that crashed* (Event 7045) as a prime suspect — the classic "new driver → bugcheck" lead — flagging kernel-mode drivers and `.sys` images specifically.
 
 > **Important timing note:** Event 41 and Event 6008 are *retrospective* — Windows logs them at the start of the recovery boot to describe what happened in the *previous* session. Events 1074, 13, and 6006 are *prospective* — logged during the shutdown itself.
 

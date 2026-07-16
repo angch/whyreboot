@@ -467,6 +467,8 @@ pub fn extract_boot_cycles(
         let prev_boot = boot_times.get(idx + 1).copied().flatten();
         let next_boot = if idx > 0 { boot_times[idx - 1] } else { None };
         annotate_os_version(&mut cycles[idx], events, prev_boot, next_boot);
+        annotate_update_installs(&mut cycles[idx], events, prev_boot, next_boot);
+        annotate_service_installs(&mut cycles[idx], events, prev_boot, boot_times[idx]);
     }
     annotate_with_wer_and_dumps(&mut cycles, wer, dumps);
     cycles
@@ -527,6 +529,114 @@ fn annotate_os_version(
     let Some(bt) = cycle.boot_time else { return };
     *old_version = nearest_os_version(events, prev_boot, Some(bt), true);
     *new_version = nearest_os_version(events, Some(bt), next_boot, false);
+}
+
+/// Returns all Event-`id` records whose `TimeCreated` lies in the half-open window
+/// `[lo, hi)` (either bound `None` = unbounded on that side), newest first.
+fn events_in_window(
+    events: &[EventRecord],
+    id:     u32,
+    lo:     Option<Timestamp>,
+    hi:     Option<Timestamp>,
+) -> Vec<&EventRecord> {
+    let mut v: Vec<&EventRecord> = events.iter()
+        .filter(|e| e.event_id == id)
+        .filter(|e| lo.is_none_or(|l| e.time_created >= l))
+        .filter(|e| hi.is_none_or(|h| e.time_created <  h))
+        .collect();
+    v.sort_by_key(|e| std::cmp::Reverse(e.time_created));
+    v
+}
+
+/// Defender "Security Intelligence" definition updates install constantly and
+/// never trigger a reboot, so they are de-prioritized when naming the update
+/// behind a Windows Update restart.
+fn is_defender_intelligence(title: &str) -> bool {
+    let t = title.to_lowercase();
+    t.contains("security intelligence") || t.contains("antivirus")
+}
+
+/// Annotates a `Cause::WindowsUpdate` cycle with the update(s) Windows reported as
+/// installed around this restart (Event 19, `WindowsUpdateClient`). The title
+/// embeds the KB number, so this names *what* was applied — the "causes of reboot"
+/// evidence from Microsoft's troubleshooting guidance. Quality/cumulative/feature
+/// updates (the ones that actually reboot) are listed ahead of Defender definition
+/// updates; up to three distinct titles are shown.
+fn annotate_update_installs(
+    cycle:     &mut BootCycle,
+    events:    &[EventRecord],
+    prev_boot: Option<Timestamp>,
+    next_boot: Option<Timestamp>,
+) {
+    if !matches!(cycle.cause, Cause::WindowsUpdate { .. }) { return; }
+    let Some(bt) = cycle.boot_time else { return };
+    // The "Installation Successful" record can land in the session that was shut
+    // down (staged) or just after this boot (finalized), so scan the shut-down
+    // session plus a short post-boot grace. The grace is capped rather than
+    // running to `next_boot`: on the most-recent cycle `next_boot` is `None`
+    // (unbounded → now), which would otherwise sweep in a whole day of unrelated
+    // Store/Defender updates and misattribute them to this reboot.
+    const POST_BOOT_GRACE_SECS: i64 = 60 * 60;
+    let grace_end = bt.add_secs(POST_BOOT_GRACE_SECS);
+    let upper = Some(next_boot.map_or(grace_end, |nb| nb.min(grace_end)));
+    let found = events_in_window(events, 19, prev_boot, upper);
+    if found.is_empty() { return; }
+
+    let mut titles: Vec<&str> = Vec::new();
+    // Reboot-relevant updates first.
+    for e in found.iter() {
+        let Some(t) = e.get("updateTitle") else { continue };
+        if is_defender_intelligence(t) { continue; }
+        if !titles.iter().any(|x| *x == t) { titles.push(t); }
+        if titles.len() >= 3 { break; }
+    }
+    // Fall back to the newest update of any kind if nothing else matched.
+    if titles.is_empty() {
+        if let Some(t) = found[0].get("updateTitle") { titles.push(t); }
+    }
+    for t in titles {
+        cycle.evidence.push(format!("Update installed (Event 19): {}", t));
+    }
+}
+
+/// Annotates a `Cause::BlueScreen` cycle with any service or driver installed
+/// during the session that crashed (Event 7045, Service Control Manager). Per
+/// Microsoft's guidance, a driver/service installed shortly before the first
+/// bugcheck is the prime suspect; kernel-mode drivers (or `.sys` images) are
+/// flagged as the likeliest culprits. Up to three are listed, newest first.
+///
+/// The search is bounded below by `session_start` (the boot that began the crashed
+/// session): without a lower bound there is no way to tell "installed just before
+/// the crash" from ancient history, so the annotation is skipped rather than guess.
+fn annotate_service_installs(
+    cycle:         &mut BootCycle,
+    events:        &[EventRecord],
+    session_start: Option<Timestamp>,
+    boot_time:     Option<Timestamp>,
+) {
+    if !matches!(cycle.cause, Cause::BlueScreen { .. }) { return; }
+    let Some(lo) = session_start else { return };
+    let found = events_in_window(events, 7045, Some(lo), boot_time);
+    if found.is_empty() { return; }
+
+    for e in found.iter().take(3) {
+        let name  = e.get("ServiceName").unwrap_or("(unnamed service)");
+        let image = e.get("ImagePath").unwrap_or("").to_lowercase();
+        let stype = e.get("ServiceType").unwrap_or("").to_lowercase();
+        let is_driver = stype.contains("driver") || stype.contains("kernel")
+            || image.contains(".sys");
+        let kind = if is_driver { "Driver" } else { "Service" };
+        cycle.evidence.push(format!(
+            "{} installed during the session that crashed — possible cause (Event 7045): {}",
+            kind, name
+        ));
+    }
+    if found.len() > 3 {
+        cycle.evidence.push(format!(
+            "  … and {} more service/driver install(s) in that session (see event table).",
+            found.len() - 3
+        ));
+    }
 }
 
 /// Runs both annotation passes (minidumps then WER module) over all cycles.
@@ -601,6 +711,8 @@ mod tests {
         bsod_evidence, classify_event41, classify_event1074,
         analyze_slice, collect_boot_indices, extract_boot_cycles,
         annotate_os_version, os_version_from_6009,
+        annotate_update_installs, annotate_service_installs,
+        events_in_window, is_defender_intelligence,
     };
     use crate::timestamp::Timestamp;
     use crate::types::{BootCycle, Cause, EventRecord};
@@ -1035,6 +1147,125 @@ mod tests {
             }
             other => panic!("expected WindowsUpdate, got {other:?}"),
         }
+    }
+
+    // ── events_in_window / is_defender_intelligence ─────────────────────────────
+
+    #[test]
+    fn events_in_window_filters_by_id_and_range_newest_first() {
+        let base = Timestamp(1_705_314_600);
+        let events = [
+            make_event_at(7045, "SCM", base.add_secs(50), &[("ServiceName", "c")]),
+            make_event_at(7045, "SCM", base.add_secs(10), &[("ServiceName", "a")]),
+            make_event_at(19,   "WUC", base.add_secs(20), &[("updateTitle", "u")]),
+            make_event_at(7045, "SCM", base.add_secs(30), &[("ServiceName", "b")]),
+        ];
+        // Half-open [base+10, base+50): includes a (10) and b (30), excludes c (50).
+        let got = events_in_window(&events, 7045, Some(base.add_secs(10)), Some(base.add_secs(50)));
+        let names: Vec<&str> = got.iter().map(|e| e.get("ServiceName").unwrap()).collect();
+        assert_eq!(names, vec!["b", "a"], "newest-first, id-filtered, hi exclusive");
+    }
+
+    #[test]
+    fn is_defender_intelligence_matches_definition_updates_only() {
+        assert!(is_defender_intelligence(
+            "Security Intelligence Update for Microsoft Defender Antivirus - KB2267602"));
+        assert!(is_defender_intelligence("Update for Microsoft Defender Antivirus"));
+        assert!(!is_defender_intelligence(
+            "2026-07 Cumulative Update for Windows 11 Version 24H2 (KB5099999)"));
+    }
+
+    // ── annotate_update_installs (Event 19) ─────────────────────────────────────
+
+    #[test]
+    fn update_installs_prefers_cumulative_over_defender() {
+        let bt = Timestamp(1_705_314_600);
+        let events = [
+            // Defender update is newest, but should be de-prioritized.
+            make_event_at(19, "WindowsUpdateClient", bt.add_secs(-30),
+                &[("updateTitle", "Security Intelligence Update for Microsoft Defender Antivirus - KB2267602")]),
+            make_event_at(19, "WindowsUpdateClient", bt.add_secs(-120),
+                &[("updateTitle", "2026-07 Cumulative Update for Windows 11 (KB5099999)")]),
+        ];
+        let mut cycle = make_cycle(
+            Cause::WindowsUpdate { process: "TrustedInstaller.exe".into(), old_version: None, new_version: None },
+            Some(bt),
+        );
+        annotate_update_installs(&mut cycle, &events, Some(bt.add_secs(-600)), None);
+        assert!(cycle.evidence.iter().any(|e| e.contains("KB5099999")),
+            "cumulative update should be surfaced: {:?}", cycle.evidence);
+        assert!(!cycle.evidence.iter().any(|e| e.contains("KB2267602")),
+            "Defender definition update should be de-prioritized: {:?}", cycle.evidence);
+    }
+
+    #[test]
+    fn update_installs_falls_back_to_newest_when_only_defender() {
+        let bt = Timestamp(1_705_314_600);
+        let events = [make_event_at(19, "WindowsUpdateClient", bt.add_secs(-30),
+            &[("updateTitle", "Security Intelligence Update for Microsoft Defender Antivirus - KB2267602")])];
+        let mut cycle = make_cycle(
+            Cause::WindowsUpdate { process: "TiWorker.exe".into(), old_version: None, new_version: None },
+            Some(bt),
+        );
+        annotate_update_installs(&mut cycle, &events, Some(bt.add_secs(-600)), None);
+        assert!(cycle.evidence.iter().any(|e| e.contains("KB2267602")),
+            "with nothing else, the newest update is shown as context: {:?}", cycle.evidence);
+    }
+
+    #[test]
+    fn update_installs_no_op_for_non_update_cause() {
+        let bt = Timestamp(1_705_314_600);
+        let events = [make_event_at(19, "WindowsUpdateClient", bt.add_secs(-30),
+            &[("updateTitle", "2026-07 Cumulative Update (KB5099999)")])];
+        let mut cycle = make_cycle(Cause::NormalShutdown, Some(bt));
+        annotate_update_installs(&mut cycle, &events, Some(bt.add_secs(-600)), None);
+        assert!(cycle.evidence.is_empty(), "non-update cause must not gain update evidence");
+    }
+
+    // ── annotate_service_installs (Event 7045) ──────────────────────────────────
+
+    #[test]
+    fn service_installs_flags_driver_before_bsod() {
+        let bt = Timestamp(1_705_314_600);
+        let session_start = bt.add_secs(-3600);
+        let events = [
+            make_event_at(7045, "Service Control Manager", bt.add_secs(-600), &[
+                ("ServiceName", "EvilGpuDriver"),
+                ("ImagePath", r"C:\Windows\System32\drivers\evil.sys"),
+                ("ServiceType", "kernel mode driver"),
+            ]),
+        ];
+        let mut cycle = make_cycle(
+            Cause::BlueScreen { stop_code: 0x9F, stop_name: "DRIVER_POWER_STATE_FAILURE", params: [0;4] },
+            Some(bt),
+        );
+        annotate_service_installs(&mut cycle, &events, Some(session_start), Some(bt));
+        assert!(cycle.evidence.iter().any(|e| e.contains("EvilGpuDriver") && e.contains("Driver")),
+            "driver install in the crashed session should be flagged: {:?}", cycle.evidence);
+    }
+
+    #[test]
+    fn service_installs_skipped_without_session_lower_bound() {
+        let bt = Timestamp(1_705_314_600);
+        let events = [make_event_at(7045, "SCM", bt.add_secs(-600),
+            &[("ServiceName", "x"), ("ServiceType", "user mode service")])];
+        let mut cycle = make_cycle(
+            Cause::BlueScreen { stop_code: 0x50, stop_name: "PAGE_FAULT_IN_NONPAGED_AREA", params: [0;4] },
+            Some(bt),
+        );
+        // No session_start → cannot bound "shortly before" → no annotation.
+        annotate_service_installs(&mut cycle, &events, None, Some(bt));
+        assert!(cycle.evidence.is_empty());
+    }
+
+    #[test]
+    fn service_installs_no_op_for_non_bsod_cause() {
+        let bt = Timestamp(1_705_314_600);
+        let events = [make_event_at(7045, "SCM", bt.add_secs(-600),
+            &[("ServiceName", "x"), ("ServiceType", "kernel mode driver")])];
+        let mut cycle = make_cycle(Cause::NormalShutdown, Some(bt));
+        annotate_service_installs(&mut cycle, &events, Some(bt.add_secs(-3600)), Some(bt));
+        assert!(cycle.evidence.is_empty(), "non-BSOD cause must not gain service-install evidence");
     }
 
     #[test]

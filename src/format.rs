@@ -145,6 +145,9 @@ pub fn event_summary(ev: &EventRecord) -> String {
     match ev.event_id {
         12   => "System started".into(),
         13   => "System shutdown initiated".into(),
+        19   => ev.get("updateTitle")
+            .map(|t| format!("Update installed: {}", t))
+            .unwrap_or_else(|| "Windows Update installed".into()),
         41   => format!(
             "Unexpected shutdown — BugCheck={}",
             ev.get("BugcheckCode").unwrap_or("?")
@@ -156,6 +159,10 @@ pub fn event_summary(ev: &EventRecord) -> String {
             ev.get("param7").unwrap_or("?")
         ),
         1076 => "Shutdown reason documented".into(),
+        7045 => format!(
+            "Service/driver installed: {}",
+            ev.get("ServiceName").unwrap_or("?")
+        ),
         6006 => "Event log stopped cleanly (shutdown)".into(),
         6008 => "Previous shutdown was unexpected".into(),
         6009 => "Startup: Windows version info".into(),

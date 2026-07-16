@@ -97,20 +97,29 @@ fn warn_if_unparsed(channel: &str, unparsed: usize) {
     }
 }
 
-/// Fetches up to 300 shutdown/boot-related events from the System log.
-/// Covers Event IDs: 12 (boot), 13 (shutdown), 41 (unexpected shutdown),
-/// 109 (power button), 1074 (process-initiated shutdown), 1076 (shutdown reason),
-/// 6006 (log stopped cleanly), 6008 (previous shutdown unexpected), 6009 (version),
-/// 6013 (uptime).
+/// Fetches up to 500 shutdown / boot / reboot-cause events from the System log.
+/// Covers Event IDs: 12 (boot), 13 (shutdown), 19 (Windows Update install
+/// success), 41 (unexpected shutdown), 109 (power button), 1074 (process-initiated
+/// shutdown), 1076 (shutdown reason), 7045 (service/driver installed),
+/// 6006 (log stopped cleanly), 6008 (previous shutdown unexpected),
+/// 6009 (version), 6013 (uptime).
+///
+/// 19 and 7045 are the correlation IDs from Microsoft's "troubleshoot unexpected
+/// reboots using system event logs" guidance: Event 19 (WindowsUpdateClient)
+/// names the update behind a Windows Update restart, and Event 7045 (Service
+/// Control Manager) surfaces a driver/service installed shortly before a bugcheck
+/// — the classic "new driver → BSOD" lead. The limit is higher than the bare
+/// shutdown-event set needed so several boot cycles stay in view despite the
+/// frequent Defender "Security Intelligence" Event 19s that share the channel.
 pub fn fetch_system_events() -> Vec<EventRecord> {
     let ch: Vec<u16> = "System\0".encode_utf16().collect();
     let q: Vec<u16> =
-        "*[System[(EventID=12 or EventID=13 or EventID=41 or EventID=109 \
-          or EventID=1074 or EventID=1076 \
+        "*[System[(EventID=12 or EventID=13 or EventID=19 or EventID=41 \
+          or EventID=109 or EventID=1074 or EventID=1076 or EventID=7045 \
           or EventID=6006 or EventID=6008 or EventID=6009 or EventID=6013)]]\0"
             .encode_utf16()
             .collect();
-    let (records, unparsed) = fetch_channel(&ch, &q, 300);
+    let (records, unparsed) = fetch_channel(&ch, &q, 500);
     warn_if_unparsed("System", unparsed);
     records
 }
