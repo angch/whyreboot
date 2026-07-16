@@ -8,7 +8,9 @@
 
 use crate::color::Pal;
 use whyreboot::timestamp::Timestamp;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use whyreboot::timewindow::TimeWindow;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use whyreboot::types::{Finding, Severity};
 
 #[cfg(windows)]
@@ -21,6 +23,7 @@ use whyreboot::types::{AudioPowerInfo, BootCycle, Cause};
 
 // ── Finding output (portable) ───────────────────────────────────────────────────
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn severity_color(sev: Severity, pal: &Pal) -> &str {
     match sev {
         Severity::Critical => pal.crash,
@@ -31,6 +34,7 @@ fn severity_color(sev: Severity, pal: &Pal) -> &str {
 
 /// Prints the findings report: a header describing the scanned window, then one
 /// block per finding (newest first), or a clean-bill-of-health line if none.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn print_findings(findings: &[Finding], pal: &Pal, window: &TimeWindow, scanned: usize) {
     let w = 74usize;
     println!();
@@ -67,6 +71,7 @@ pub fn print_findings(findings: &[Finding], pal: &Pal, window: &TimeWindow, scan
 
 /// Outputs findings as hand-built JSON (no serde dependency), mirroring the
 /// boot-cycle JSON shape.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn print_findings_json(findings: &[Finding], window: &TimeWindow, scanned: usize) {
     println!("{{");
     println!("  \"generated\": {},", json_str(&Timestamp::now().to_rfc3339()));
