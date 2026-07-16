@@ -1158,7 +1158,7 @@ mod tests {
         ])];
         let pre = [make_event(1074, "User32", &[
             ("param1", "TiWorker.exe"),
-            ("param3", "SYSTEM"),
+            ("param7", "SYSTEM"),
             ("param4", "0x80020002"),
             ("param5", "restart"),
             ("param6", ""),

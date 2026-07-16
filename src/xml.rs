@@ -7,9 +7,37 @@
 use crate::timestamp::Timestamp;
 use crate::types::EventRecord;
 
+/// True if `c` terminates an XML tag *name*, so that a search for tag `Data`
+/// matches `<Data>`, `<Data …>`, and `<Data/>` but never a longer name like
+/// `<DataObject>`.
+fn is_tag_boundary(c: char) -> bool {
+    c == '>' || c == '/' || c.is_ascii_whitespace()
+}
+
+/// Given a slice starting at the `<` of an opening tag, returns the byte offset
+/// of the `>` that closes it, skipping any `>` that appears inside a single- or
+/// double-quoted attribute value. Returns `None` for an unterminated tag.
+///
+/// Scanning bytes is UTF-8-safe here: `'`, `"`, and `>` are ASCII, and a UTF-8
+/// continuation byte never collides with an ASCII byte, so the returned index
+/// always falls on a char boundary.
+fn find_tag_end(s: &str) -> Option<usize> {
+    let mut quote: Option<u8> = None;
+    for (i, b) in s.bytes().enumerate() {
+        match quote {
+            Some(q) if b == q       => quote = None,
+            Some(_)                 => {}
+            None if b == b'\'' || b == b'"' => quote = Some(b),
+            None if b == b'>'       => return Some(i),
+            None                    => {}
+        }
+    }
+    None
+}
+
 /// Extracts an attribute value from the first occurrence of `<tag … attr='…'>`.
 /// Handles both single- and double-quoted attribute values.
-/// Requires the character immediately after the tag name to be a word boundary
+/// Requires the character immediately after the tag name to be a tag boundary
 /// (space, `>`, `/`) to avoid matching longer tag names such as `<DataObject>`
 /// when searching for `<Data>`.
 pub fn xml_attr(xml: &str, tag: &str, attr: &str) -> Option<String> {
@@ -19,20 +47,19 @@ pub fn xml_attr(xml: &str, tag: &str, attr: &str) -> Option<String> {
     // the latter is O(n^2) on adversarial input with many false-positive matches.
     for (start, _) in xml.match_indices(&tag_prefix) {
         let after = start + tag_prefix.len();
-        if xml[after..].starts_with(|c: char| c == '>' || c == '/' || c.is_ascii_whitespace()) {
-            let region_end = xml[start..].find('>')?;
-            let region = &xml[start..start + region_end];
-            for (open, close) in [("='", '\''), ("=\"", '"')] {
-                let search = format!("{}{}", attr, open);
-                if let Some(pos) = region.find(&search) {
-                    let vs = pos + search.len();
-                    if let Some(ve) = region[vs..].find(close) {
-                        return Some(region[vs..vs + ve].to_string());
-                    }
+        if !xml[after..].starts_with(is_tag_boundary) { continue; }
+        let Some(region_end) = find_tag_end(&xml[start..]) else { continue };
+        let region = &xml[start..start + region_end];
+        for (open, close) in [("='", '\''), ("=\"", '"')] {
+            let search = format!("{}{}", attr, open);
+            if let Some(pos) = region.find(&search) {
+                let vs = pos + search.len();
+                if let Some(ve) = region[vs..].find(close) {
+                    return Some(region[vs..vs + ve].to_string());
                 }
             }
-            return None;
         }
+        return None;
     }
     None
 }
@@ -40,17 +67,17 @@ pub fn xml_attr(xml: &str, tag: &str, attr: &str) -> Option<String> {
 /// Extracts the trimmed text content of `<tag …>…</tag>` (first occurrence only).
 /// Tolerates attributes on the opening tag (e.g. `<EventID Qualifiers='32768'>1074</EventID>`,
 /// as emitted for events from legacy providers like `User32` and `EventLog`) — matching
-/// only a bare `<tag>` would miss these entirely.
+/// only a bare `<tag>` would miss these entirely. Self-closing `<tag/>` has no
+/// content and is skipped.
 pub fn xml_elem(xml: &str, tag: &str) -> Option<String> {
     let tag_prefix = format!("<{}", tag);
     let close = format!("</{}>", tag);
     for (start, _) in xml.match_indices(&tag_prefix) {
         let after = start + tag_prefix.len();
-        if !xml[after..].starts_with(|c: char| c == '>' || c.is_ascii_whitespace()) {
-            continue;
-        }
-        let Some(gt) = xml[start..].find('>') else { continue };
-        let s = start + gt + 1;
+        if !xml[after..].starts_with(is_tag_boundary) { continue; }
+        let Some(end) = find_tag_end(&xml[start..]) else { continue };
+        if xml[start..start + end].ends_with('/') { continue; } // self-closing: no content
+        let s = start + end + 1;
         let Some(e) = xml[s..].find(&close) else { continue };
         return Some(xml[s..s + e].trim().to_string());
     }
@@ -71,11 +98,11 @@ pub fn xml_data(xml: &str) -> Vec<(String, String)> {
         if abs < resume_from { continue; }
         let rest = &xml[abs..];
         // Guard against matching <DataSomethingElse> when we want only <Data …>.
-        if !rest[5..].starts_with(|c: char| c == '>' || c == '/' || c.is_ascii_whitespace()) {
+        if !rest["<Data".len()..].starts_with(is_tag_boundary) {
             continue;
         }
         let name = xml_attr(rest, "Data", "Name");
-        let Some(gt) = rest.find('>') else { continue };
+        let Some(gt) = find_tag_end(rest) else { continue };
         if rest[..gt].ends_with('/') {
             resume_from = abs + gt + 1;
             continue;
@@ -166,6 +193,15 @@ mod tests {
         assert_eq!(xml_attr(xml, "System", "Name"), Some("right".to_string()));
     }
 
+    #[test]
+    fn attr_ignores_gt_inside_quoted_value() {
+        // A '>' inside an earlier attribute value must not be mistaken for the
+        // end of the opening tag, or a later attribute becomes unreachable.
+        let xml = r#"<Provider Name='a>b' Guid='xyz'/>"#;
+        assert_eq!(xml_attr(xml, "Provider", "Guid"), Some("xyz".to_string()));
+        assert_eq!(xml_attr(xml, "Provider", "Name"), Some("a>b".to_string()));
+    }
+
     // ── xml_elem ─────────────────────────────────────────────────────────────
 
     #[test]
@@ -202,6 +238,16 @@ mod tests {
     fn elem_skips_longer_tag_name() {
         // <EventIDFoo> must not be matched when searching for <EventID>.
         let xml = "<EventIDFoo>99</EventIDFoo><EventID>41</EventID>";
+        assert_eq!(xml_elem(xml, "EventID"), Some("41".to_string()));
+    }
+
+    #[test]
+    fn elem_self_closing_has_no_content() {
+        // A self-closing tag carries no text; don't fall through to a later
+        // element's close tag and return garbage.
+        assert_eq!(xml_elem("<EventID/>", "EventID"), None);
+        // ...but a real element after a self-closing one is still found.
+        let xml = "<EventID/><EventID>41</EventID>";
         assert_eq!(xml_elem(xml, "EventID"), Some("41".to_string()));
     }
 

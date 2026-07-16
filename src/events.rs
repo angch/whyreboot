@@ -8,11 +8,19 @@ use crate::timestamp::Timestamp;
 use crate::types::{EventRecord, WerRecord};
 use crate::xml::parse_event;
 
-/// Generic `EvtQuery` wrapper. Returns up to `limit` parsed events from the given
-/// `channel` using the provided XPath `query_str`, newest first
-/// (`EvtQueryReverseDirection`). Silently returns empty on query failure.
-pub fn fetch_channel(channel: &[u16], query_str: &[u16], limit: usize) -> Vec<EventRecord> {
+/// Generic `EvtQuery` wrapper. Returns `(records, unparsed)`: up to `limit` parsed
+/// events from the given `channel` using the provided XPath `query_str`, newest
+/// first (`EvtQueryReverseDirection`), plus a count of XML fragments that rendered
+/// successfully but could **not** be parsed into an `EventRecord`.
+///
+/// The `unparsed` count is deliberately surfaced rather than swallowed: a spike
+/// there is the fingerprint of a parser regression (e.g. a legacy provider
+/// rendering `<EventID>` with an unexpected attribute), which would otherwise
+/// silently drop whole classes of events and skew the diagnosis. Returns empty
+/// on query failure.
+pub fn fetch_channel(channel: &[u16], query_str: &[u16], limit: usize) -> (Vec<EventRecord>, usize) {
     let mut records = Vec::new();
+    let mut unparsed = 0usize;
     unsafe {
         let h_results = match EvtQuery(
             None,
@@ -21,7 +29,7 @@ pub fn fetch_channel(channel: &[u16], query_str: &[u16], limit: usize) -> Vec<Ev
             EvtQueryChannelPath.0 | EvtQueryReverseDirection.0,
         ) {
             Ok(h)  => h,
-            Err(_) => return records,
+            Err(_) => return (records, unparsed),
         };
 
         let mut handles = [0isize; 16];
@@ -59,8 +67,9 @@ pub fn fetch_channel(channel: &[u16], query_str: &[u16], limit: usize) -> Vec<Ev
                             char_count
                         };
                         let xml = String::from_utf16_lossy(&buf[..end]);
-                        if let Some(rec) = parse_event(&xml) {
-                            records.push(rec);
+                        match parse_event(&xml) {
+                            Some(rec) => records.push(rec),
+                            None      => unparsed += 1,
                         }
                     }
                 }
@@ -77,7 +86,15 @@ pub fn fetch_channel(channel: &[u16], query_str: &[u16], limit: usize) -> Vec<Ev
         }
         let _ = EvtClose(h_results);
     }
-    records
+    (records, unparsed)
+}
+
+/// Emits a one-line stderr warning when `fetch_channel` reported dropped records,
+/// naming the channel so a parser regression is visible instead of silent.
+fn warn_if_unparsed(channel: &str, unparsed: usize) {
+    if unparsed > 0 {
+        eprintln!("  warning: {unparsed} {channel} event record(s) could not be parsed and were skipped.");
+    }
 }
 
 /// Fetches up to 300 shutdown/boot-related events from the System log.
@@ -93,7 +110,9 @@ pub fn fetch_system_events() -> Vec<EventRecord> {
           or EventID=6006 or EventID=6008 or EventID=6009 or EventID=6013)]]\0"
             .encode_utf16()
             .collect();
-    fetch_channel(&ch, &q, 300)
+    let (records, unparsed) = fetch_channel(&ch, &q, 300);
+    warn_if_unparsed("System", unparsed);
+    records
 }
 
 /// Maximum length kept for any single WER text field (see trust-boundary note below).
@@ -125,7 +144,9 @@ pub fn fetch_wer_events() -> Vec<WerRecord> {
     let ch: Vec<u16> = "Application\0".encode_utf16().collect();
     let q: Vec<u16>  = "*[System[EventID=1001]]\0".encode_utf16().collect();
 
-    fetch_channel(&ch, &q, 100)
+    let (records, unparsed) = fetch_channel(&ch, &q, 100);
+    warn_if_unparsed("Application/WER", unparsed);
+    records
         .into_iter()
         .filter_map(|ev| {
             let prov = ev.provider.to_lowercase();
