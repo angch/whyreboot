@@ -55,5 +55,7 @@ pub fn fetch_unified_log(window: &TimeWindow) -> io::Result<Vec<LogLine>> {
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    Ok(crate::jsonlog::parse_json_lines(&String::from_utf8_lossy(&out.stdout)))
+    Ok(crate::jsonlog::parse_json_lines(&String::from_utf8_lossy(
+        &out.stdout,
+    )))
 }

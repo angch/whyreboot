@@ -11,11 +11,11 @@ use crate::types::AudioPowerInfo;
 /// Reads a `REG_DWORD` value from an open registry key. Returns `None` if the
 /// value is absent, the wrong type, or the query fails.
 fn reg_read_dword(hk: windows::Win32::System::Registry::HKEY, name: &str) -> Option<u32> {
-    use windows::Win32::System::Registry::{RegQueryValueExW, REG_VALUE_TYPE};
+    use windows::Win32::System::Registry::{REG_VALUE_TYPE, RegQueryValueExW};
     let w: Vec<u16> = name.encode_utf16().chain([0]).collect();
     let mut val = 0u32;
-    let mut sz  = 4u32;
-    let mut tp  = REG_VALUE_TYPE(0);
+    let mut sz = 4u32;
+    let mut tp = REG_VALUE_TYPE(0);
     let ok = unsafe {
         RegQueryValueExW(
             hk,
@@ -34,7 +34,7 @@ fn reg_read_dword(hk: windows::Win32::System::Registry::HKEY, name: &str) -> Opt
 /// Reads a `REG_SZ` or `REG_EXPAND_SZ` value from an open registry key.
 /// Uses a two-pass query: size probe then read. Returns `None` if absent or empty.
 fn reg_read_string(hk: windows::Win32::System::Registry::HKEY, name: &str) -> Option<String> {
-    use windows::Win32::System::Registry::{RegQueryValueExW, REG_VALUE_TYPE};
+    use windows::Win32::System::Registry::{REG_VALUE_TYPE, RegQueryValueExW};
     let w: Vec<u16> = name.encode_utf16().chain([0]).collect();
     let mut sz = 0u32;
     let mut tp = REG_VALUE_TYPE(0);
@@ -49,7 +49,9 @@ fn reg_read_string(hk: windows::Win32::System::Registry::HKEY, name: &str) -> Op
         );
     }
     // sz=2 is just a null terminator (empty string); skip that too.
-    if sz <= 2 { return None; }
+    if sz <= 2 {
+        return None;
+    }
     // Buffer as Vec<u16> (not Vec<u8>) so the allocation is 2-byte aligned;
     // reading back through a misaligned *const u16 is undefined behavior.
     let mut buf = vec![0u16; sz as usize / 2 + 2];
@@ -69,7 +71,11 @@ fn reg_read_string(hk: windows::Win32::System::Registry::HKEY, name: &str) -> Op
         let chars = &buf[..sz as usize / 2];
         let trimmed = String::from_utf16_lossy(chars);
         let trimmed = trimmed.trim_end_matches('\0');
-        if !trimmed.is_empty() { Some(trimmed.to_string()) } else { None }
+        if !trimmed.is_empty() {
+            Some(trimmed.to_string())
+        } else {
+            None
+        }
     } else {
         None
     }
@@ -81,9 +87,10 @@ fn reg_read_string(hk: windows::Win32::System::Registry::HKEY, name: &str) -> Op
 /// `EnhancedPowerManagementEnabled` values (`None` = registry value absent).
 pub fn check_audio_power_settings() -> Vec<AudioPowerInfo> {
     use windows::Win32::System::Registry::{
-        RegOpenKeyExW, RegCloseKey, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
+        HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegOpenKeyExW,
     };
-    const BASE: &str = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e96c-e325-11ce-bfc1-08002be10318}";
+    const BASE: &str =
+        r"SYSTEM\CurrentControlSet\Control\Class\{4d36e96c-e325-11ce-bfc1-08002be10318}";
     let mut results = Vec::new();
     unsafe {
         let base_w: Vec<u16> = BASE.encode_utf16().chain([0]).collect();
@@ -102,7 +109,7 @@ pub fn check_audio_power_settings() -> Vec<AudioPowerInfo> {
         }
 
         for i in 0..=20u32 {
-            let inst   = format!("{:04}", i);
+            let inst = format!("{:04}", i);
             let inst_w: Vec<u16> = inst.encode_utf16().chain([0]).collect();
             let mut hk = HKEY(std::ptr::null_mut());
             if RegOpenKeyExW(
@@ -122,13 +129,21 @@ pub fn check_audio_power_settings() -> Vec<AudioPowerInfo> {
                 .or_else(|| reg_read_string(hk, "FriendlyName"))
             {
                 Some(n) if !n.is_empty() => n,
-                _ => { let _ = RegCloseKey(hk); continue; }
+                _ => {
+                    let _ = RegCloseKey(hk);
+                    continue;
+                }
             };
 
             let allow_idle_d3 = reg_read_dword(hk, "AllowIdleIrpInD3");
-            let enhanced_pm   = reg_read_dword(hk, "EnhancedPowerManagementEnabled");
+            let enhanced_pm = reg_read_dword(hk, "EnhancedPowerManagementEnabled");
             let _ = RegCloseKey(hk);
-            results.push(AudioPowerInfo { instance: inst, name, allow_idle_d3, enhanced_pm });
+            results.push(AudioPowerInfo {
+                instance: inst,
+                name,
+                allow_idle_d3,
+                enhanced_pm,
+            });
         }
 
         let _ = RegCloseKey(hk_base);

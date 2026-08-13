@@ -9,7 +9,7 @@
 mod color;
 mod display;
 
-use color::{enable_ansi_color, COLORS, NO_COLOR};
+use color::{COLORS, NO_COLOR, enable_ansi_color};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -17,13 +17,13 @@ use color::{enable_ansi_color, COLORS, NO_COLOR};
 /// subset that applies to it).
 struct Args {
     /// Windows: number of boot cycles to show (default 1; 0 = all).
-    history:   usize,
-    json:      bool,
-    color:     bool,
+    history: usize,
+    json: bool,
+    color: bool,
     /// Time-range expression, e.g. "1 hour ago" / "today" / "2h" (Linux).
-    window:    Option<String>,
+    window: Option<String>,
     /// Analyze all available history regardless of window.
-    all:       bool,
+    all: bool,
     /// Read journalctl `-o json` records from this file instead of the live
     /// journal (Linux; used for testing and offline analysis).
     from_file: Option<std::path::PathBuf>,
@@ -34,17 +34,21 @@ struct Args {
 /// works as well as `whyreboot --since "1 hour ago"`.
 fn parse_args() -> Args {
     let mut args = Args {
-        history: 1, json: false, color: true,
-        window: None, all: false, from_file: None,
+        history: 1,
+        json: false,
+        color: true,
+        window: None,
+        all: false,
+        from_file: None,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut positional: Vec<String> = Vec::new();
     let mut i = 0;
     while i < argv.len() {
         match argv[i].as_str() {
-            "--json"        => args.json  = true,
-            "--no-color"    => args.color = false,
-            "--all"         => args.all   = true,
+            "--json" => args.json = true,
+            "--no-color" => args.color = false,
+            "--all" => args.all = true,
             "--help" | "-h" => print_help(),
             "--history" => {
                 i += 1;
@@ -54,11 +58,15 @@ fn parse_args() -> Args {
             }
             "--since" | "--for" | "--window" => {
                 i += 1;
-                if let Some(v) = argv.get(i) { args.window = Some(v.clone()); }
+                if let Some(v) = argv.get(i) {
+                    args.window = Some(v.clone());
+                }
             }
             "--from-file" => {
                 i += 1;
-                if let Some(v) = argv.get(i) { args.from_file = Some(v.into()); }
+                if let Some(v) = argv.get(i) {
+                    args.from_file = Some(v.into());
+                }
             }
             other => positional.push(other.to_string()),
         }
@@ -94,20 +102,30 @@ fn print_help() -> ! {
 
 fn main() {
     let args = parse_args();
-    let pal  = if args.color && enable_ansi_color() { &COLORS } else { &NO_COLOR };
+    let pal = if args.color && enable_ansi_color() {
+        &COLORS
+    } else {
+        &NO_COLOR
+    };
 
     #[cfg(windows)]
     run_windows(&args, pal);
 
     #[cfg(target_os = "linux")]
-    run_issue_scan(&args, pal,
+    run_issue_scan(
+        &args,
+        pal,
         whyreboot::linux::fetch_journal,
-        "Ensure `journalctl` is available and readable (try the systemd-journal or adm group).");
+        "Ensure `journalctl` is available and readable (try the systemd-journal or adm group).",
+    );
 
     #[cfg(target_os = "macos")]
-    run_issue_scan(&args, pal,
+    run_issue_scan(
+        &args,
+        pal,
         whyreboot::macos::fetch_unified_log,
-        "Ensure the `log` command is available (macOS 10.12+).");
+        "Ensure the `log` command is available (macOS 10.12+).",
+    );
 
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
@@ -126,14 +144,15 @@ fn main() {
 fn run_issue_scan(
     args: &Args,
     pal: &color::Pal,
-    fetch: fn(&whyreboot::timewindow::TimeWindow)
-        -> std::io::Result<Vec<whyreboot::types::LogLine>>,
+    fetch: fn(
+        &whyreboot::timewindow::TimeWindow,
+    ) -> std::io::Result<Vec<whyreboot::types::LogLine>>,
     fetch_hint: &str,
 ) {
     use whyreboot::detect::scan;
     use whyreboot::jsonlog::fetch_from_file;
     use whyreboot::timestamp::Timestamp;
-    use whyreboot::timewindow::{parse_window, TimeWindow};
+    use whyreboot::timewindow::{TimeWindow, parse_window};
 
     let now = Timestamp::now();
 
@@ -160,7 +179,7 @@ fn run_issue_scan(
 
     let lines = match &args.from_file {
         Some(p) => fetch_from_file(p),
-        None    => fetch(&window),
+        None => fetch(&window),
     };
     let lines = match lines {
         Ok(l) => l,
@@ -178,7 +197,11 @@ fn run_issue_scan(
         .filter(|f| window.contains(f.time))
         .collect();
 
-    eprintln!("  Scanned {} record(s); found {} issue(s).\n", lines.len(), findings.len());
+    eprintln!(
+        "  Scanned {} record(s); found {} issue(s).\n",
+        lines.len(),
+        findings.len()
+    );
 
     if args.json {
         display::print_findings_json(&findings, &window, lines.len());
@@ -197,9 +220,9 @@ fn run_windows(args: &Args, pal: &color::Pal) {
 
     eprintln!("Scanning Windows Event Log for shutdown/reboot events…");
 
-    let sys_events  = fetch_system_events();
-    let wer_events  = fetch_wer_events();
-    let dumps       = list_minidumps();
+    let sys_events = fetch_system_events();
+    let wer_events = fetch_wer_events();
+    let dumps = list_minidumps();
     let audio_power = check_audio_power_settings();
 
     if sys_events.is_empty() {
@@ -213,7 +236,10 @@ fn run_windows(args: &Args, pal: &color::Pal) {
         eprintln!("  Found {} minidump file(s).", dumps.len());
     }
     if !audio_power.is_empty() {
-        eprintln!("  Checked {} audio device power setting(s).", audio_power.len());
+        eprintln!(
+            "  Checked {} audio device power setting(s).",
+            audio_power.len()
+        );
     }
 
     let cycles = extract_boot_cycles(&sys_events, &wer_events, &dumps, args.history);

@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Windows Event Log fetching: System channel, WER (Application channel), and minidump listing.
 
-use std::ffi::c_void;
-use std::path::PathBuf;
-use windows::Win32::System::EventLog::*;
 use crate::timestamp::Timestamp;
 use crate::types::{EventRecord, WerRecord};
 use crate::xml::parse_event;
+use std::ffi::c_void;
+use std::path::PathBuf;
+use windows::Win32::System::EventLog::*;
 
 /// Generic `EvtQuery` wrapper. Returns `(records, unparsed)`: up to `limit` parsed
 /// events from the given `channel` using the provided XPath `query_str`, newest
@@ -18,7 +18,11 @@ use crate::xml::parse_event;
 /// rendering `<EventID>` with an unexpected attribute), which would otherwise
 /// silently drop whole classes of events and skew the diagnosis. Returns empty
 /// on query failure.
-pub fn fetch_channel(channel: &[u16], query_str: &[u16], limit: usize) -> (Vec<EventRecord>, usize) {
+pub fn fetch_channel(
+    channel: &[u16],
+    query_str: &[u16],
+    limit: usize,
+) -> (Vec<EventRecord>, usize) {
     let mut records = Vec::new();
     let mut unparsed = 0usize;
     unsafe {
@@ -28,23 +32,29 @@ pub fn fetch_channel(channel: &[u16], query_str: &[u16], limit: usize) -> (Vec<E
             windows::core::PCWSTR(query_str.as_ptr()),
             EvtQueryChannelPath.0 | EvtQueryReverseDirection.0,
         ) {
-            Ok(h)  => h,
+            Ok(h) => h,
             Err(_) => return (records, unparsed),
         };
 
         let mut handles = [0isize; 16];
         'outer: loop {
             let mut returned = 0u32;
-            if EvtNext(h_results, &mut handles, 5000, 0, &mut returned).is_err()
-                || returned == 0
-            {
+            if EvtNext(h_results, &mut handles, 5000, 0, &mut returned).is_err() || returned == 0 {
                 break;
             }
             for (i, &h) in handles[..returned as usize].iter().enumerate() {
                 let h_ev = EVT_HANDLE(h);
                 let mut needed = 0u32;
-                let mut pc    = 0u32;
-                let _ = EvtRender(None, h_ev, EvtRenderEventXml.0, 0, None, &mut needed, &mut pc);
+                let mut pc = 0u32;
+                let _ = EvtRender(
+                    None,
+                    h_ev,
+                    EvtRenderEventXml.0,
+                    0,
+                    None,
+                    &mut needed,
+                    &mut pc,
+                );
                 if needed > 0 {
                     let mut buf = vec![0u16; (needed as usize).div_ceil(2) + 1];
                     if EvtRender(
@@ -69,7 +79,7 @@ pub fn fetch_channel(channel: &[u16], query_str: &[u16], limit: usize) -> (Vec<E
                         let xml = String::from_utf16_lossy(&buf[..end]);
                         match parse_event(&xml) {
                             Some(rec) => records.push(rec),
-                            None      => unparsed += 1,
+                            None => unparsed += 1,
                         }
                     }
                 }
@@ -93,7 +103,9 @@ pub fn fetch_channel(channel: &[u16], query_str: &[u16], limit: usize) -> (Vec<E
 /// naming the channel so a parser regression is visible instead of silent.
 fn warn_if_unparsed(channel: &str, unparsed: usize) {
     if unparsed > 0 {
-        eprintln!("  warning: {unparsed} {channel} event record(s) could not be parsed and were skipped.");
+        eprintln!(
+            "  warning: {unparsed} {channel} event record(s) could not be parsed and were skipped."
+        );
     }
 }
 
@@ -113,12 +125,11 @@ fn warn_if_unparsed(channel: &str, unparsed: usize) {
 /// frequent Defender "Security Intelligence" Event 19s that share the channel.
 pub fn fetch_system_events() -> Vec<EventRecord> {
     let ch: Vec<u16> = "System\0".encode_utf16().collect();
-    let q: Vec<u16> =
-        "*[System[(EventID=12 or EventID=13 or EventID=19 or EventID=41 \
+    let q: Vec<u16> = "*[System[(EventID=12 or EventID=13 or EventID=19 or EventID=41 \
           or EventID=109 or EventID=1074 or EventID=1076 or EventID=7045 \
           or EventID=6006 or EventID=6008 or EventID=6009 or EventID=6013)]]\0"
-            .encode_utf16()
-            .collect();
+        .encode_utf16()
+        .collect();
     let (records, unparsed) = fetch_channel(&ch, &q, 500);
     warn_if_unparsed("System", unparsed);
     records
@@ -151,7 +162,7 @@ fn clamp_field(s: &str) -> String {
 /// the displayed output.
 pub fn fetch_wer_events() -> Vec<WerRecord> {
     let ch: Vec<u16> = "Application\0".encode_utf16().collect();
-    let q: Vec<u16>  = "*[System[EventID=1001]]\0".encode_utf16().collect();
+    let q: Vec<u16> = "*[System[EventID=1001]]\0".encode_utf16().collect();
 
     let (records, unparsed) = fetch_channel(&ch, &q, 100);
     warn_if_unparsed("Application/WER", unparsed);
@@ -168,10 +179,12 @@ pub fn fetch_wer_events() -> Vec<WerRecord> {
             {
                 return None;
             }
-            let p1 = ev.get("P1")
+            let p1 = ev
+                .get("P1")
                 .and_then(|s| u64::from_str_radix(s.trim(), 16).ok())
                 .unwrap_or(0);
-            let bucket_id = ev.get("Bucket")
+            let bucket_id = ev
+                .get("Bucket")
                 .or_else(|| ev.get("BucketId"))
                 .or_else(|| ev.get("HashedBucket"))
                 .or_else(|| ev.get("_0"))
@@ -183,7 +196,12 @@ pub fn fetch_wer_events() -> Vec<WerRecord> {
                     .find(|l| l.to_lowercase().ends_with(".dmp"))
                     .map(|l| PathBuf::from(clamp_field(l.trim_start_matches(r"\\?\"))))
             });
-            Some(WerRecord { time_created: ev.time_created, p1, bucket_id, minidump_path })
+            Some(WerRecord {
+                time_created: ev.time_created,
+                p1,
+                bucket_id,
+                minidump_path,
+            })
         })
         .collect()
 }
@@ -193,7 +211,9 @@ pub fn fetch_wer_events() -> Vec<WerRecord> {
 pub fn list_minidumps() -> Vec<(Timestamp, PathBuf)> {
     let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
     let dir = PathBuf::from(sysroot).join("Minidump");
-    let Ok(rd) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
     let mut v: Vec<(Timestamp, PathBuf)> = rd
         .filter_map(|e| e.ok())
         .filter(|e| {

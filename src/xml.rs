@@ -25,11 +25,11 @@ fn find_tag_end(s: &str) -> Option<usize> {
     let mut quote: Option<u8> = None;
     for (i, b) in s.bytes().enumerate() {
         match quote {
-            Some(q) if b == q       => quote = None,
-            Some(_)                 => {}
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
             None if b == b'\'' || b == b'"' => quote = Some(b),
-            None if b == b'>'       => return Some(i),
-            None                    => {}
+            None if b == b'>' => return Some(i),
+            None => {}
         }
     }
     None
@@ -47,8 +47,12 @@ pub fn xml_attr(xml: &str, tag: &str, attr: &str) -> Option<String> {
     // the latter is O(n^2) on adversarial input with many false-positive matches.
     for (start, _) in xml.match_indices(&tag_prefix) {
         let after = start + tag_prefix.len();
-        if !xml[after..].starts_with(is_tag_boundary) { continue; }
-        let Some(region_end) = find_tag_end(&xml[start..]) else { continue };
+        if !xml[after..].starts_with(is_tag_boundary) {
+            continue;
+        }
+        let Some(region_end) = find_tag_end(&xml[start..]) else {
+            continue;
+        };
         let region = &xml[start..start + region_end];
         for (open, close) in [("='", '\''), ("=\"", '"')] {
             let search = format!("{}{}", attr, open);
@@ -74,11 +78,19 @@ pub fn xml_elem(xml: &str, tag: &str) -> Option<String> {
     let close = format!("</{}>", tag);
     for (start, _) in xml.match_indices(&tag_prefix) {
         let after = start + tag_prefix.len();
-        if !xml[after..].starts_with(is_tag_boundary) { continue; }
-        let Some(end) = find_tag_end(&xml[start..]) else { continue };
-        if xml[start..start + end].ends_with('/') { continue; } // self-closing: no content
+        if !xml[after..].starts_with(is_tag_boundary) {
+            continue;
+        }
+        let Some(end) = find_tag_end(&xml[start..]) else {
+            continue;
+        };
+        if xml[start..start + end].ends_with('/') {
+            continue;
+        } // self-closing: no content
         let s = start + end + 1;
-        let Some(e) = xml[s..].find(&close) else { continue };
+        let Some(e) = xml[s..].find(&close) else {
+            continue;
+        };
         return Some(xml[s..s + e].trim().to_string());
     }
     None
@@ -88,27 +100,33 @@ pub fn xml_elem(xml: &str, tag: &str) -> Option<String> {
 /// Fields without a `Name` attribute are assigned anonymous keys `_0`, `_1`, etc.
 /// Self-closing `<Data … />` elements are skipped (empty values).
 pub fn xml_data(xml: &str) -> Vec<(String, String)> {
-    let mut map  = Vec::new();
+    let mut map = Vec::new();
     let mut anon = 0usize;
     // Single forward sweep over all "<Data" occurrences (see `xml_attr` for why
     // this replaces a restart-by-one-byte loop). `resume_from` skips matches that
     // fall inside a region already consumed by a previously parsed element.
     let mut resume_from = 0usize;
     for (abs, _) in xml.match_indices("<Data") {
-        if abs < resume_from { continue; }
+        if abs < resume_from {
+            continue;
+        }
         let rest = &xml[abs..];
         // Guard against matching <DataSomethingElse> when we want only <Data …>.
         if !rest["<Data".len()..].starts_with(is_tag_boundary) {
             continue;
         }
         let name = xml_attr(rest, "Data", "Name");
-        let Some(gt) = find_tag_end(rest) else { continue };
+        let Some(gt) = find_tag_end(rest) else {
+            continue;
+        };
         if rest[..gt].ends_with('/') {
             resume_from = abs + gt + 1;
             continue;
         }
         let cs = gt + 1;
-        let Some(end) = rest[cs..].find("</Data>") else { continue };
+        let Some(end) = rest[cs..].find("</Data>") else {
+            continue;
+        };
         let value = rest[cs..cs + end].trim().to_string();
         let key = name.unwrap_or_else(|| {
             let k = format!("_{}", anon);
@@ -125,11 +143,16 @@ pub fn xml_data(xml: &str) -> Vec<(String, String)> {
 /// Returns `None` if the minimum required fields (EventID, SystemTime) are absent.
 pub fn parse_event(xml: &str) -> Option<EventRecord> {
     let event_id: u32 = xml_elem(xml, "EventID")?.parse().ok()?;
-    let time_str      = xml_attr(xml, "TimeCreated", "SystemTime")?;
-    let time_created  = Timestamp::from_rfc3339(&time_str)?;
-    let provider      = xml_attr(xml, "Provider", "Name").unwrap_or_default();
-    let data          = xml_data(xml);
-    Some(EventRecord { event_id, time_created, provider, data })
+    let time_str = xml_attr(xml, "TimeCreated", "SystemTime")?;
+    let time_created = Timestamp::from_rfc3339(&time_str)?;
+    let provider = xml_attr(xml, "Provider", "Name").unwrap_or_default();
+    let data = xml_data(xml);
+    Some(EventRecord {
+        event_id,
+        time_created,
+        provider,
+        data,
+    })
 }
 
 #[cfg(test)]
@@ -164,7 +187,11 @@ mod tests {
     #[test]
     fn attr_double_quote() {
         assert_eq!(
-            xml_attr(r#"<TimeCreated SystemTime="2026-06-29T10:00:00Z"/>"#, "TimeCreated", "SystemTime"),
+            xml_attr(
+                r#"<TimeCreated SystemTime="2026-06-29T10:00:00Z"/>"#,
+                "TimeCreated",
+                "SystemTime"
+            ),
             Some("2026-06-29T10:00:00Z".to_string())
         );
     }
@@ -206,12 +233,18 @@ mod tests {
 
     #[test]
     fn elem_basic() {
-        assert_eq!(xml_elem("<EventID>41</EventID>", "EventID"), Some("41".to_string()));
+        assert_eq!(
+            xml_elem("<EventID>41</EventID>", "EventID"),
+            Some("41".to_string())
+        );
     }
 
     #[test]
     fn elem_trims_whitespace() {
-        assert_eq!(xml_elem("<EventID>  41  </EventID>", "EventID"), Some("41".to_string()));
+        assert_eq!(
+            xml_elem("<EventID>  41  </EventID>", "EventID"),
+            Some("41".to_string())
+        );
     }
 
     #[test]
@@ -298,7 +331,10 @@ mod tests {
         // <DataProvider> must not be matched as <Data>.
         let xml = r#"<DataProvider Name="wrong"/><Data Name="right">val</Data>"#;
         let m = xml_data(xml);
-        assert!(dget(&m, "wrong").is_none(), "longer tag name must not be matched");
+        assert!(
+            dget(&m, "wrong").is_none(),
+            "longer tag name must not be matched"
+        );
         assert_eq!(dget(&m, "right"), Some("val"));
     }
 
@@ -316,7 +352,8 @@ mod tests {
 
     #[test]
     fn parse_event_missing_event_id() {
-        let xml = r#"<Event><System><TimeCreated SystemTime='2026-06-29T10:00:00Z'/></System></Event>"#;
+        let xml =
+            r#"<Event><System><TimeCreated SystemTime='2026-06-29T10:00:00Z'/></System></Event>"#;
         assert!(parse_event(xml).is_none());
     }
 

@@ -10,13 +10,13 @@ use whyreboot::types::{AudioPowerInfo, BootCycle};
 
 pub const WIN_W: i32 = 860;
 pub const WIN_H: i32 = 500;
-pub const LV_W:  i32 = 252;   // left-pane ListView width
-pub const PAD:   i32 = 4;     // gap between panes / edge margins
+pub const LV_W: i32 = 252; // left-pane ListView width
+pub const PAD: i32 = 4; // gap between panes / edge margins
 
 // ── Analysis data ─────────────────────────────────────────────────────────────
 
-pub static CYCLES: OnceLock<Vec<BootCycle>>      = OnceLock::new();
-pub static AUDIO:  OnceLock<Vec<AudioPowerInfo>> = OnceLock::new();
+pub static CYCLES: OnceLock<Vec<BootCycle>> = OnceLock::new();
+pub static AUDIO: OnceLock<Vec<AudioPowerInfo>> = OnceLock::new();
 
 // ── Window handles ────────────────────────────────────────────────────────────
 // Raw HWNDs stored as `isize` since HWND isn't Send/Sync; these are only ever

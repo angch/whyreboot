@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Boot cycle analysis: stop code tables, event classification, and WER/minidump annotation.
 
-use std::path::PathBuf;
 use crate::timestamp::Timestamp;
 use crate::types::{BootCycle, Cause, EventRecord, WerRecord};
+use std::path::PathBuf;
 
 // ── Lookup tables ─────────────────────────────────────────────────────────────
 
@@ -41,7 +41,10 @@ const STOP_CODES: &[(u64, &str)] = &[
     (0x000000C5, "DRIVER_CORRUPTED_EXPOOL"),
     (0x000000CA, "PNP_DETECTED_FATAL_ERROR"),
     (0x000000D1, "DRIVER_IRQL_NOT_LESS_OR_EQUAL"),
-    (0x000000D4, "SYSTEM_SCAN_AT_RAISED_IRQL_CAUGHT_IMPROPER_DRIVER_UNLOAD"),
+    (
+        0x000000D4,
+        "SYSTEM_SCAN_AT_RAISED_IRQL_CAUGHT_IMPROPER_DRIVER_UNLOAD",
+    ),
     (0x000000EA, "THREAD_STUCK_IN_DEVICE_DRIVER"),
     (0x000000ED, "UNMOUNTABLE_BOOT_VOLUME"),
     (0x000000EF, "CRITICAL_PROCESS_DIED"),
@@ -91,7 +94,10 @@ pub fn stop_name(code: u64) -> &'static str {
 
 const REASON_CODES: &[(&str, &str)] = &[
     ("80020001", "OS: Upgrade/Reinstall (planned)"),
-    ("80020002", "OS: Reconfiguration (planned) — typically Windows Update"),
+    (
+        "80020002",
+        "OS: Reconfiguration (planned) — typically Windows Update",
+    ),
     ("80020003", "Application: Maintenance (planned)"),
     ("80020004", "Application: Installation (planned)"),
     ("80020010", "Hardware: Maintenance (planned)"),
@@ -151,15 +157,19 @@ pub fn module_from_bucket(bucket: &str) -> Option<String> {
     let lower = bucket.to_lowercase();
     if let Some(bang) = bucket.find('!') {
         let before = &bucket[..bang];
-        let start  = before.rfind('_').map(|i| i + 1).unwrap_or(0);
+        let start = before.rfind('_').map(|i| i + 1).unwrap_or(0);
         let m = &before[start..];
-        if !m.is_empty() { return Some(m.to_string()); }
+        if !m.is_empty() {
+            return Some(m.to_string());
+        }
     }
     if let Some(pos) = lower.find("_image_") {
         let rest = &bucket[pos + 7..];
-        let end  = rest.find('_').unwrap_or(rest.len());
+        let end = rest.find('_').unwrap_or(rest.len());
         let m = &rest[..end];
-        if !m.is_empty() { return Some(m.to_string()); }
+        if !m.is_empty() {
+            return Some(m.to_string());
+        }
     }
     for token in bucket.split('_') {
         let tl = token.to_lowercase();
@@ -174,11 +184,11 @@ pub fn module_from_bucket(bucket: &str) -> Option<String> {
 
 /// Intermediate result from `analyze_slice`, before WER/minidump annotation.
 pub struct CycleAnalysis {
-    pub cause:         Cause,
-    pub confidence:    u8,
+    pub cause: Cause,
+    pub confidence: u8,
     pub shutdown_time: Option<Timestamp>,
-    pub evidence:      Vec<String>,
-    pub timeline:      Vec<(Timestamp, String)>,
+    pub evidence: Vec<String>,
+    pub timeline: Vec<(Timestamp, String)>,
 }
 
 // ── Event classifiers ─────────────────────────────────────────────────────────
@@ -186,7 +196,11 @@ pub struct CycleAnalysis {
 /// Builds the evidence bullet list for a BSOD. For stop code 0x9F,
 /// adds a human-readable decode of Parameter 1 (the failure mode).
 fn bsod_evidence(stop_code: u64, params: [u64; 4]) -> Vec<String> {
-    let mut ev = vec![format!("BSOD stop code: 0x{:08X} — {}", stop_code, stop_name(stop_code))];
+    let mut ev = vec![format!(
+        "BSOD stop code: 0x{:08X} — {}",
+        stop_code,
+        stop_name(stop_code)
+    )];
     if stop_code == 0x9F {
         let meaning = match params[0] {
             1 => " (device object failed WaitForSingleObject during power transition)",
@@ -218,17 +232,30 @@ fn classify_event41(ev: &EventRecord, unexpected_flag: bool) -> (Cause, u8, Vec<
         ev.get("BugcheckParameter3").and_then(hex_u64).unwrap_or(0),
         ev.get("BugcheckParameter4").and_then(hex_u64).unwrap_or(0),
     ];
-    let power_btn = ev.get("PowerButtonTimestamp")
+    let power_btn = ev
+        .get("PowerButtonTimestamp")
         .and_then(hex_u64)
         .map(|v| v != 0)
         .unwrap_or(false);
 
     if stop_code != 0 {
-        let name     = stop_name(stop_code);
+        let name = stop_name(stop_code);
         let evidence = bsod_evidence(stop_code, params);
-        (Cause::BlueScreen { stop_code, stop_name: name, params }, 95, evidence)
+        (
+            Cause::BlueScreen {
+                stop_code,
+                stop_name: name,
+                params,
+            },
+            95,
+            evidence,
+        )
     } else if power_btn {
-        (Cause::ForcedPowerOff, 82, vec!["Power button was held down (hard power-off)".into()])
+        (
+            Cause::ForcedPowerOff,
+            82,
+            vec!["Power button was held down (hard power-off)".into()],
+        )
     } else {
         let mut evidence = vec!["Event 41: system did not shut down cleanly".into()];
         if unexpected_flag {
@@ -242,35 +269,39 @@ fn classify_event41(ev: &EventRecord, unexpected_flag: bool) -> (Cause, u8, Vec<
 /// SystemProcess, or UserAction based on process name, user, and reason code.
 /// Returns `(cause, confidence, evidence, timeline_message)`.
 fn classify_event1074(ev: &EventRecord) -> (Cause, u8, Vec<String>, String) {
-    let process     = ev.get("param1").unwrap_or_default().to_owned();
+    let process = ev.get("param1").unwrap_or_default().to_owned();
     // param3 is the human-readable reason text (e.g. "Operating System: Upgrade
     // (Planned)"); the initiating user is param7. (Confirmed against a live
     // Event 1074 from User32 — the two are easy to mix up since both are strings.)
-    let user        = ev.get("param7").unwrap_or_default().to_owned();
+    let user = ev.get("param7").unwrap_or_default().to_owned();
     let reason_code = ev.get("param4").unwrap_or_default().to_owned();
-    let action_raw  = ev.get("param5").unwrap_or_default().to_owned();
-    let comment     = ev.get("param6").unwrap_or_default().to_owned();
+    let action_raw = ev.get("param5").unwrap_or_default().to_owned();
+    let comment = ev.get("param6").unwrap_or_default().to_owned();
 
     let action = match action_raw.as_str() {
-        "restart"              => "Restart",
-        "power off"            => "Shutdown",
-        s if !s.is_empty()     => s,
-        _                      => "Shutdown/Restart",
+        "restart" => "Restart",
+        "power off" => "Shutdown",
+        s if !s.is_empty() => s,
+        _ => "Shutdown/Restart",
     }
     .to_string();
 
     let mut evidence = vec![format!("Process: {}", process)];
-    if !user.is_empty() { evidence.push(format!("User: {}", user)); }
+    if !user.is_empty() {
+        evidence.push(format!("User: {}", user));
+    }
     match decode_reason(&reason_code) {
         Some(desc) => evidence.push(format!("Reason: {} ({})", reason_code, desc)),
         None if !reason_code.is_empty() => evidence.push(format!("Reason code: {}", reason_code)),
         _ => {}
     }
-    if !comment.is_empty() { evidence.push(format!("Comment: \"{}\"", comment)); }
+    if !comment.is_empty() {
+        evidence.push(format!("Comment: \"{}\"", comment));
+    }
 
     let timeline_msg = format!("{} initiated by {} (Event 1074)", action, process);
 
-    let pl        = process.to_lowercase();
+    let pl = process.to_lowercase();
     // Normalize the reason code to bare hex (strip "0x"/"0X" if present) before
     // comparing, since Event 1074 param4 may arrive with or without the prefix.
     let rc_norm = reason_code.trim().to_lowercase();
@@ -287,11 +318,32 @@ fn classify_event1074(ev: &EventRecord) -> (Cause, u8, Vec<String>, String) {
     let is_system = ul.contains("system") || ul.contains("authority");
 
     let (cause, confidence) = if is_update {
-        (Cause::WindowsUpdate { process, old_version: None, new_version: None }, 92)
+        (
+            Cause::WindowsUpdate {
+                process,
+                old_version: None,
+                new_version: None,
+            },
+            92,
+        )
     } else if is_system {
-        (Cause::SystemProcess { process, reason: reason_code, action }, 87)
+        (
+            Cause::SystemProcess {
+                process,
+                reason: reason_code,
+                action,
+            },
+            87,
+        )
     } else {
-        (Cause::UserAction { user, action, comment }, 90)
+        (
+            Cause::UserAction {
+                user,
+                action,
+                comment,
+            },
+            90,
+        )
     };
 
     (cause, confidence, evidence, timeline_msg)
@@ -307,7 +359,7 @@ fn classify_event1074(ev: &EventRecord) -> (Cause, u8, Vec<String>, String) {
 /// "Service Pack 0" in `_1`) yields `None` rather than a bogus "10.0.Service Pack 0".
 fn os_version_from_6009(ev: &EventRecord) -> Option<String> {
     let major_minor = ev.get("_0")?.trim_matches('.');
-    let build       = ev.get("_1")?.trim();
+    let build = ev.get("_1")?.trim();
     if build.is_empty() || !build.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
@@ -316,7 +368,6 @@ fn os_version_from_6009(ev: &EventRecord) -> Option<String> {
     let minor: u32 = parts.next().unwrap_or("0").parse().unwrap_or(0);
     Some(format!("{major}.{minor}.{build}"))
 }
-
 
 // ── Core analysis ─────────────────────────────────────────────────────────────
 
@@ -327,13 +378,13 @@ fn os_version_from_6009(ev: &EventRecord) -> Option<String> {
 pub fn analyze_slice(
     boot_time: Option<Timestamp>,
     post_boot: &[EventRecord],
-    pre_boot:  &[EventRecord],
+    pre_boot: &[EventRecord],
 ) -> CycleAnalysis {
-    let e41             = post_boot.iter().find(|e| e.event_id == 41);
+    let e41 = post_boot.iter().find(|e| e.event_id == 41);
     let unexpected_flag = post_boot.iter().any(|e| e.event_id == 6008);
-    let e1074           = pre_boot.iter().find(|e| e.event_id == 1074);
-    let e13             = pre_boot.iter().find(|e| e.event_id == 13);
-    let e6006           = pre_boot.iter().find(|e| e.event_id == 6006);
+    let e1074 = pre_boot.iter().find(|e| e.event_id == 1074);
+    let e13 = pre_boot.iter().find(|e| e.event_id == 13);
+    let e6006 = pre_boot.iter().find(|e| e.event_id == 6006);
 
     let shutdown_time = if e41.is_none() {
         e1074.or(e13).or(e6006).map(|e| e.time_created)
@@ -359,10 +410,15 @@ pub fn analyze_slice(
         // which scans the full (unsliced) event list — see its doc comment for why.
         (cause, confidence, evidence)
     } else if unexpected_flag {
-        (Cause::UnexpectedShutdown, 60, vec![
-            "Event 6008: Windows logged that the previous shutdown was unexpected".into(),
-            "No Kernel-Power Event 41 found — crash may have occurred before event was written".into(),
-        ])
+        (
+            Cause::UnexpectedShutdown,
+            60,
+            vec![
+                "Event 6008: Windows logged that the previous shutdown was unexpected".into(),
+                "No Kernel-Power Event 41 found — crash may have occurred before event was written"
+                    .into(),
+            ],
+        )
     } else if e13.is_some() || e6006.is_some() {
         let mut evidence = Vec::new();
         if let Some(e) = e13 {
@@ -370,15 +426,28 @@ pub fn analyze_slice(
             evidence.push("Event 13: Clean OS shutdown recorded".into());
         }
         if let Some(e) = e6006 {
-            timeline.push((e.time_created, "Event log stopped cleanly (Event 6006)".into()));
+            timeline.push((
+                e.time_created,
+                "Event log stopped cleanly (Event 6006)".into(),
+            ));
             evidence.push("Event 6006: Event log stopped cleanly".into());
         }
         (Cause::NormalShutdown, 60, evidence)
     } else {
-        (Cause::Undetermined, 10, vec!["No conclusive shutdown events found in log window.".into()])
+        (
+            Cause::Undetermined,
+            10,
+            vec!["No conclusive shutdown events found in log window.".into()],
+        )
     };
 
-    CycleAnalysis { cause, confidence, shutdown_time, evidence, timeline }
+    CycleAnalysis {
+        cause,
+        confidence,
+        shutdown_time,
+        evidence,
+        timeline,
+    }
 }
 
 // ── Boot cycle extraction ─────────────────────────────────────────────────────
@@ -393,7 +462,9 @@ pub fn collect_boot_indices(events: &[EventRecord]) -> Vec<usize> {
         .filter(|(_, e)| e.event_id == 12 && e.provider.contains("General"))
         .map(|(i, _)| i)
         .collect();
-    if !general.is_empty() { return general; }
+    if !general.is_empty() {
+        return general;
+    }
     events
         .iter()
         .enumerate()
@@ -408,52 +479,60 @@ pub fn collect_boot_indices(events: &[EventRecord]) -> Vec<usize> {
 /// After initial classification, annotates each cycle with WER module and minidump data.
 pub fn extract_boot_cycles(
     events: &[EventRecord],
-    wer:    &[WerRecord],
-    dumps:  &[(Timestamp, PathBuf)],
-    limit:  usize,
+    wer: &[WerRecord],
+    dumps: &[(Timestamp, PathBuf)],
+    limit: usize,
 ) -> Vec<BootCycle> {
     let boot_idxs = collect_boot_indices(events);
 
     if boot_idxs.is_empty() {
         let a = analyze_slice(None, &[], events);
         return vec![BootCycle {
-            index:          0,
-            boot_time:      None,
-            shutdown_time:  a.shutdown_time,
-            cause:          a.cause,
-            confidence:     a.confidence,
-            evidence:       a.evidence,
-            timeline:       a.timeline,
-            wer_module:     None,
-            minidumps:      Vec::new(),
+            index: 0,
+            boot_time: None,
+            shutdown_time: a.shutdown_time,
+            cause: a.cause,
+            confidence: a.confidence,
+            evidence: a.evidence,
+            timeline: a.timeline,
+            wer_module: None,
+            minidumps: Vec::new(),
             display_events: events.iter().take(20).cloned().collect(),
         }];
     }
 
-    let n = if limit == 0 { boot_idxs.len() } else { limit.min(boot_idxs.len()) };
+    let n = if limit == 0 {
+        boot_idxs.len()
+    } else {
+        limit.min(boot_idxs.len())
+    };
 
     let mut cycles: Vec<BootCycle> = (0..n)
         .map(|idx| {
-            let bi         = boot_idxs[idx];
-            let boot_time  = Some(events[bi].time_created);
+            let bi = boot_idxs[idx];
+            let boot_time = Some(events[bi].time_created);
             let post_start = if idx == 0 { 0 } else { boot_idxs[idx - 1] + 1 };
-            let pre_end    = boot_idxs.get(idx + 1).copied().unwrap_or(events.len());
-            let post_boot  = &events[post_start..bi];
-            let pre_boot   = &events[bi + 1..pre_end];
+            let pre_end = boot_idxs.get(idx + 1).copied().unwrap_or(events.len());
+            let post_boot = &events[post_start..bi];
+            let pre_boot = &events[bi + 1..pre_end];
 
             let a = analyze_slice(boot_time, post_boot, pre_boot);
-            let display_events = events[post_start..pre_end].iter().take(20).cloned().collect();
+            let display_events = events[post_start..pre_end]
+                .iter()
+                .take(20)
+                .cloned()
+                .collect();
 
             BootCycle {
-                index:          idx,
+                index: idx,
                 boot_time,
-                shutdown_time:  a.shutdown_time,
-                cause:          a.cause,
-                confidence:     a.confidence,
-                evidence:       a.evidence,
-                timeline:       a.timeline,
-                wer_module:     None,
-                minidumps:      Vec::new(),
+                shutdown_time: a.shutdown_time,
+                cause: a.cause,
+                confidence: a.confidence,
+                evidence: a.evidence,
+                timeline: a.timeline,
+                wer_module: None,
+                minidumps: Vec::new(),
                 display_events,
             }
         })
@@ -487,15 +566,16 @@ pub fn extract_boot_cycles(
 /// parsing only the single extreme record) means one malformed 6009 doesn't
 /// discard a perfectly good neighbor in range.
 fn nearest_os_version(
-    events:        &[EventRecord],
-    lo:            Option<Timestamp>,
-    hi:            Option<Timestamp>,
+    events: &[EventRecord],
+    lo: Option<Timestamp>,
+    hi: Option<Timestamp>,
     prefer_latest: bool,
 ) -> Option<String> {
-    let mut in_range: Vec<&EventRecord> = events.iter()
+    let mut in_range: Vec<&EventRecord> = events
+        .iter()
         .filter(|e| e.event_id == 6009)
         .filter(|e| lo.is_none_or(|l| e.time_created >= l))
-        .filter(|e| hi.is_none_or(|h| e.time_created <  h))
+        .filter(|e| hi.is_none_or(|h| e.time_created < h))
         .collect();
     in_range.sort_by_key(|e| e.time_created);
     if prefer_latest {
@@ -520,12 +600,19 @@ fn nearest_os_version(
 /// here does **not** prove no upgrade occurred — it only means the build hadn't
 /// changed yet at this boot. `cause_detail` is careful not to overclaim on that.
 fn annotate_os_version(
-    cycle:     &mut BootCycle,
-    events:    &[EventRecord],
+    cycle: &mut BootCycle,
+    events: &[EventRecord],
     prev_boot: Option<Timestamp>,
     next_boot: Option<Timestamp>,
 ) {
-    let Cause::WindowsUpdate { old_version, new_version, .. } = &mut cycle.cause else { return };
+    let Cause::WindowsUpdate {
+        old_version,
+        new_version,
+        ..
+    } = &mut cycle.cause
+    else {
+        return;
+    };
     let Some(bt) = cycle.boot_time else { return };
     *old_version = nearest_os_version(events, prev_boot, Some(bt), true);
     *new_version = nearest_os_version(events, Some(bt), next_boot, false);
@@ -535,14 +622,15 @@ fn annotate_os_version(
 /// `[lo, hi)` (either bound `None` = unbounded on that side), newest first.
 fn events_in_window(
     events: &[EventRecord],
-    id:     u32,
-    lo:     Option<Timestamp>,
-    hi:     Option<Timestamp>,
+    id: u32,
+    lo: Option<Timestamp>,
+    hi: Option<Timestamp>,
 ) -> Vec<&EventRecord> {
-    let mut v: Vec<&EventRecord> = events.iter()
+    let mut v: Vec<&EventRecord> = events
+        .iter()
         .filter(|e| e.event_id == id)
         .filter(|e| lo.is_none_or(|l| e.time_created >= l))
-        .filter(|e| hi.is_none_or(|h| e.time_created <  h))
+        .filter(|e| hi.is_none_or(|h| e.time_created < h))
         .collect();
     v.sort_by_key(|e| std::cmp::Reverse(e.time_created));
     v
@@ -563,12 +651,14 @@ fn is_defender_intelligence(title: &str) -> bool {
 /// updates (the ones that actually reboot) are listed ahead of Defender definition
 /// updates; up to three distinct titles are shown.
 fn annotate_update_installs(
-    cycle:     &mut BootCycle,
-    events:    &[EventRecord],
+    cycle: &mut BootCycle,
+    events: &[EventRecord],
     prev_boot: Option<Timestamp>,
     next_boot: Option<Timestamp>,
 ) {
-    if !matches!(cycle.cause, Cause::WindowsUpdate { .. }) { return; }
+    if !matches!(cycle.cause, Cause::WindowsUpdate { .. }) {
+        return;
+    }
     let Some(bt) = cycle.boot_time else { return };
     // The "Installation Successful" record can land in the session that was shut
     // down (staged) or just after this boot (finalized), so scan the shut-down
@@ -580,22 +670,36 @@ fn annotate_update_installs(
     let grace_end = bt.add_secs(POST_BOOT_GRACE_SECS);
     let upper = Some(next_boot.map_or(grace_end, |nb| nb.min(grace_end)));
     let found = events_in_window(events, 19, prev_boot, upper);
-    if found.is_empty() { return; }
+    if found.is_empty() {
+        return;
+    }
 
     let mut titles: Vec<&str> = Vec::new();
     // Reboot-relevant updates first.
     for e in found.iter() {
-        let Some(t) = e.get("updateTitle") else { continue };
-        if is_defender_intelligence(t) { continue; }
-        if !titles.iter().any(|x| *x == t) { titles.push(t); }
-        if titles.len() >= 3 { break; }
+        let Some(t) = e.get("updateTitle") else {
+            continue;
+        };
+        if is_defender_intelligence(t) {
+            continue;
+        }
+        if !titles.iter().any(|x| *x == t) {
+            titles.push(t);
+        }
+        if titles.len() >= 3 {
+            break;
+        }
     }
     // Fall back to the newest update of any kind if nothing else matched.
     if titles.is_empty() {
-        if let Some(t) = found[0].get("updateTitle") { titles.push(t); }
+        if let Some(t) = found[0].get("updateTitle") {
+            titles.push(t);
+        }
     }
     for t in titles {
-        cycle.evidence.push(format!("Update installed (Event 19): {}", t));
+        cycle
+            .evidence
+            .push(format!("Update installed (Event 19): {}", t));
     }
 }
 
@@ -609,22 +713,26 @@ fn annotate_update_installs(
 /// session): without a lower bound there is no way to tell "installed just before
 /// the crash" from ancient history, so the annotation is skipped rather than guess.
 fn annotate_service_installs(
-    cycle:         &mut BootCycle,
-    events:        &[EventRecord],
+    cycle: &mut BootCycle,
+    events: &[EventRecord],
     session_start: Option<Timestamp>,
-    boot_time:     Option<Timestamp>,
+    boot_time: Option<Timestamp>,
 ) {
-    if !matches!(cycle.cause, Cause::BlueScreen { .. }) { return; }
+    if !matches!(cycle.cause, Cause::BlueScreen { .. }) {
+        return;
+    }
     let Some(lo) = session_start else { return };
     let found = events_in_window(events, 7045, Some(lo), boot_time);
-    if found.is_empty() { return; }
+    if found.is_empty() {
+        return;
+    }
 
     for e in found.iter().take(3) {
-        let name  = e.get("ServiceName").unwrap_or("(unnamed service)");
+        let name = e.get("ServiceName").unwrap_or("(unnamed service)");
         let image = e.get("ImagePath").unwrap_or("").to_lowercase();
         let stype = e.get("ServiceType").unwrap_or("").to_lowercase();
-        let is_driver = stype.contains("driver") || stype.contains("kernel")
-            || image.contains(".sys");
+        let is_driver =
+            stype.contains("driver") || stype.contains("kernel") || image.contains(".sys");
         let kind = if is_driver { "Driver" } else { "Service" };
         cycle.evidence.push(format!(
             "{} installed during the session that crashed — possible cause (Event 7045): {}",
@@ -642,15 +750,15 @@ fn annotate_service_installs(
 /// Runs both annotation passes (minidumps then WER module) over all cycles.
 fn annotate_with_wer_and_dumps(
     cycles: &mut [BootCycle],
-    wer:    &[WerRecord],
-    dumps:  &[(Timestamp, PathBuf)],
+    wer: &[WerRecord],
+    dumps: &[(Timestamp, PathBuf)],
 ) {
     let boot_times: Vec<Option<Timestamp>> = cycles.iter().map(|c| c.boot_time).collect();
 
     for idx in 0..cycles.len() {
-        let boot_time    = boot_times[idx];
+        let boot_time = boot_times[idx];
         let session_start = boot_times.get(idx + 1).copied().flatten();
-        let wer_end       = if idx > 0 { boot_times[idx - 1] } else { None };
+        let wer_end = if idx > 0 { boot_times[idx - 1] } else { None };
 
         annotate_minidumps(&mut cycles[idx], boot_time, session_start, dumps);
         annotate_wer_module(&mut cycles[idx], boot_time, wer_end, wer);
@@ -661,15 +769,19 @@ fn annotate_with_wer_and_dumps(
 /// The window is `[session_start, boot_time + 10 min]`; the upper bound
 /// accommodates WER processing delay after the recovery boot.
 fn annotate_minidumps(
-    cycle:         &mut BootCycle,
-    boot_time:     Option<Timestamp>,
+    cycle: &mut BootCycle,
+    boot_time: Option<Timestamp>,
     session_start: Option<Timestamp>,
-    dumps:         &[(Timestamp, PathBuf)],
+    dumps: &[(Timestamp, PathBuf)],
 ) {
     let lower = session_start.unwrap_or_else(|| {
-        boot_time.map(|t| t.add_secs(-30 * 86_400)).unwrap_or_else(Timestamp::now)
+        boot_time
+            .map(|t| t.add_secs(-30 * 86_400))
+            .unwrap_or_else(Timestamp::now)
     });
-    let upper = boot_time.map(|t| t.add_secs(10 * 60)).unwrap_or_else(Timestamp::now);
+    let upper = boot_time
+        .map(|t| t.add_secs(10 * 60))
+        .unwrap_or_else(Timestamp::now);
     cycle.minidumps = dumps
         .iter()
         .filter(|(t, _)| *t >= lower && *t <= upper)
@@ -682,22 +794,27 @@ fn annotate_minidumps(
 /// where `wer_end` is the start of the next boot (or now for the most recent cycle).
 /// Also fills `minidumps` from `WerRecord.minidump_path` if the filesystem scan found nothing.
 fn annotate_wer_module(
-    cycle:     &mut BootCycle,
+    cycle: &mut BootCycle,
     boot_time: Option<Timestamp>,
-    wer_end:   Option<Timestamp>,
-    wer:       &[WerRecord],
+    wer_end: Option<Timestamp>,
+    wer: &[WerRecord],
 ) {
-    let Cause::BlueScreen { stop_code, .. } = &cycle.cause else { return };
-    let sc    = *stop_code;
-    let bt    = boot_time.unwrap_or_else(Timestamp::now);
+    let Cause::BlueScreen { stop_code, .. } = &cycle.cause else {
+        return;
+    };
+    let sc = *stop_code;
+    let bt = boot_time.unwrap_or_else(Timestamp::now);
     let upper = wer_end.unwrap_or_else(Timestamp::now);
 
-    let Some(wr) = wer.iter().find(|w| w.p1 == sc && w.time_created >= bt && w.time_created <= upper)
-    else { return };
+    let Some(wr) = wer
+        .iter()
+        .find(|w| w.p1 == sc && w.time_created >= bt && w.time_created <= upper)
+    else {
+        return;
+    };
 
-    cycle.wer_module = module_from_bucket(&wr.bucket_id).or_else(|| {
-        (!wr.bucket_id.is_empty()).then(|| format!("(bucket: {})", wr.bucket_id))
-    });
+    cycle.wer_module = module_from_bucket(&wr.bucket_id)
+        .or_else(|| (!wr.bucket_id.is_empty()).then(|| format!("(bucket: {})", wr.bucket_id)));
 
     if let (true, Some(p)) = (cycle.minidumps.is_empty(), &wr.minidump_path) {
         cycle.minidumps = vec![(wr.time_created, p.clone())];
@@ -707,12 +824,10 @@ fn annotate_wer_module(
 #[cfg(test)]
 mod tests {
     use super::{
-        hex_u64, stop_name, decode_reason, module_from_bucket,
-        bsod_evidence, classify_event41, classify_event1074,
-        analyze_slice, collect_boot_indices, extract_boot_cycles,
-        annotate_os_version, os_version_from_6009,
-        annotate_update_installs, annotate_service_installs,
-        events_in_window, is_defender_intelligence,
+        analyze_slice, annotate_os_version, annotate_service_installs, annotate_update_installs,
+        bsod_evidence, classify_event41, classify_event1074, collect_boot_indices, decode_reason,
+        events_in_window, extract_boot_cycles, hex_u64, is_defender_intelligence,
+        module_from_bucket, os_version_from_6009, stop_name,
     };
     use crate::timestamp::Timestamp;
     use crate::types::{BootCycle, Cause, EventRecord};
@@ -721,12 +836,20 @@ mod tests {
         make_event_at(event_id, provider, Timestamp::now(), data)
     }
 
-    fn make_event_at(event_id: u32, provider: &str, time: Timestamp, data: &[(&str, &str)]) -> EventRecord {
+    fn make_event_at(
+        event_id: u32,
+        provider: &str,
+        time: Timestamp,
+        data: &[(&str, &str)],
+    ) -> EventRecord {
         EventRecord {
             event_id,
             time_created: time,
             provider: provider.to_string(),
-            data: data.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            data: data
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
         }
     }
 
@@ -767,17 +890,17 @@ mod tests {
 
     #[test]
     fn stop_name_known_codes() {
-        assert_eq!(stop_name(0x9F),  "DRIVER_POWER_STATE_FAILURE");
+        assert_eq!(stop_name(0x9F), "DRIVER_POWER_STATE_FAILURE");
         assert_eq!(stop_name(0x19C), "WIN32K_POWER_WATCHDOG_TIMEOUT");
-        assert_eq!(stop_name(0xFE),  "BUGCODE_USB_DRIVER");
+        assert_eq!(stop_name(0xFE), "BUGCODE_USB_DRIVER");
         assert_eq!(stop_name(0x144), "BUGCODE_USB3_DRIVER");
-        assert_eq!(stop_name(0x50),  "PAGE_FAULT_IN_NONPAGED_AREA");
+        assert_eq!(stop_name(0x50), "PAGE_FAULT_IN_NONPAGED_AREA");
     }
 
     #[test]
     fn stop_name_unknown() {
         assert_eq!(stop_name(0xDEADBEEF), "(unknown)");
-        assert_eq!(stop_name(0),          "(unknown)");
+        assert_eq!(stop_name(0), "(unknown)");
     }
 
     // ── decode_reason ─────────────────────────────────────────────────────────
@@ -835,13 +958,22 @@ mod tests {
     #[test]
     fn bucket_sys_token_fallback() {
         // Priority 3: token ending in .sys
-        assert_eq!(module_from_bucket("0x50_ntoskrnl.exe"), Some("ntoskrnl.exe".to_string()));
-        assert_eq!(module_from_bucket("CRASH_win32k.sys"),  Some("win32k.sys".to_string()));
+        assert_eq!(
+            module_from_bucket("0x50_ntoskrnl.exe"),
+            Some("ntoskrnl.exe".to_string())
+        );
+        assert_eq!(
+            module_from_bucket("CRASH_win32k.sys"),
+            Some("win32k.sys".to_string())
+        );
     }
 
     #[test]
     fn bucket_dll_token_fallback() {
-        assert_eq!(module_from_bucket("0x1E_some_lib.dll"), Some("lib.dll".to_string()));
+        assert_eq!(
+            module_from_bucket("0x1E_some_lib.dll"),
+            Some("lib.dll".to_string())
+        );
     }
 
     #[test]
@@ -853,7 +985,10 @@ mod tests {
     #[test]
     fn bucket_bang_with_empty_module_falls_through() {
         // '_!function' → before='_', rfind('_')=0, m="" → falls through to .sys scan
-        assert_eq!(module_from_bucket("_!func_ntoskrnl.exe"), Some("ntoskrnl.exe".to_string()));
+        assert_eq!(
+            module_from_bucket("_!func_ntoskrnl.exe"),
+            Some("ntoskrnl.exe".to_string())
+        );
     }
 
     // ── bsod_evidence ─────────────────────────────────────────────────────────
@@ -879,9 +1014,15 @@ mod tests {
     #[test]
     fn bsod_evidence_nonzero_params_appear() {
         let ev = bsod_evidence(0x50, [0, 0xDEAD, 0, 0xBEEF]);
-        assert!(!ev.iter().any(|l| l.contains("Parameter 1")), "zero param 1 should be absent");
+        assert!(
+            !ev.iter().any(|l| l.contains("Parameter 1")),
+            "zero param 1 should be absent"
+        );
         assert!(ev.iter().any(|l| l.contains("Parameter 2")));
-        assert!(!ev.iter().any(|l| l.contains("Parameter 3")), "zero param 3 should be absent");
+        assert!(
+            !ev.iter().any(|l| l.contains("Parameter 3")),
+            "zero param 3 should be absent"
+        );
         assert!(ev.iter().any(|l| l.contains("Parameter 4")));
     }
 
@@ -889,14 +1030,18 @@ mod tests {
 
     #[test]
     fn ev41_bsod_stop_code_nonzero() {
-        let ev = make_event(41, "Microsoft-Windows-Kernel-Power", &[
-            ("BugcheckCode", "0x9f"),
-            ("BugcheckParameter1", "3"),
-            ("BugcheckParameter2", "0"),
-            ("BugcheckParameter3", "0"),
-            ("BugcheckParameter4", "0"),
-            ("PowerButtonTimestamp", "0"),
-        ]);
+        let ev = make_event(
+            41,
+            "Microsoft-Windows-Kernel-Power",
+            &[
+                ("BugcheckCode", "0x9f"),
+                ("BugcheckParameter1", "3"),
+                ("BugcheckParameter2", "0"),
+                ("BugcheckParameter3", "0"),
+                ("BugcheckParameter4", "0"),
+                ("PowerButtonTimestamp", "0"),
+            ],
+        );
         let (cause, conf, _) = classify_event41(&ev, false);
         assert!(matches!(cause, Cause::BlueScreen { stop_code, .. } if stop_code == 0x9F));
         assert_eq!(conf, 95);
@@ -904,10 +1049,11 @@ mod tests {
 
     #[test]
     fn ev41_forced_power_off() {
-        let ev = make_event(41, "Microsoft-Windows-Kernel-Power", &[
-            ("BugcheckCode", "0"),
-            ("PowerButtonTimestamp", "0x1234"),
-        ]);
+        let ev = make_event(
+            41,
+            "Microsoft-Windows-Kernel-Power",
+            &[("BugcheckCode", "0"), ("PowerButtonTimestamp", "0x1234")],
+        );
         let (cause, conf, _) = classify_event41(&ev, false);
         assert!(matches!(cause, Cause::ForcedPowerOff));
         assert_eq!(conf, 82);
@@ -915,10 +1061,11 @@ mod tests {
 
     #[test]
     fn ev41_unexpected_no_stop_code_no_power_btn() {
-        let ev = make_event(41, "Microsoft-Windows-Kernel-Power", &[
-            ("BugcheckCode", "0"),
-            ("PowerButtonTimestamp", "0"),
-        ]);
+        let ev = make_event(
+            41,
+            "Microsoft-Windows-Kernel-Power",
+            &[("BugcheckCode", "0"), ("PowerButtonTimestamp", "0")],
+        );
         let (cause, conf, _) = classify_event41(&ev, false);
         assert!(matches!(cause, Cause::UnexpectedShutdown));
         assert_eq!(conf, 75);
@@ -926,10 +1073,11 @@ mod tests {
 
     #[test]
     fn ev41_unexpected_with_6008_flag_adds_evidence() {
-        let ev = make_event(41, "Microsoft-Windows-Kernel-Power", &[
-            ("BugcheckCode", "0"),
-            ("PowerButtonTimestamp", "0"),
-        ]);
+        let ev = make_event(
+            41,
+            "Microsoft-Windows-Kernel-Power",
+            &[("BugcheckCode", "0"), ("PowerButtonTimestamp", "0")],
+        );
         let (cause, _, evidence) = classify_event41(&ev, true);
         assert!(matches!(cause, Cause::UnexpectedShutdown));
         assert!(evidence.iter().any(|e| e.contains("6008")));
@@ -939,13 +1087,17 @@ mod tests {
 
     #[test]
     fn ev1074_tiworker_is_windows_update() {
-        let ev = make_event(1074, "User32", &[
-            ("param1", r"C:\Windows\System32\TiWorker.exe"),
-            ("param7", r"NT AUTHORITY\SYSTEM"),
-            ("param4", "0x80020002"),
-            ("param5", "restart"),
-            ("param6", ""),
-        ]);
+        let ev = make_event(
+            1074,
+            "User32",
+            &[
+                ("param1", r"C:\Windows\System32\TiWorker.exe"),
+                ("param7", r"NT AUTHORITY\SYSTEM"),
+                ("param4", "0x80020002"),
+                ("param5", "restart"),
+                ("param6", ""),
+            ],
+        );
         let (cause, conf, _, _) = classify_event1074(&ev);
         assert!(matches!(cause, Cause::WindowsUpdate { .. }));
         assert!(conf >= 90);
@@ -954,13 +1106,17 @@ mod tests {
     #[test]
     fn ev1074_reason_code_0x80020002_alone_triggers_update() {
         // Even when the process is not TiWorker, the reason code overrides.
-        let ev = make_event(1074, "User32", &[
-            ("param1", "SomeProcess.exe"),
-            ("param7", r"DOMAIN\user"),
-            ("param4", "0x80020002"),
-            ("param5", "restart"),
-            ("param6", ""),
-        ]);
+        let ev = make_event(
+            1074,
+            "User32",
+            &[
+                ("param1", "SomeProcess.exe"),
+                ("param7", r"DOMAIN\user"),
+                ("param4", "0x80020002"),
+                ("param5", "restart"),
+                ("param6", ""),
+            ],
+        );
         let (cause, _, _, _) = classify_event1074(&ev);
         assert!(matches!(cause, Cause::WindowsUpdate { .. }));
     }
@@ -968,39 +1124,51 @@ mod tests {
     #[test]
     fn ev1074_reason_code_without_0x_prefix_triggers_update() {
         // param4 "80020002" (no 0x prefix) must still classify as WindowsUpdate.
-        let ev = make_event(1074, "User32", &[
-            ("param1", "SomeProcess.exe"),
-            ("param7", r"DOMAIN\user"),
-            ("param4", "80020002"),
-            ("param5", "restart"),
-            ("param6", ""),
-        ]);
+        let ev = make_event(
+            1074,
+            "User32",
+            &[
+                ("param1", "SomeProcess.exe"),
+                ("param7", r"DOMAIN\user"),
+                ("param4", "80020002"),
+                ("param5", "restart"),
+                ("param6", ""),
+            ],
+        );
         let (cause, _, _, _) = classify_event1074(&ev);
         assert!(matches!(cause, Cause::WindowsUpdate { .. }));
     }
 
     #[test]
     fn ev1074_system_user_is_system_process() {
-        let ev = make_event(1074, "User32", &[
-            ("param1", "svchost.exe"),
-            ("param7", r"NT AUTHORITY\SYSTEM"),
-            ("param4", "0x80040001"),
-            ("param5", "power off"),
-            ("param6", ""),
-        ]);
+        let ev = make_event(
+            1074,
+            "User32",
+            &[
+                ("param1", "svchost.exe"),
+                ("param7", r"NT AUTHORITY\SYSTEM"),
+                ("param4", "0x80040001"),
+                ("param5", "power off"),
+                ("param6", ""),
+            ],
+        );
         let (cause, _, _, _) = classify_event1074(&ev);
         assert!(matches!(cause, Cause::SystemProcess { .. }));
     }
 
     #[test]
     fn ev1074_normal_user_is_user_action() {
-        let ev = make_event(1074, "User32", &[
-            ("param1", "explorer.exe"),
-            ("param7", r"DESKTOP-ABC\angch"),
-            ("param4", "0x00040000"),
-            ("param5", "restart"),
-            ("param6", "testing reboot"),
-        ]);
+        let ev = make_event(
+            1074,
+            "User32",
+            &[
+                ("param1", "explorer.exe"),
+                ("param7", r"DESKTOP-ABC\angch"),
+                ("param4", "0x00040000"),
+                ("param5", "restart"),
+                ("param6", "testing reboot"),
+            ],
+        );
         let (cause, conf, evidence, _) = classify_event1074(&ev);
         assert!(matches!(cause, Cause::UserAction { .. }));
         assert!(conf >= 88);
@@ -1010,13 +1178,17 @@ mod tests {
 
     #[test]
     fn ev1074_action_normalised() {
-        let ev = make_event(1074, "User32", &[
-            ("param1", "p.exe"),
-            ("param7", r"DOMAIN\bob"),
-            ("param4", "0"),
-            ("param5", "power off"),
-            ("param6", ""),
-        ]);
+        let ev = make_event(
+            1074,
+            "User32",
+            &[
+                ("param1", "p.exe"),
+                ("param7", r"DOMAIN\bob"),
+                ("param4", "0"),
+                ("param5", "power off"),
+                ("param6", ""),
+            ],
+        );
         let (_, _, _, msg) = classify_event1074(&ev);
         assert!(msg.contains("Shutdown"));
     }
@@ -1025,14 +1197,18 @@ mod tests {
 
     #[test]
     fn analyze_bsod_from_event41() {
-        let post = [make_event(41, "Microsoft-Windows-Kernel-Power", &[
-            ("BugcheckCode", "0x9f"),
-            ("BugcheckParameter1", "3"),
-            ("BugcheckParameter2", "0"),
-            ("BugcheckParameter3", "0"),
-            ("BugcheckParameter4", "0"),
-            ("PowerButtonTimestamp", "0"),
-        ])];
+        let post = [make_event(
+            41,
+            "Microsoft-Windows-Kernel-Power",
+            &[
+                ("BugcheckCode", "0x9f"),
+                ("BugcheckParameter1", "3"),
+                ("BugcheckParameter2", "0"),
+                ("BugcheckParameter3", "0"),
+                ("BugcheckParameter4", "0"),
+                ("PowerButtonTimestamp", "0"),
+            ],
+        )];
         let a = analyze_slice(None, &post, &[]);
         assert!(matches!(a.cause, Cause::BlueScreen { stop_code, .. } if stop_code == 0x9F));
         assert_eq!(a.confidence, 95);
@@ -1041,33 +1217,48 @@ mod tests {
 
     #[test]
     fn analyze_forced_poweroff_from_event41() {
-        let post = [make_event(41, "Microsoft-Windows-Kernel-Power", &[
-            ("BugcheckCode", "0"),
-            ("PowerButtonTimestamp", "1"),
-        ])];
+        let post = [make_event(
+            41,
+            "Microsoft-Windows-Kernel-Power",
+            &[("BugcheckCode", "0"), ("PowerButtonTimestamp", "1")],
+        )];
         let a = analyze_slice(None, &post, &[]);
         assert!(matches!(a.cause, Cause::ForcedPowerOff));
     }
 
     #[test]
     fn analyze_windows_update_from_1074() {
-        let pre = [make_event(1074, "User32", &[
-            ("param1", "TiWorker.exe"),
-            ("param7", "SYSTEM"),
-            ("param4", "0x80020002"),
-            ("param5", "restart"),
-            ("param6", ""),
-        ])];
+        let pre = [make_event(
+            1074,
+            "User32",
+            &[
+                ("param1", "TiWorker.exe"),
+                ("param7", "SYSTEM"),
+                ("param4", "0x80020002"),
+                ("param5", "restart"),
+                ("param6", ""),
+            ],
+        )];
         let a = analyze_slice(None, &[], &pre);
         assert!(matches!(a.cause, Cause::WindowsUpdate { .. }));
-        assert!(a.shutdown_time.is_some(), "clean shutdowns record shutdown_time");
+        assert!(
+            a.shutdown_time.is_some(),
+            "clean shutdowns record shutdown_time"
+        );
     }
 
     fn make_cycle(cause: Cause, boot_time: Option<Timestamp>) -> BootCycle {
         BootCycle {
-            index: 0, boot_time, shutdown_time: None, cause, confidence: 0,
-            evidence: Vec::new(), timeline: Vec::new(), wer_module: None,
-            minidumps: Vec::new(), display_events: Vec::new(),
+            index: 0,
+            boot_time,
+            shutdown_time: None,
+            cause,
+            confidence: 0,
+            evidence: Vec::new(),
+            timeline: Vec::new(),
+            wer_module: None,
+            minidumps: Vec::new(),
+            display_events: Vec::new(),
         }
     }
 
@@ -1075,19 +1266,39 @@ mod tests {
     fn annotate_os_version_finds_versions_on_each_side_of_boot() {
         let boot_time = Timestamp(1_705_314_600);
         let events = [
-            make_event_at(6009, "EventLog", boot_time.add_secs(15),
-                &[("_0", "10.00."), ("_1", "26100")]),
-            make_event_at(6009, "EventLog", boot_time.add_secs(-90),
-                &[("_0", "10.00."), ("_1", "25900")]),
+            make_event_at(
+                6009,
+                "EventLog",
+                boot_time.add_secs(15),
+                &[("_0", "10.00."), ("_1", "26100")],
+            ),
+            make_event_at(
+                6009,
+                "EventLog",
+                boot_time.add_secs(-90),
+                &[("_0", "10.00."), ("_1", "25900")],
+            ),
         ];
         let mut cycle = make_cycle(
-            Cause::WindowsUpdate { process: "TrustedInstaller.exe".into(), old_version: None, new_version: None },
+            Cause::WindowsUpdate {
+                process: "TrustedInstaller.exe".into(),
+                old_version: None,
+                new_version: None,
+            },
             Some(boot_time),
         );
-        annotate_os_version(&mut cycle, &events,
-            Some(boot_time.add_secs(-300)), Some(boot_time.add_secs(300)));
+        annotate_os_version(
+            &mut cycle,
+            &events,
+            Some(boot_time.add_secs(-300)),
+            Some(boot_time.add_secs(300)),
+        );
         match cycle.cause {
-            Cause::WindowsUpdate { old_version, new_version, .. } => {
+            Cause::WindowsUpdate {
+                old_version,
+                new_version,
+                ..
+            } => {
                 assert_eq!(old_version.as_deref(), Some("10.0.25900"));
                 assert_eq!(new_version.as_deref(), Some("10.0.26100"));
             }
@@ -1105,19 +1316,39 @@ mod tests {
         // to confirm the lookup keys off TimeCreated, not array position.
         let boot_time = Timestamp(1_705_314_600);
         let events = [
-            make_event_at(6009, "EventLog", boot_time.add_secs(15),
-                &[("_0", "10.00."), ("_1", "26200")]),
-            make_event_at(6009, "EventLog", boot_time.add_secs(-120),
-                &[("_0", "10.00."), ("_1", "26100")]),
+            make_event_at(
+                6009,
+                "EventLog",
+                boot_time.add_secs(15),
+                &[("_0", "10.00."), ("_1", "26200")],
+            ),
+            make_event_at(
+                6009,
+                "EventLog",
+                boot_time.add_secs(-120),
+                &[("_0", "10.00."), ("_1", "26100")],
+            ),
         ];
         let mut cycle = make_cycle(
-            Cause::WindowsUpdate { process: "TrustedInstaller.exe".into(), old_version: None, new_version: None },
+            Cause::WindowsUpdate {
+                process: "TrustedInstaller.exe".into(),
+                old_version: None,
+                new_version: None,
+            },
             Some(boot_time),
         );
-        annotate_os_version(&mut cycle, &events,
-            Some(boot_time.add_secs(-300)), Some(boot_time.add_secs(300)));
+        annotate_os_version(
+            &mut cycle,
+            &events,
+            Some(boot_time.add_secs(-300)),
+            Some(boot_time.add_secs(300)),
+        );
         match cycle.cause {
-            Cause::WindowsUpdate { old_version, new_version, .. } => {
+            Cause::WindowsUpdate {
+                old_version,
+                new_version,
+                ..
+            } => {
                 assert_eq!(old_version.as_deref(), Some("10.0.26100"));
                 assert_eq!(new_version.as_deref(), Some("10.0.26200"));
             }
@@ -1135,14 +1366,26 @@ mod tests {
     #[test]
     fn annotate_os_version_no_op_without_boot_time() {
         let mut cycle = make_cycle(
-            Cause::WindowsUpdate { process: "x".into(), old_version: None, new_version: None },
+            Cause::WindowsUpdate {
+                process: "x".into(),
+                old_version: None,
+                new_version: None,
+            },
             None,
         );
-        let events = [make_event_at(6009, "EventLog", Timestamp(1_705_314_600),
-            &[("_0", "10.00."), ("_1", "26100")])];
+        let events = [make_event_at(
+            6009,
+            "EventLog",
+            Timestamp(1_705_314_600),
+            &[("_0", "10.00."), ("_1", "26100")],
+        )];
         annotate_os_version(&mut cycle, &events, None, None);
         match cycle.cause {
-            Cause::WindowsUpdate { old_version, new_version, .. } => {
+            Cause::WindowsUpdate {
+                old_version,
+                new_version,
+                ..
+            } => {
                 assert!(old_version.is_none() && new_version.is_none());
             }
             other => panic!("expected WindowsUpdate, got {other:?}"),
@@ -1157,22 +1400,35 @@ mod tests {
         let events = [
             make_event_at(7045, "SCM", base.add_secs(50), &[("ServiceName", "c")]),
             make_event_at(7045, "SCM", base.add_secs(10), &[("ServiceName", "a")]),
-            make_event_at(19,   "WUC", base.add_secs(20), &[("updateTitle", "u")]),
+            make_event_at(19, "WUC", base.add_secs(20), &[("updateTitle", "u")]),
             make_event_at(7045, "SCM", base.add_secs(30), &[("ServiceName", "b")]),
         ];
         // Half-open [base+10, base+50): includes a (10) and b (30), excludes c (50).
-        let got = events_in_window(&events, 7045, Some(base.add_secs(10)), Some(base.add_secs(50)));
+        let got = events_in_window(
+            &events,
+            7045,
+            Some(base.add_secs(10)),
+            Some(base.add_secs(50)),
+        );
         let names: Vec<&str> = got.iter().map(|e| e.get("ServiceName").unwrap()).collect();
-        assert_eq!(names, vec!["b", "a"], "newest-first, id-filtered, hi exclusive");
+        assert_eq!(
+            names,
+            vec!["b", "a"],
+            "newest-first, id-filtered, hi exclusive"
+        );
     }
 
     #[test]
     fn is_defender_intelligence_matches_definition_updates_only() {
         assert!(is_defender_intelligence(
-            "Security Intelligence Update for Microsoft Defender Antivirus - KB2267602"));
-        assert!(is_defender_intelligence("Update for Microsoft Defender Antivirus"));
+            "Security Intelligence Update for Microsoft Defender Antivirus - KB2267602"
+        ));
+        assert!(is_defender_intelligence(
+            "Update for Microsoft Defender Antivirus"
+        ));
         assert!(!is_defender_intelligence(
-            "2026-07 Cumulative Update for Windows 11 Version 24H2 (KB5099999)"));
+            "2026-07 Cumulative Update for Windows 11 Version 24H2 (KB5099999)"
+        ));
     }
 
     // ── annotate_update_installs (Event 19) ─────────────────────────────────────
@@ -1182,44 +1438,89 @@ mod tests {
         let bt = Timestamp(1_705_314_600);
         let events = [
             // Defender update is newest, but should be de-prioritized.
-            make_event_at(19, "WindowsUpdateClient", bt.add_secs(-30),
-                &[("updateTitle", "Security Intelligence Update for Microsoft Defender Antivirus - KB2267602")]),
-            make_event_at(19, "WindowsUpdateClient", bt.add_secs(-120),
-                &[("updateTitle", "2026-07 Cumulative Update for Windows 11 (KB5099999)")]),
+            make_event_at(
+                19,
+                "WindowsUpdateClient",
+                bt.add_secs(-30),
+                &[(
+                    "updateTitle",
+                    "Security Intelligence Update for Microsoft Defender Antivirus - KB2267602",
+                )],
+            ),
+            make_event_at(
+                19,
+                "WindowsUpdateClient",
+                bt.add_secs(-120),
+                &[(
+                    "updateTitle",
+                    "2026-07 Cumulative Update for Windows 11 (KB5099999)",
+                )],
+            ),
         ];
         let mut cycle = make_cycle(
-            Cause::WindowsUpdate { process: "TrustedInstaller.exe".into(), old_version: None, new_version: None },
+            Cause::WindowsUpdate {
+                process: "TrustedInstaller.exe".into(),
+                old_version: None,
+                new_version: None,
+            },
             Some(bt),
         );
         annotate_update_installs(&mut cycle, &events, Some(bt.add_secs(-600)), None);
-        assert!(cycle.evidence.iter().any(|e| e.contains("KB5099999")),
-            "cumulative update should be surfaced: {:?}", cycle.evidence);
-        assert!(!cycle.evidence.iter().any(|e| e.contains("KB2267602")),
-            "Defender definition update should be de-prioritized: {:?}", cycle.evidence);
+        assert!(
+            cycle.evidence.iter().any(|e| e.contains("KB5099999")),
+            "cumulative update should be surfaced: {:?}",
+            cycle.evidence
+        );
+        assert!(
+            !cycle.evidence.iter().any(|e| e.contains("KB2267602")),
+            "Defender definition update should be de-prioritized: {:?}",
+            cycle.evidence
+        );
     }
 
     #[test]
     fn update_installs_falls_back_to_newest_when_only_defender() {
         let bt = Timestamp(1_705_314_600);
-        let events = [make_event_at(19, "WindowsUpdateClient", bt.add_secs(-30),
-            &[("updateTitle", "Security Intelligence Update for Microsoft Defender Antivirus - KB2267602")])];
+        let events = [make_event_at(
+            19,
+            "WindowsUpdateClient",
+            bt.add_secs(-30),
+            &[(
+                "updateTitle",
+                "Security Intelligence Update for Microsoft Defender Antivirus - KB2267602",
+            )],
+        )];
         let mut cycle = make_cycle(
-            Cause::WindowsUpdate { process: "TiWorker.exe".into(), old_version: None, new_version: None },
+            Cause::WindowsUpdate {
+                process: "TiWorker.exe".into(),
+                old_version: None,
+                new_version: None,
+            },
             Some(bt),
         );
         annotate_update_installs(&mut cycle, &events, Some(bt.add_secs(-600)), None);
-        assert!(cycle.evidence.iter().any(|e| e.contains("KB2267602")),
-            "with nothing else, the newest update is shown as context: {:?}", cycle.evidence);
+        assert!(
+            cycle.evidence.iter().any(|e| e.contains("KB2267602")),
+            "with nothing else, the newest update is shown as context: {:?}",
+            cycle.evidence
+        );
     }
 
     #[test]
     fn update_installs_no_op_for_non_update_cause() {
         let bt = Timestamp(1_705_314_600);
-        let events = [make_event_at(19, "WindowsUpdateClient", bt.add_secs(-30),
-            &[("updateTitle", "2026-07 Cumulative Update (KB5099999)")])];
+        let events = [make_event_at(
+            19,
+            "WindowsUpdateClient",
+            bt.add_secs(-30),
+            &[("updateTitle", "2026-07 Cumulative Update (KB5099999)")],
+        )];
         let mut cycle = make_cycle(Cause::NormalShutdown, Some(bt));
         annotate_update_installs(&mut cycle, &events, Some(bt.add_secs(-600)), None);
-        assert!(cycle.evidence.is_empty(), "non-update cause must not gain update evidence");
+        assert!(
+            cycle.evidence.is_empty(),
+            "non-update cause must not gain update evidence"
+        );
     }
 
     // ── annotate_service_installs (Event 7045) ──────────────────────────────────
@@ -1228,29 +1529,50 @@ mod tests {
     fn service_installs_flags_driver_before_bsod() {
         let bt = Timestamp(1_705_314_600);
         let session_start = bt.add_secs(-3600);
-        let events = [
-            make_event_at(7045, "Service Control Manager", bt.add_secs(-600), &[
+        let events = [make_event_at(
+            7045,
+            "Service Control Manager",
+            bt.add_secs(-600),
+            &[
                 ("ServiceName", "EvilGpuDriver"),
                 ("ImagePath", r"C:\Windows\System32\drivers\evil.sys"),
                 ("ServiceType", "kernel mode driver"),
-            ]),
-        ];
+            ],
+        )];
         let mut cycle = make_cycle(
-            Cause::BlueScreen { stop_code: 0x9F, stop_name: "DRIVER_POWER_STATE_FAILURE", params: [0;4] },
+            Cause::BlueScreen {
+                stop_code: 0x9F,
+                stop_name: "DRIVER_POWER_STATE_FAILURE",
+                params: [0; 4],
+            },
             Some(bt),
         );
         annotate_service_installs(&mut cycle, &events, Some(session_start), Some(bt));
-        assert!(cycle.evidence.iter().any(|e| e.contains("EvilGpuDriver") && e.contains("Driver")),
-            "driver install in the crashed session should be flagged: {:?}", cycle.evidence);
+        assert!(
+            cycle
+                .evidence
+                .iter()
+                .any(|e| e.contains("EvilGpuDriver") && e.contains("Driver")),
+            "driver install in the crashed session should be flagged: {:?}",
+            cycle.evidence
+        );
     }
 
     #[test]
     fn service_installs_skipped_without_session_lower_bound() {
         let bt = Timestamp(1_705_314_600);
-        let events = [make_event_at(7045, "SCM", bt.add_secs(-600),
-            &[("ServiceName", "x"), ("ServiceType", "user mode service")])];
+        let events = [make_event_at(
+            7045,
+            "SCM",
+            bt.add_secs(-600),
+            &[("ServiceName", "x"), ("ServiceType", "user mode service")],
+        )];
         let mut cycle = make_cycle(
-            Cause::BlueScreen { stop_code: 0x50, stop_name: "PAGE_FAULT_IN_NONPAGED_AREA", params: [0;4] },
+            Cause::BlueScreen {
+                stop_code: 0x50,
+                stop_name: "PAGE_FAULT_IN_NONPAGED_AREA",
+                params: [0; 4],
+            },
             Some(bt),
         );
         // No session_start → cannot bound "shortly before" → no annotation.
@@ -1261,11 +1583,18 @@ mod tests {
     #[test]
     fn service_installs_no_op_for_non_bsod_cause() {
         let bt = Timestamp(1_705_314_600);
-        let events = [make_event_at(7045, "SCM", bt.add_secs(-600),
-            &[("ServiceName", "x"), ("ServiceType", "kernel mode driver")])];
+        let events = [make_event_at(
+            7045,
+            "SCM",
+            bt.add_secs(-600),
+            &[("ServiceName", "x"), ("ServiceType", "kernel mode driver")],
+        )];
         let mut cycle = make_cycle(Cause::NormalShutdown, Some(bt));
         annotate_service_installs(&mut cycle, &events, Some(bt.add_secs(-3600)), Some(bt));
-        assert!(cycle.evidence.is_empty(), "non-BSOD cause must not gain service-install evidence");
+        assert!(
+            cycle.evidence.is_empty(),
+            "non-BSOD cause must not gain service-install evidence"
+        );
     }
 
     #[test]
@@ -1277,19 +1606,40 @@ mod tests {
         let bt = Timestamp(1_705_314_600);
         let next_boot = bt.add_secs(3600);
         let events = [
-            make_event_at(6009, "EventLog", bt.add_secs(-60),
-                &[("_0", "10.00."), ("_1", "26100")]),
+            make_event_at(
+                6009,
+                "EventLog",
+                bt.add_secs(-60),
+                &[("_0", "10.00."), ("_1", "26100")],
+            ),
             // A different, later cycle's banner — outside [bt, next_boot).
-            make_event_at(6009, "EventLog", next_boot.add_secs(15),
-                &[("_0", "10.00."), ("_1", "26300")]),
+            make_event_at(
+                6009,
+                "EventLog",
+                next_boot.add_secs(15),
+                &[("_0", "10.00."), ("_1", "26300")],
+            ),
         ];
         let mut cycle = make_cycle(
-            Cause::WindowsUpdate { process: "TrustedInstaller.exe".into(), old_version: None, new_version: None },
+            Cause::WindowsUpdate {
+                process: "TrustedInstaller.exe".into(),
+                old_version: None,
+                new_version: None,
+            },
             Some(bt),
         );
-        annotate_os_version(&mut cycle, &events, Some(bt.add_secs(-300)), Some(next_boot));
+        annotate_os_version(
+            &mut cycle,
+            &events,
+            Some(bt.add_secs(-300)),
+            Some(next_boot),
+        );
         match cycle.cause {
-            Cause::WindowsUpdate { old_version, new_version, .. } => {
+            Cause::WindowsUpdate {
+                old_version,
+                new_version,
+                ..
+            } => {
                 assert_eq!(old_version.as_deref(), Some("10.0.26100"));
                 assert_eq!(new_version, None, "must not borrow a later cycle's banner");
             }
@@ -1303,19 +1653,32 @@ mod tests {
         // one still in range must be used rather than dropping old_version.
         let bt = Timestamp(1_705_314_600);
         let events = [
-            make_event_at(6009, "EventLog", bt.add_secs(-30),
-                &[("_0", "10.00."), ("_1", "Service Pack 0")]),
-            make_event_at(6009, "EventLog", bt.add_secs(-120),
-                &[("_0", "10.00."), ("_1", "19045")]),
+            make_event_at(
+                6009,
+                "EventLog",
+                bt.add_secs(-30),
+                &[("_0", "10.00."), ("_1", "Service Pack 0")],
+            ),
+            make_event_at(
+                6009,
+                "EventLog",
+                bt.add_secs(-120),
+                &[("_0", "10.00."), ("_1", "19045")],
+            ),
         ];
         let mut cycle = make_cycle(
-            Cause::WindowsUpdate { process: "TiWorker.exe".into(), old_version: None, new_version: None },
+            Cause::WindowsUpdate {
+                process: "TiWorker.exe".into(),
+                old_version: None,
+                new_version: None,
+            },
             Some(bt),
         );
         annotate_os_version(&mut cycle, &events, Some(bt.add_secs(-300)), None);
         match cycle.cause {
-            Cause::WindowsUpdate { old_version, .. } =>
-                assert_eq!(old_version.as_deref(), Some("10.0.19045")),
+            Cause::WindowsUpdate { old_version, .. } => {
+                assert_eq!(old_version.as_deref(), Some("10.0.19045"))
+            }
             other => panic!("expected WindowsUpdate, got {other:?}"),
         }
     }
@@ -1325,7 +1688,11 @@ mod tests {
         // Guards against "10.0.Service Pack 0"-style bogus version strings (#3).
         let good = make_event(6009, "EventLog", &[("_0", "10.00."), ("_1", "26200")]);
         assert_eq!(os_version_from_6009(&good).as_deref(), Some("10.0.26200"));
-        let bad = make_event(6009, "EventLog", &[("_0", "10.00."), ("_1", "Service Pack 0")]);
+        let bad = make_event(
+            6009,
+            "EventLog",
+            &[("_0", "10.00."), ("_1", "Service Pack 0")],
+        );
         assert_eq!(os_version_from_6009(&bad), None);
         let empty = make_event(6009, "EventLog", &[("_0", "10.00."), ("_1", "")]);
         assert_eq!(os_version_from_6009(&empty), None);
@@ -1336,13 +1703,17 @@ mod tests {
         // Update Orchestrator worker restarts don't always carry the 0x80020002
         // reason code (this one is 0x80020010, "Service pack (Planned)") — the
         // process name alone must still be recognized as Windows Update.
-        let ev = make_event(1074, "User32", &[
-            ("param1", r"C:\WINDOWS\uus\AMD64\MoUsoCoreWorker.exe"),
-            ("param7", r"NT AUTHORITY\SYSTEM"),
-            ("param4", "0x80020010"),
-            ("param5", "restart"),
-            ("param6", ""),
-        ]);
+        let ev = make_event(
+            1074,
+            "User32",
+            &[
+                ("param1", r"C:\WINDOWS\uus\AMD64\MoUsoCoreWorker.exe"),
+                ("param7", r"NT AUTHORITY\SYSTEM"),
+                ("param4", "0x80020010"),
+                ("param5", "restart"),
+                ("param6", ""),
+            ],
+        );
         let (cause, _, _, _) = classify_event1074(&ev);
         assert!(matches!(cause, Cause::WindowsUpdate { .. }));
     }
@@ -1379,33 +1750,45 @@ mod tests {
 
     #[test]
     fn analyze_event41_takes_priority_over_1074() {
-        let post = [make_event(41, "Microsoft-Windows-Kernel-Power", &[
-            ("BugcheckCode", "0x9f"),
-            ("BugcheckParameter1", "3"),
-            ("BugcheckParameter2", "0"),
-            ("BugcheckParameter3", "0"),
-            ("BugcheckParameter4", "0"),
-            ("PowerButtonTimestamp", "0"),
-        ])];
-        let pre = [make_event(1074, "User32", &[
-            ("param1", "TiWorker.exe"),
-            ("param7", "SYSTEM"),
-            ("param4", "0x80020002"),
-            ("param5", "restart"),
-            ("param6", ""),
-        ])];
+        let post = [make_event(
+            41,
+            "Microsoft-Windows-Kernel-Power",
+            &[
+                ("BugcheckCode", "0x9f"),
+                ("BugcheckParameter1", "3"),
+                ("BugcheckParameter2", "0"),
+                ("BugcheckParameter3", "0"),
+                ("BugcheckParameter4", "0"),
+                ("PowerButtonTimestamp", "0"),
+            ],
+        )];
+        let pre = [make_event(
+            1074,
+            "User32",
+            &[
+                ("param1", "TiWorker.exe"),
+                ("param7", "SYSTEM"),
+                ("param4", "0x80020002"),
+                ("param5", "restart"),
+                ("param6", ""),
+            ],
+        )];
         let a = analyze_slice(None, &post, &pre);
-        assert!(matches!(a.cause, Cause::BlueScreen { .. }), "Event 41 must win over Event 1074");
+        assert!(
+            matches!(a.cause, Cause::BlueScreen { .. }),
+            "Event 41 must win over Event 1074"
+        );
     }
 
     #[test]
     fn analyze_6008_without_41_is_lower_confidence_than_41() {
-        let post_with_41 = [make_event(41, "Microsoft-Windows-Kernel-Power", &[
-            ("BugcheckCode", "0"),
-            ("PowerButtonTimestamp", "0"),
-        ])];
+        let post_with_41 = [make_event(
+            41,
+            "Microsoft-Windows-Kernel-Power",
+            &[("BugcheckCode", "0"), ("PowerButtonTimestamp", "0")],
+        )];
         let post_6008_only = [make_event(6008, "EventLog", &[])];
-        let a_41   = analyze_slice(None, &post_with_41,   &[]);
+        let a_41 = analyze_slice(None, &post_with_41, &[]);
         let a_6008 = analyze_slice(None, &post_6008_only, &[]);
         assert!(a_41.confidence > a_6008.confidence);
     }
@@ -1416,8 +1799,8 @@ mod tests {
     fn boot_indices_prefers_kernel_general_provider() {
         let events = vec![
             make_event(12, "Microsoft-Windows-Kernel-General", &[]), // idx 0 ✓
-            make_event(41, "Microsoft-Windows-Kernel-Power",   &[]), // idx 1
-            make_event(12, "SomeOtherProvider",                &[]), // idx 2 — not General
+            make_event(41, "Microsoft-Windows-Kernel-Power", &[]),   // idx 1
+            make_event(12, "SomeOtherProvider", &[]),                // idx 2 — not General
             make_event(12, "Microsoft-Windows-Kernel-General", &[]), // idx 3 ✓
         ];
         assert_eq!(collect_boot_indices(&events), vec![0, 3]);
@@ -1426,9 +1809,9 @@ mod tests {
     #[test]
     fn boot_indices_falls_back_to_any_event12() {
         let events = vec![
-            make_event(41, "Kernel-Power",  &[]),
-            make_event(12, "SomeProvider",  &[]), // idx 1
-            make_event(41, "Kernel-Power",  &[]),
+            make_event(41, "Kernel-Power", &[]),
+            make_event(12, "SomeProvider", &[]), // idx 1
+            make_event(41, "Kernel-Power", &[]),
             make_event(12, "OtherProvider", &[]), // idx 3
         ];
         assert_eq!(collect_boot_indices(&events), vec![1, 3]);
@@ -1454,7 +1837,11 @@ mod tests {
     fn extract_limit_restricts_count() {
         // events: [ev41, Event12, Event13, Event12, Event13] → 2 boot cycles
         let events = vec![
-            make_event(41, "Kernel-Power", &[("BugcheckCode","0"),("PowerButtonTimestamp","0")]),
+            make_event(
+                41,
+                "Kernel-Power",
+                &[("BugcheckCode", "0"), ("PowerButtonTimestamp", "0")],
+            ),
             make_event(12, "Microsoft-Windows-Kernel-General", &[]),
             make_event(13, "Microsoft-Windows-Kernel-General", &[]),
             make_event(12, "Microsoft-Windows-Kernel-General", &[]),
@@ -1468,20 +1855,26 @@ mod tests {
     fn extract_bsod_cycle_identified() {
         // post_boot of cycle 0 = [ev41], pre_boot = [ev13]
         let events = vec![
-            make_event(41, "Microsoft-Windows-Kernel-Power", &[
-                ("BugcheckCode", "0x9f"),
-                ("BugcheckParameter1", "3"),
-                ("BugcheckParameter2", "0"),
-                ("BugcheckParameter3", "0"),
-                ("BugcheckParameter4", "0"),
-                ("PowerButtonTimestamp", "0"),
-            ]),
+            make_event(
+                41,
+                "Microsoft-Windows-Kernel-Power",
+                &[
+                    ("BugcheckCode", "0x9f"),
+                    ("BugcheckParameter1", "3"),
+                    ("BugcheckParameter2", "0"),
+                    ("BugcheckParameter3", "0"),
+                    ("BugcheckParameter4", "0"),
+                    ("PowerButtonTimestamp", "0"),
+                ],
+            ),
             make_event(12, "Microsoft-Windows-Kernel-General", &[]),
             make_event(13, "Microsoft-Windows-Kernel-General", &[]),
         ];
         let cycles = extract_boot_cycles(&events, &[], &[], 1);
         assert_eq!(cycles.len(), 1);
-        assert!(matches!(&cycles[0].cause, Cause::BlueScreen { stop_code, .. } if *stop_code == 0x9F));
+        assert!(
+            matches!(&cycles[0].cause, Cause::BlueScreen { stop_code, .. } if *stop_code == 0x9F)
+        );
     }
 
     #[test]

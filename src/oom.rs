@@ -48,14 +48,14 @@ fn detect_kernel_oom(line: &LogLine) -> Option<Finding> {
     let marker = find_ci(msg, "killed process").or_else(|| find_ci(msg, "kill process"))?;
     let after = &msg[marker..];
 
-    let pid  = first_number(after);
+    let pid = first_number(after);
     let comm = between(after, '(', ')');
 
     let victim = match (&comm, pid) {
         (Some(c), Some(p)) => format!("process '{c}' (pid {p})"),
-        (Some(c), None)    => format!("process '{c}'"),
-        (None, Some(p))    => format!("process pid {p}"),
-        (None, None)       => "a process".to_string(),
+        (Some(c), None) => format!("process '{c}'"),
+        (None, Some(p)) => format!("process pid {p}"),
+        (None, None) => "a process".to_string(),
     };
 
     let mut evidence = Vec::new();
@@ -76,12 +76,12 @@ fn detect_kernel_oom(line: &LogLine) -> Option<Finding> {
     );
 
     Some(Finding {
-        time:     line.time,
+        time: line.time,
         severity: Severity::Critical,
         category: "OOM".to_string(),
-        title:    format!("Kernel OOM killer terminated {victim}"),
+        title: format!("Kernel OOM killer terminated {victim}"),
         evidence,
-        source:   "journald:kernel".to_string(),
+        source: "journald:kernel".to_string(),
     })
 }
 
@@ -94,7 +94,7 @@ fn detect_systemd_oomd(line: &LogLine) -> Option<Finding> {
     let marker = find_ci(msg, "killed ")?;
     // Everything after "Killed " up to " due to" is the cgroup path.
     let rest = &msg[marker + "killed ".len()..];
-    let due  = find_ci(rest, "due to")?;
+    let due = find_ci(rest, "due to")?;
     let cgroup = rest[..due].trim().trim_end_matches(',').trim();
     let reason = rest[due..].trim();
 
@@ -110,15 +110,19 @@ fn detect_systemd_oomd(line: &LogLine) -> Option<Finding> {
             .to_string(),
     );
 
-    let cg = if cgroup.is_empty() { "a control group".to_string() } else { format!("'{cgroup}'") };
+    let cg = if cgroup.is_empty() {
+        "a control group".to_string()
+    } else {
+        format!("'{cgroup}'")
+    };
 
     Some(Finding {
-        time:     line.time,
+        time: line.time,
         severity: Severity::Critical,
         category: "OOM".to_string(),
-        title:    format!("systemd-oomd killed {cg} under memory pressure"),
+        title: format!("systemd-oomd killed {cg} under memory pressure"),
         evidence,
-        source:   "systemd-oomd".to_string(),
+        source: "systemd-oomd".to_string(),
     })
 }
 
@@ -130,14 +134,18 @@ fn detect_systemd_oomd(line: &LogLine) -> Option<Finding> {
 /// with, even when the message contains multibyte UTF-8 elsewhere.
 fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
     let (h, n) = (haystack.as_bytes(), needle.as_bytes());
-    if n.is_empty() || h.len() < n.len() { return None; }
+    if n.is_empty() || h.len() < n.len() {
+        return None;
+    }
     (0..=h.len() - n.len()).find(|&i| h[i..i + n.len()].eq_ignore_ascii_case(n))
 }
 
 /// First run of ASCII digits in `s`, parsed as u64.
 fn first_number(s: &str) -> Option<u64> {
     let start = s.find(|c: char| c.is_ascii_digit())?;
-    let end = s[start..].find(|c: char| !c.is_ascii_digit()).map_or(s.len(), |i| start + i);
+    let end = s[start..]
+        .find(|c: char| !c.is_ascii_digit())
+        .map_or(s.len(), |i| start + i);
     s[start..end].parse().ok()
 }
 
@@ -152,7 +160,9 @@ fn between(s: &str, open: char, close: char) -> Option<String> {
 fn extract_after(s: &str, key: &str) -> Option<String> {
     let pos = s.find(key)? + key.len();
     let rest = s[pos..].trim_start();
-    let end = rest.find(|c: char| c.is_whitespace() || c == ',').unwrap_or(rest.len());
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == ',')
+        .unwrap_or(rest.len());
     let v = &rest[..end];
     (!v.is_empty()).then(|| v.to_string())
 }
@@ -166,9 +176,13 @@ fn extract_field_kb(s: &str, key: &str) -> Option<u64> {
 
 /// Formats a kilobyte count as a human-readable size.
 fn human_kb(kb: u64) -> String {
-    if kb >= 1024 * 1024 { format!("{:.1} GB", kb as f64 / (1024.0 * 1024.0)) }
-    else if kb >= 1024   { format!("{:.1} MB", kb as f64 / 1024.0) }
-    else                 { format!("{kb} kB") }
+    if kb >= 1024 * 1024 {
+        format!("{:.1} GB", kb as f64 / (1024.0 * 1024.0))
+    } else if kb >= 1024 {
+        format!("{:.1} MB", kb as f64 / 1024.0)
+    } else {
+        format!("{kb} kB")
+    }
 }
 
 #[cfg(test)]
@@ -177,12 +191,20 @@ mod tests {
     use crate::timestamp::Timestamp;
 
     fn kline(msg: &str) -> LogLine {
-        LogLine { time: Timestamp(1_700_000_000), message: msg.to_string(),
-                  identifier: "kernel".into(), transport: "kernel".into() }
+        LogLine {
+            time: Timestamp(1_700_000_000),
+            message: msg.to_string(),
+            identifier: "kernel".into(),
+            transport: "kernel".into(),
+        }
     }
     fn oomd_line(msg: &str) -> LogLine {
-        LogLine { time: Timestamp(1_700_000_100), message: msg.to_string(),
-                  identifier: "systemd-oomd".into(), transport: "journal".into() }
+        LogLine {
+            time: Timestamp(1_700_000_100),
+            message: msg.to_string(),
+            identifier: "systemd-oomd".into(),
+            transport: "journal".into(),
+        }
     }
 
     #[test]
@@ -190,14 +212,19 @@ mod tests {
         let l = kline(
             "Out of memory: Killed process 4242 (chrome) total-vm:9999000kB, \
              anon-rss:512000kB, file-rss:0kB, shmem-rss:0kB, UID:1000 \
-             pgtables:2048kB oom_score_adj:300");
+             pgtables:2048kB oom_score_adj:300",
+        );
         let f = detect(&l).expect("should detect");
         assert_eq!(f.category, "OOM");
         assert_eq!(f.severity, Severity::Critical);
         assert_eq!(f.source, "journald:kernel");
         assert!(f.title.contains("chrome"), "title: {}", f.title);
         assert!(f.title.contains("4242"));
-        assert!(f.evidence.iter().any(|e| e.contains("MB") || e.contains("GB")));
+        assert!(
+            f.evidence
+                .iter()
+                .any(|e| e.contains("MB") || e.contains("GB"))
+        );
         assert!(f.evidence.iter().any(|e| e.contains("oom_score_adj: 300")));
     }
 
@@ -220,9 +247,12 @@ mod tests {
     #[test]
     fn invoked_oom_killer_line_is_not_a_kill() {
         // The dump header is context, not the decisive kill line.
-        assert!(detect(&kline(
-            "chrome invoked oom-killer: gfp_mask=0x140dca(GFP_HIGHUSER_MOVABLE), order=0"
-        )).is_none());
+        assert!(
+            detect(&kline(
+                "chrome invoked oom-killer: gfp_mask=0x140dca(GFP_HIGHUSER_MOVABLE), order=0"
+            ))
+            .is_none()
+        );
     }
 
     #[test]
@@ -235,7 +265,8 @@ mod tests {
         let l = oomd_line(
             "Killed /user.slice/user-1000.slice/user@1000.service/app.slice/app-foo.service \
              due to memory pressure for /user.slice/user-1000.slice/user@1000.service being \
-             60.13% > 50.00% for > 20s");
+             60.13% > 50.00% for > 20s",
+        );
         let f = detect(&l).expect("should detect");
         assert_eq!(f.source, "systemd-oomd");
         assert_eq!(f.severity, Severity::Critical);
@@ -247,7 +278,8 @@ mod tests {
     fn systemd_oomd_swap_kill() {
         let l = oomd_line(
             "Killed /user.slice/app.slice/leaky.service due to swap used (2000000) / total \
-             (2097148) being more than 90.00%");
+             (2097148) being more than 90.00%",
+        );
         let f = detect(&l).expect("should detect");
         assert!(f.title.contains("leaky.service"));
         assert!(f.evidence.iter().any(|e| e.to_lowercase().contains("swap")));

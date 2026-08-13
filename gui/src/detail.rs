@@ -3,8 +3,8 @@
 //! no Win32 calls — mirroring the CLI's `display.rs` for the same data.
 
 use whyreboot::format::{
-    audio_power_status_text, cause_detail, cause_label, event_row, event_table_header,
-    fmt_secs, generate_explanation, is_audio_power_crash, relative_ago,
+    audio_power_status_text, cause_detail, cause_label, event_row, event_table_header, fmt_secs,
+    generate_explanation, is_audio_power_crash, relative_ago,
 };
 use whyreboot::timestamp::Timestamp;
 use whyreboot::types::{AudioPowerInfo, BootCycle};
@@ -13,7 +13,8 @@ pub fn format_cycle_detail(c: &BootCycle, audio: &[AudioPowerInfo]) -> String {
     let mut s = String::new();
 
     // ── Boot times ────────────────────────────────────────────────────────────
-    let bt_str = c.boot_time
+    let bt_str = c
+        .boot_time
         .map(|t| t.format_dt())
         .unwrap_or_else(|| "(unknown — no Event 12 found)".into());
     s += &format!("Boot time:   {}\r\n", bt_str);
@@ -26,15 +27,23 @@ pub fn format_cycle_detail(c: &BootCycle, audio: &[AudioPowerInfo]) -> String {
     if let Some((sd, bt)) = c.shutdown_time.zip(c.boot_time) {
         let secs = bt.secs_since(sd);
         if secs >= 0 {
-            s += &format!("Offline:     {}  \u{2192}  {}  ({})\r\n",
-                sd.format_t(), bt.format_t(), fmt_secs(secs));
+            s += &format!(
+                "Offline:     {}  \u{2192}  {}  ({})\r\n",
+                sd.format_t(),
+                bt.format_t(),
+                fmt_secs(secs)
+            );
         }
     }
 
     s += "\r\n";
 
     // ── Verdict ───────────────────────────────────────────────────────────────
-    s += &format!("VERDICT:     {}  ({}% confidence)\r\n", cause_label(&c.cause), c.confidence);
+    s += &format!(
+        "VERDICT:     {}  ({}% confidence)\r\n",
+        cause_label(&c.cause),
+        c.confidence
+    );
     s += &format!("             {}\r\n", cause_detail(&c.cause));
     if let Some(m) = &c.wer_module {
         s += &format!("Module:      {}  [from WER Event 1001]\r\n", m);
@@ -81,7 +90,11 @@ pub fn format_cycle_detail(c: &BootCycle, audio: &[AudioPowerInfo]) -> String {
     if !explanation.is_empty() {
         s += "\r\nExplanation:\r\n";
         for ln in &explanation {
-            if ln.is_empty() { s += "\r\n"; } else { s += &format!("  {}\r\n", ln); }
+            if ln.is_empty() {
+                s += "\r\n";
+            } else {
+                s += &format!("  {}\r\n", ln);
+            }
         }
     }
 

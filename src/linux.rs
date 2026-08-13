@@ -46,8 +46,12 @@ pub fn fetch_journal(window: &TimeWindow) -> io::Result<Vec<LogLine>> {
     // unit start/stop lines are info (6). Intersecting the identifier and priority
     // indexes collapses ~90k lines to a few dozen in ~0.5s. Best-effort: a missing
     // identifier simply contributes nothing.
-    let user = &["-p", "notice",
-                 "SYSLOG_IDENTIFIER=systemd", "SYSLOG_IDENTIFIER=systemd-coredump"];
+    let user = &[
+        "-p",
+        "notice",
+        "SYSLOG_IDENTIFIER=systemd",
+        "SYSLOG_IDENTIFIER=systemd-coredump",
+    ];
     if let Ok(mut v) = run_journalctl(user, window) {
         lines.append(&mut v);
     }
@@ -55,18 +59,27 @@ pub fn fetch_journal(window: &TimeWindow) -> io::Result<Vec<LogLine>> {
     // Graphical session: compositors and session managers, priority-gated because
     // gnome-shell/kwin chat a lot at info. Identifiers absent on servers/headless
     // boxes simply match nothing. (Best-effort, like the query above.)
-    let graphical = &["-p", "notice",
-                      "SYSLOG_IDENTIFIER=gnome-shell", "SYSLOG_IDENTIFIER=gnome-session-binary",
-                      "SYSLOG_IDENTIFIER=kwin_wayland", "SYSLOG_IDENTIFIER=kwin_x11",
-                      "SYSLOG_IDENTIFIER=plasmashell", "SYSLOG_IDENTIFIER=xdg-desktop-portal"];
+    let graphical = &[
+        "-p",
+        "notice",
+        "SYSLOG_IDENTIFIER=gnome-shell",
+        "SYSLOG_IDENTIFIER=gnome-session-binary",
+        "SYSLOG_IDENTIFIER=kwin_wayland",
+        "SYSLOG_IDENTIFIER=kwin_x11",
+        "SYSLOG_IDENTIFIER=plasmashell",
+        "SYSLOG_IDENTIFIER=xdg-desktop-portal",
+    ];
     if let Ok(mut v) = run_journalctl(graphical, window) {
         lines.append(&mut v);
     }
 
     // X server logs arrive via gdm at info priority, so these two identifiers are
     // fetched unfiltered — their volume is modest (hundreds of lines per boot).
-    let xorg = &["SYSLOG_IDENTIFIER=Xorg", "SYSLOG_IDENTIFIER=gdm-x-session",
-                 "SYSLOG_IDENTIFIER=Xorg.bin"];
+    let xorg = &[
+        "SYSLOG_IDENTIFIER=Xorg",
+        "SYSLOG_IDENTIFIER=gdm-x-session",
+        "SYSLOG_IDENTIFIER=Xorg.bin",
+    ];
     if let Ok(mut v) = run_journalctl(xorg, window) {
         lines.append(&mut v);
     }
@@ -82,7 +95,6 @@ fn dedup(lines: &mut Vec<LogLine>) {
     lines.retain(|l| seen.insert((l.time.0, l.message.clone())));
 }
 
-
 /// Reads `journalctl -o json`-formatted lines from a file (test / offline seam).
 /// Kept as a re-export so existing callers keep working; the implementation is
 /// the shared, format-autodetecting parser in [`crate::jsonlog`].
@@ -95,8 +107,12 @@ pub use crate::jsonlog::fetch_from_file;
 fn run_journalctl(extra: &[&str], window: &TimeWindow) -> io::Result<Vec<LogLine>> {
     let mut cmd = Command::new("journalctl");
     cmd.args(extra);
-    cmd.args(["-o", "json", "--no-pager",
-              "--output-fields=MESSAGE,SYSLOG_IDENTIFIER,_TRANSPORT"]);
+    cmd.args([
+        "-o",
+        "json",
+        "--no-pager",
+        "--output-fields=MESSAGE,SYSLOG_IDENTIFIER,_TRANSPORT",
+    ]);
 
     // journalctl accepts `@<unix-seconds>` for absolute since/until.
     let since;
@@ -118,5 +134,7 @@ fn run_journalctl(extra: &[&str], window: &TimeWindow) -> io::Result<Vec<LogLine
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    Ok(crate::jsonlog::parse_json_lines(&String::from_utf8_lossy(&out.stdout)))
+    Ok(crate::jsonlog::parse_json_lines(&String::from_utf8_lossy(
+        &out.stdout,
+    )))
 }

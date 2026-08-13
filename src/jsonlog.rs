@@ -43,10 +43,10 @@ fn line_to_log(line: &str) -> Option<LogLine> {
         // journald: __REALTIME_TIMESTAMP is microseconds since the Unix epoch.
         let micros: i64 = get("__REALTIME_TIMESTAMP")?.parse().ok()?;
         return Some(LogLine {
-            time:       Timestamp(micros / 1_000_000),
-            message:    message.to_string(),
+            time: Timestamp(micros / 1_000_000),
+            message: message.to_string(),
             identifier: get("SYSLOG_IDENTIFIER").unwrap_or("").to_string(),
-            transport:  get("_TRANSPORT").unwrap_or("").to_string(),
+            transport: get("_TRANSPORT").unwrap_or("").to_string(),
         });
     }
 
@@ -55,9 +55,9 @@ fn line_to_log(line: &str) -> Option<LogLine> {
         let time = Timestamp::from_log_show(get("timestamp")?)?;
         return Some(LogLine {
             time,
-            message:    message.to_string(),
+            message: message.to_string(),
             identifier: get("process").unwrap_or("").to_string(),
-            transport:  get("subsystem").unwrap_or("").to_string(),
+            transport: get("subsystem").unwrap_or("").to_string(),
         });
     }
 
@@ -74,20 +74,34 @@ pub fn parse_flat_json(s: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
 
     // Skip to opening brace.
-    while i < b.len() && b[i] != b'{' { i += 1; }
-    if i < b.len() { i += 1; }
+    while i < b.len() && b[i] != b'{' {
+        i += 1;
+    }
+    if i < b.len() {
+        i += 1;
+    }
 
     loop {
         skip_ws(b, &mut i);
-        if i >= b.len() || b[i] == b'}' { break; }
-        if b[i] != b'"' { break; } // malformed key
+        if i >= b.len() || b[i] == b'}' {
+            break;
+        }
+        if b[i] != b'"' {
+            break;
+        } // malformed key
 
-        let Some(key) = parse_json_string(b, &mut i) else { break };
+        let Some(key) = parse_json_string(b, &mut i) else {
+            break;
+        };
         skip_ws(b, &mut i);
-        if i >= b.len() || b[i] != b':' { break; }
+        if i >= b.len() || b[i] != b':' {
+            break;
+        }
         i += 1;
         skip_ws(b, &mut i);
-        if i >= b.len() { break; }
+        if i >= b.len() {
+            break;
+        }
 
         match b[i] {
             b'"' => {
@@ -100,26 +114,34 @@ pub fn parse_flat_json(s: &str) -> Vec<(String, String)> {
             _ => {
                 // Bare literal (number/true/false/null): capture verbatim.
                 let start = i;
-                while i < b.len() && b[i] != b',' && b[i] != b'}' { i += 1; }
+                while i < b.len() && b[i] != b',' && b[i] != b'}' {
+                    i += 1;
+                }
                 let val = s[start..i].trim().to_string();
                 out.push((key, val));
             }
         }
 
         skip_ws(b, &mut i);
-        if i < b.len() && b[i] == b',' { i += 1; }
+        if i < b.len() && b[i] == b',' {
+            i += 1;
+        }
     }
     out
 }
 
 fn skip_ws(b: &[u8], i: &mut usize) {
-    while *i < b.len() && (b[*i] as char).is_whitespace() { *i += 1; }
+    while *i < b.len() && (b[*i] as char).is_whitespace() {
+        *i += 1;
+    }
 }
 
 /// Parses a JSON string starting at `b[*i] == '"'`, advancing past the closing
 /// quote. Decodes standard escapes and `\uXXXX` (BMP) sequences.
 fn parse_json_string(b: &[u8], i: &mut usize) -> Option<String> {
-    if *i >= b.len() || b[*i] != b'"' { return None; }
+    if *i >= b.len() || b[*i] != b'"' {
+        return None;
+    }
     *i += 1;
     let mut s = String::new();
     while *i < b.len() {
@@ -128,20 +150,24 @@ fn parse_json_string(b: &[u8], i: &mut usize) -> Option<String> {
         match c {
             b'"' => return Some(s),
             b'\\' => {
-                if *i >= b.len() { return None; }
+                if *i >= b.len() {
+                    return None;
+                }
                 let e = b[*i];
                 *i += 1;
                 match e {
-                    b'"'  => s.push('"'),
+                    b'"' => s.push('"'),
                     b'\\' => s.push('\\'),
-                    b'/'  => s.push('/'),
-                    b'n'  => s.push('\n'),
-                    b't'  => s.push('\t'),
-                    b'r'  => s.push('\r'),
-                    b'b'  => s.push('\u{0008}'),
-                    b'f'  => s.push('\u{000C}'),
-                    b'u'  => {
-                        if *i + 4 > b.len() { return None; }
+                    b'/' => s.push('/'),
+                    b'n' => s.push('\n'),
+                    b't' => s.push('\t'),
+                    b'r' => s.push('\r'),
+                    b'b' => s.push('\u{0008}'),
+                    b'f' => s.push('\u{000C}'),
+                    b'u' => {
+                        if *i + 4 > b.len() {
+                            return None;
+                        }
                         let hex = std::str::from_utf8(&b[*i..*i + 4]).ok()?;
                         let cp = u32::from_str_radix(hex, 16).ok()?;
                         *i += 4;
@@ -153,7 +179,9 @@ fn parse_json_string(b: &[u8], i: &mut usize) -> Option<String> {
             // Multi-byte UTF-8: copy the continuation bytes verbatim.
             0x80..=0xFF => {
                 let start = *i - 1;
-                while *i < b.len() && (b[*i] & 0xC0) == 0x80 { *i += 1; }
+                while *i < b.len() && (b[*i] & 0xC0) == 0x80 {
+                    *i += 1;
+                }
                 if let Ok(chunk) = std::str::from_utf8(&b[start..*i]) {
                     s.push_str(chunk);
                 }
@@ -169,9 +197,18 @@ fn skip_balanced(b: &[u8], i: &mut usize, open: u8, close: u8) {
     let mut depth = 0i32;
     while *i < b.len() {
         match b[*i] {
-            b'"' => { let _ = parse_json_string(b, i); continue; }
-            c if c == open  => depth += 1,
-            c if c == close => { depth -= 1; if depth == 0 { *i += 1; return; } }
+            b'"' => {
+                let _ = parse_json_string(b, i);
+                continue;
+            }
+            c if c == open => depth += 1,
+            c if c == close => {
+                depth -= 1;
+                if depth == 0 {
+                    *i += 1;
+                    return;
+                }
+            }
             _ => {}
         }
         *i += 1;
@@ -219,7 +256,8 @@ mod tests {
 
     #[test]
     fn handles_escapes_in_message() {
-        let line = r#"{"MESSAGE":"a \"quote\" and \\ and A","__REALTIME_TIMESTAMP":"1700000000000000"}"#;
+        let line =
+            r#"{"MESSAGE":"a \"quote\" and \\ and A","__REALTIME_TIMESTAMP":"1700000000000000"}"#;
         let ll = line_to_log(line).expect("parse");
         assert_eq!(ll.message, "a \"quote\" and \\ and A");
     }

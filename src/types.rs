@@ -7,15 +7,18 @@ use std::path::PathBuf;
 /// unnamed fields are keyed `_0`, `_1`, etc.
 #[derive(Debug, Clone)]
 pub struct EventRecord {
-    pub event_id:     u32,
+    pub event_id: u32,
     pub time_created: Timestamp,
-    pub provider:     String,
-    pub data:         Vec<(String, String)>,
+    pub provider: String,
+    pub data: Vec<(String, String)>,
 }
 
 impl EventRecord {
     pub fn get(&self, key: &str) -> Option<&str> {
-        self.data.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+        self.data
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
     }
 }
 
@@ -26,9 +29,9 @@ impl EventRecord {
 /// module; see `module_from_bucket` in analysis.rs.
 #[derive(Debug, Clone)]
 pub struct WerRecord {
-    pub time_created:  Timestamp,
-    pub p1:            u64,
-    pub bucket_id:     String,
+    pub time_created: Timestamp,
+    pub p1: u64,
+    pub bucket_id: String,
     pub minidump_path: Option<PathBuf>,
 }
 
@@ -38,10 +41,10 @@ pub struct WerRecord {
 /// `Some(0)` = safe; `Some(1)` = driver may enter D3 on idle (risky for portcls).
 #[allow(dead_code)]
 pub struct AudioPowerInfo {
-    pub instance:      String,    // zero-padded 4-digit instance number, e.g. "0005"
-    pub name:          String,    // DriverDesc or FriendlyName
+    pub instance: String, // zero-padded 4-digit instance number, e.g. "0005"
+    pub name: String,     // DriverDesc or FriendlyName
     pub allow_idle_d3: Option<u32>,
-    pub enhanced_pm:   Option<u32>,
+    pub enhanced_pm: Option<u32>,
 }
 
 /// Why this boot cycle ended.
@@ -49,7 +52,11 @@ pub struct AudioPowerInfo {
 #[derive(Debug)]
 pub enum Cause {
     /// Kernel bugcheck (BSOD). `params` are BugcheckParameter1–4 from Event 41.
-    BlueScreen { stop_code: u64, stop_name: &'static str, params: [u64; 4] },
+    BlueScreen {
+        stop_code: u64,
+        stop_name: &'static str,
+        params: [u64; 4],
+    },
     /// Power button held — Event 41 present with non-zero `PowerButtonTimestamp`.
     ForcedPowerOff,
     /// Event 41 with no stop code, or Event 6008 without Event 41.
@@ -59,11 +66,23 @@ pub enum Cause {
     /// strings read from the Event 6009 banner logged just after each boot
     /// (before and after this restart, respectively) — `None` if not found in
     /// the scanned log window.
-    WindowsUpdate  { process: String, old_version: Option<String>, new_version: Option<String> },
+    WindowsUpdate {
+        process: String,
+        old_version: Option<String>,
+        new_version: Option<String>,
+    },
     /// Event 1074 from an interactive user account.
-    UserAction     { user: String, action: String, comment: String },
+    UserAction {
+        user: String,
+        action: String,
+        comment: String,
+    },
     /// Event 1074 from NT AUTHORITY\SYSTEM or similar.
-    SystemProcess  { process: String, reason: String, action: String },
+    SystemProcess {
+        process: String,
+        reason: String,
+        action: String,
+    },
     /// Event 13 or 6006 found, no crash indicators.
     NormalShutdown,
     /// No conclusive events found in the log window.
@@ -76,12 +95,12 @@ pub enum Cause {
 /// Detectors in [`crate::detect`] consume these and emit [`Finding`]s.
 #[derive(Debug, Clone)]
 pub struct LogLine {
-    pub time:       Timestamp,
-    pub message:    String,
+    pub time: Timestamp,
+    pub message: String,
     /// syslog identifier, e.g. `"kernel"` or `"systemd-oomd"` (may be empty).
     pub identifier: String,
     /// journald `_TRANSPORT`, e.g. `"kernel"` (may be empty).
-    pub transport:  String,
+    pub transport: String,
 }
 
 /// Severity of a detected issue. Ordered least-to-most severe so `Ord` can rank.
@@ -96,8 +115,8 @@ impl Severity {
     /// Short uppercase label for text output.
     pub fn label(self) -> &'static str {
         match self {
-            Severity::Info     => "INFO",
-            Severity::Warning  => "WARNING",
+            Severity::Info => "INFO",
+            Severity::Warning => "WARNING",
             Severity::Critical => "CRITICAL",
         }
     }
@@ -112,16 +131,16 @@ impl Severity {
 #[derive(Debug, Clone)]
 pub struct Finding {
     /// When the issue occurred.
-    pub time:     Timestamp,
+    pub time: Timestamp,
     pub severity: Severity,
     /// Coarse category slug, e.g. `"OOM"`.
     pub category: String,
     /// One-line human-readable headline.
-    pub title:    String,
+    pub title: String,
     /// Supporting detail bullets (raw log excerpts, extracted fields, advice).
     pub evidence: Vec<String>,
     /// Where it came from, e.g. `"journald:kernel"` or `"systemd-oomd"`.
-    pub source:   String,
+    pub source: String,
 }
 
 /// One boot session, from Event 12 to the next Event 12 (or end of log).
@@ -130,14 +149,14 @@ pub struct Finding {
 /// `wer_module` and `minidumps` are filled by the annotation pass after
 /// initial classification.
 pub struct BootCycle {
-    pub index:          usize,
-    pub boot_time:      Option<Timestamp>,
-    pub shutdown_time:  Option<Timestamp>,
-    pub cause:          Cause,
-    pub confidence:     u8,
-    pub evidence:       Vec<String>,
-    pub timeline:       Vec<(Timestamp, String)>,
-    pub wer_module:     Option<String>,
-    pub minidumps:      Vec<(Timestamp, PathBuf)>,
+    pub index: usize,
+    pub boot_time: Option<Timestamp>,
+    pub shutdown_time: Option<Timestamp>,
+    pub cause: Cause,
+    pub confidence: u8,
+    pub evidence: Vec<String>,
+    pub timeline: Vec<(Timestamp, String)>,
+    pub wer_module: Option<String>,
+    pub minidumps: Vec<(Timestamp, PathBuf)>,
     pub display_events: Vec<EventRecord>,
 }
