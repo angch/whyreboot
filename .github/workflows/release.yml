@@ -10,8 +10,26 @@ permissions:
   contents: write
 
 jobs:
+  # Gate: never cut a release from an unformatted tree. Cheap and fails fast,
+  # so the three build jobs below don't burn minutes on a tree that must be
+  # re-tagged anyway. Mirrors the `fmt` job in ci.yml.
+  fmt:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable (rustfmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
   build-macos:
     runs-on: macos-latest
+    needs: fmt
 
     steps:
       - uses: actions/checkout@v4

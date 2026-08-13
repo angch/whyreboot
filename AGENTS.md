@@ -255,6 +255,45 @@ Each `BootCycle` prints:
 
 ---
 
+## Code formatting — non-negotiable
+
+**Every commit must be `rustfmt`-clean.** Run `cargo fmt` before committing and verify with:
+
+```
+cargo fmt --check    # must exit 0 and print nothing
+```
+
+The whole tree was normalized in one pass (v0.5.0); do not reintroduce hand-formatting. In particular, **no gofmt-style column alignment** — rustfmt collapses these and will fight you forever:
+
+```rust
+// WRONG — hand-aligned, rustfmt will rewrite it
+Finding { time:     line.time,
+          severity: Severity::Critical, }
+let pid  = first_number(after);
+let comm = between(after, '(', ')');
+
+// RIGHT — let rustfmt decide
+Finding { time: line.time, severity: Severity::Critical }
+let pid = first_number(after);
+let comm = between(after, '(', ')');
+```
+
+The same applies to manually packed multi-argument calls (the Win32 `CreateWindowExW` calls in `gui/`) and aligned `match` arms — write it however, then run `cargo fmt` and commit what it produces.
+
+There is no `rustfmt.toml`; default rustfmt settings are the standard. If you genuinely need to preserve a hand layout (e.g. a table-like `const` array), use a targeted `#[rustfmt::skip]` on that item and say why in a comment — never disable formatting repo-wide.
+
+Note `cargo fmt` covers the workspace including `gui/`, which is excluded from `default-members` for build/test — so `cargo fmt --all --check` on Linux still checks the Windows-only GUI sources.
+
+**This is enforced in CI**, not just documented: the `fmt` job in `.github/workflows/ci.yml` runs on every push to `main` and every PR, and `.github/workflows/release.yml` has a `fmt` gate that all three build jobs depend on — an unformatted tree fails the tag build before any binary is produced.
+
+The one-shot reformat commit is listed in `.git-blame-ignore-revs` so it doesn't pollute history. Run this once per clone to make local blame skip it (GitHub's blame view honours the file automatically):
+
+```
+git config blame.ignoreRevsFile .git-blame-ignore-revs
+```
+
+---
+
 ## Known pitfalls and constraints
 
 - **No XML dep:** XML parsing is hand-rolled (`xml_attr`, `xml_elem`, `xml_data`). Don't add `serde-xml` or similar.

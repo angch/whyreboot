@@ -1,0 +1,10 @@
+# Revisions to skip when running `git blame`.
+#
+# Enable locally with:
+#     git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# GitHub honours this file automatically in its blame view.
+
+# style: format entire tree with rustfmt (whitespace only; audited to change
+# no string literals and no semantics)
+40934187a5a0a93fc0786444a1c39bbd4b4205af
