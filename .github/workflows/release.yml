@@ -93,10 +93,25 @@ jobs:
 
       # No musl-tools/C cross-toolchain needed: the crate has no C dependencies
       # and rust-std ships a prebuilt musl libc, so the target alone suffices.
+      # Stable runs the tests and is the fallback if the nightly build below
+      # breaks; the shipped binary is normally built by nightly.
       - name: Install Rust stable (musl target)
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
+
+      # `-Zbuild-std` is nightly-only. It rebuilds std without its `backtrace`
+      # feature, which halves the shipped artifact (216 KB -> 125 KB compressed).
+      # That machinery is dead weight here: the release profile sets
+      # `strip = true`, so every frame it prints is `<unknown>` — dropping it
+      # keeps the panic message and file:line and loses only hex addresses.
+      # See "Binary size" in AGENTS.md. Revert to a plain stable build once
+      # build-std stabilizes.
+      - name: Install Rust nightly (build-std)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-unknown-linux-musl
+          components: rust-src
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -105,15 +120,34 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          # Distinct from the other jobs' key: this target dir holds a
+          # from-source std, which must not be shared with a stable build.
+          key: ${{ runner.os }}-cargo-buildstd-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-buildstd-
 
+      # Tests run on stable: they exercise this crate's logic, which the nightly
+      # std swap doesn't change, and building std from source for the test
+      # profile as well would only cost minutes.
       - name: Run tests
-        run: cargo test --release --target x86_64-unknown-linux-musl
+        run: cargo +stable test --release --target x86_64-unknown-linux-musl
 
       # default-members = ["."] keeps the Windows-only GUI out of this build.
-      - name: Build release binary (static musl)
-        run: cargo build --release --target x86_64-unknown-linux-musl
+      # `-C relocation-model=static` comes from .cargo/config.toml — deliberately
+      # not passed as RUSTFLAGS here, which would override that config.
+      - name: Build release binary (nightly, std without backtrace)
+        id: build_min
+        continue-on-error: true
+        run: |
+          cargo +nightly build --release --target x86_64-unknown-linux-musl \
+            -Zbuild-std=std,panic_abort -Zbuild-std-features=
+
+      # A nightly regression must not block a release. If build-std fails, fall
+      # back to the stable build: same binary, ~90 KB larger compressed.
+      - name: Fall back to stable build
+        if: steps.build_min.outcome == 'failure'
+        run: |
+          echo "::warning::nightly -Zbuild-std failed; falling back to the stable build (larger binary)"
+          cargo +stable build --release --target x86_64-unknown-linux-musl
 
       - name: Verify fully static
         run: |
@@ -125,8 +159,16 @@ jobs:
           sudo apt-get update -q && sudo apt-get install -qy upx-ucl
           upx --best --lzma target/x86_64-unknown-linux-musl/release/whyreboot
 
+      # Exercise the artifact that actually ships, not just `--help`: replay a
+      # fixture and require the documented exit code. This is what would catch a
+      # from-source std that built but misbehaves at runtime.
       - name: Smoke test compressed binary
-        run: target/x86_64-unknown-linux-musl/release/whyreboot --help
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/whyreboot
+          $BIN --help
+          $BIN --from-file tests/fixtures/oom.jsonl --all --no-color
+          set +e; $BIN --from-file tests/fixtures/oom.jsonl --all --exit-code >/dev/null; rc=$?; set -e
+          test "$rc" -eq 10 || { echo "expected exit 10 for critical findings, got $rc"; exit 1; }
 
       - name: Rename artifact
         run: cp target/x86_64-unknown-linux-musl/release/whyreboot whyreboot-cli-x86_64-linux

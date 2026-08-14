@@ -18,6 +18,13 @@ detect.rs). When a real GPU hang / compositor crash / OOM happens on real
 hardware: capture `journalctl -o json` around it, replay with `--from-file`,
 fix any misses, and upgrade the detector's provenance note to verified-live.
 
+### Drop nightly from the release job when `-Zbuild-std` stabilizes
+The Linux release artifact is built on nightly purely to rebuild std without its
+`backtrace` feature (216 KB → 125 KB compressed; the machinery can't symbolize
+anything anyway because the profile sets `strip = true`). The job falls back to a
+stable build if nightly breaks. When build-std is stable, delete the nightly
+toolchain step and the fallback, and build with stable directly.
+
 ### Other next steps
 - More detectors: filesystem-full (`No space left`), network link flaps, watchdog
   reboots, `systemd-coredump` truncation, apparmor/SELinux denials, USB resets.

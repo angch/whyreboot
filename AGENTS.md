@@ -17,7 +17,7 @@ The two platforms share a portable core (data model, timestamp, analysis logic) 
 **Windows binary:** `C:\Users\angch\.local\bin\whyreboot.exe` (on PATH)  
 **Build (Windows):** `cargo build --release && copy target\release\whyreboot.exe C:\Users\angch\.local\bin\`  
 **Build/test (Linux):** `cargo build` / `cargo test` (skips the Windows-only GUI).  
-**Static Linux release:** `cargo build --release --target x86_64-unknown-linux-musl` — no `musl-tools`/C toolchain needed (no C deps; rust-std ships musl libc). Produces a static binary (~528 KB; UPX → ~216 KB, no startup cost). The release workflow builds/tests/uploads this as `whyreboot-cli-x86_64-linux`; its `file`/`ldd` step asserts the binary really is static, so don't add a crate with a C build dependency without updating that job.  
+**Static Linux release:** `cargo build --release --target x86_64-unknown-linux-musl` — no `musl-tools`/C toolchain needed (no C deps; rust-std ships musl libc). Produces a static binary (~528 KB; UPX → ~216 KB, no startup cost). **The release workflow builds the shipped artifact on nightly with `-Zbuild-std` instead (~301 KB, UPX → ~125 KB) — see "Binary size" below.** A plain stable build is still correct, just larger. The release workflow builds/tests/uploads this as `whyreboot-cli-x86_64-linux`; its `file`/`ldd` step asserts the binary really is static, so don't add a crate with a C build dependency without updating that job.  
 **No admin/root required** for most data — Windows System channel is readable by standard users (`C:\Windows\Minidump` needs admin, falls back to WER AttachedFiles); Linux `journalctl` is readable by the `systemd-journal`/`adm` groups.
 
 ---
@@ -345,19 +345,27 @@ stack backtrace:
 | build-std, no `backtrace` feature | 300,808 | 124,720 | message + file:line, no frames |
 | build-std + `panic=immediate-abort` | 181,920 | 84,328 | **nothing** — silent abort |
 
-`immediate-abort` is the smallest and the wrong trade for a diagnostic tool: a bug becomes an unexplained `SIGILL` with no message and no way for a user to report it usefully. The middle row is the real prize — **−58% compressed for output that is strictly more useful than what ships today**.
+`immediate-abort` is the smallest and the wrong trade for a diagnostic tool: a bug becomes an unexplained `SIGILL` with no message and no way for a user to report it usefully.
 
-It is not adopted because it needs **nightly** (`-Zbuild-std`), which the release workflow deliberately doesn't use. The working recipe, if that ever changes:
+**The middle row is what ships.** The `build-linux` release job builds it on nightly:
 
 ```
 rustup toolchain install nightly --component rust-src
-rustup target add x86_64-unknown-linux-musl --toolchain nightly   # for the self-contained CRT + libunwind.a
-RUSTFLAGS="-C relocation-model=static" \
-  cargo +nightly build --release --target x86_64-unknown-linux-musl \
-    -Zbuild-std=std,panic_abort -Zbuild-std-features=
+rustup target add x86_64-unknown-linux-musl --toolchain nightly   # self-contained CRT + libunwind.a
+cargo +nightly build --release --target x86_64-unknown-linux-musl \
+  -Zbuild-std=std,panic_abort -Zbuild-std-features=
 ```
 
-Needs `musl-tools` only if you link with `musl-gcc` instead of the self-contained CRT. Without the nightly musl target installed, point the linker at the stable toolchain's copy: `-C linker=musl-gcc -C link-self-contained=no -C link-arg=-L$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained`.
+Notes for anyone touching that job:
+
+- **Don't set `RUSTFLAGS`** in the workflow. It would override `.cargo/config.toml`, and the non-PIE flag lives there.
+- `-Zbuild-std-features=` (empty) is the load-bearing part: it drops std's default features, `backtrace` among them. Without it you rebuild std and save nothing.
+- Tests run on `+stable`; the nightly std swap doesn't change this crate's logic, and building std from source for the test profile too would only cost minutes.
+- The job **falls back to a stable build** if the nightly one fails, so a nightly regression can't block a release — it just ships the larger binary with a warning annotation.
+- The cache key is separate (`-cargo-buildstd-`) because that `target/` holds a from-source std.
+- `musl-tools` is only needed if you link with `musl-gcc` instead of the self-contained CRT. Without the nightly musl target installed, point at the stable toolchain's copy: `-C linker=musl-gcc -C link-self-contained=no -C link-arg=-L$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained`.
+
+**Revert to a plain stable build once `build-std` stabilizes** — that is the only reason nightly is in the release path.
 
 ---
 
