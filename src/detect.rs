@@ -881,10 +881,20 @@ fn detect_hardware(line: &LogLine) -> Option<Finding> {
 /// Provenance: **verified-live** — matched real `Failed with result
 /// 'exit-code'` events (iperf3, openipmi, snap units) in this dev machine's
 /// journal during development.
+///
+/// The unit name comes from the `UNIT`/`USER_UNIT` journal field (set by the
+/// systemd manager itself since v198, Jan 2013), which carries the exact name
+/// even when it contains colons (e.g. `dbus-:1.2-org.kde.KSplash@6.service`).
+/// `USER_UNIT` marks a per-user-session unit, so the diagnostic hint uses
+/// `systemctl --user` / `journalctl --user` (a plain `journalctl -u <user
+/// unit>` returns "No entries").
 fn detect_service_failure(line: &LogLine) -> Option<Finding> {
     if !line.identifier.eq_ignore_ascii_case("systemd") {
         return None;
     }
+    // systemd's failure notices are fixed English literals (e.g. "Failed with
+    // result 'exit-code'."), so matching any marker rules out the far more
+    // numerous routine start/stop lines.
     let markers = [
         "Failed with result",
         "Main process exited, code=dumped",
@@ -895,34 +905,25 @@ fn detect_service_failure(line: &LogLine) -> Option<Finding> {
     if !matches_any(&line.message, &markers) {
         return None;
     }
-    // The unit name is the message prefix before the first ':' ("foo.service: Failed …").
-    let unit = line
-        .message
-        .split(':')
-        .next()
-        .map(str::trim)
-        .filter(|u| {
-            u.ends_with(".service")
-                || u.ends_with(".mount")
-                || u.ends_with(".socket")
-                || u.ends_with(".timer")
-        })
-        .unwrap_or("A systemd unit");
+    let unit = if line.unit.is_empty() {
+        "A systemd unit"
+    } else {
+        line.unit.as_str()
+    };
     let dumped = contains_ci(&line.message, "code=dumped");
     let title = if dumped {
         format!("Service '{unit}' crashed (dumped core)")
     } else {
         format!("Service '{unit}' failed")
     };
+    let scope = if line.user_unit { "--user " } else { "" };
     Some(finding(
         line,
         Severity::Warning,
         "Service",
         title,
         vec![format!(
-            "Inspect with `systemctl status {}` and `journalctl -u {}`.",
-            unit.trim_start_matches('\''),
-            unit.trim_start_matches('\'')
+            "Inspect with `systemctl {scope}status {unit}` and `journalctl {scope}-u {unit}`.",
         )],
         "systemd",
     ))
@@ -1167,6 +1168,8 @@ mod tests {
             message: msg.into(),
             identifier: "kernel".into(),
             transport: "kernel".into(),
+            unit: String::new(),
+            user_unit: false,
         }
     }
     fn kline(msg: &str) -> LogLine {
@@ -1178,6 +1181,26 @@ mod tests {
             message: msg.into(),
             identifier: "systemd".into(),
             transport: "journal".into(),
+            unit: String::new(),
+            user_unit: false,
+        }
+    }
+    /// Like [`systemd`] but sets the `UNIT` journal field (as a real
+    /// `journalctl -o json` record would for a systemd-manager entry).
+    fn systemd_unit(unit: &str, msg: &str) -> LogLine {
+        LogLine {
+            unit: unit.into(),
+            ..systemd(msg)
+        }
+    }
+    /// Like [`systemd`] but sets the `USER_UNIT` journal field, marking it a
+    /// per-user-session unit (as `journalctl -o json` does for entries from the
+    /// user manager, e.g. `dbus-:1.2-org.kde.KSplash@6.service`).
+    fn systemd_user_unit(unit: &str, msg: &str) -> LogLine {
+        LogLine {
+            unit: unit.into(),
+            user_unit: true,
+            ..systemd(msg)
         }
     }
 
@@ -1311,7 +1334,11 @@ mod tests {
 
     #[test]
     fn service_failure_needs_systemd_identifier() {
-        let f = classify(&systemd("nginx.service: Failed with result 'exit-code'.")).unwrap();
+        let f = classify(&systemd_unit(
+            "nginx.service",
+            "nginx.service: Failed with result 'exit-code'.",
+        ))
+        .unwrap();
         assert_eq!(f.category, "Service");
         assert!(f.title.contains("nginx.service"));
         // The same text from a non-systemd source must NOT be a service failure.
@@ -1325,12 +1352,94 @@ mod tests {
     }
 
     #[test]
+    fn service_failure_dbus_transient_unit_name() {
+        // Transient D-Bus-activated units have colons in the name
+        // (`dbus-:1.2-org.kde.KSplash@6.service`).  The USER_UNIT journal field
+        // carries the exact name, so the title and hint reference it in full
+        // (no colon-split truncation).
+        let f = classify(&systemd_user_unit(
+            "dbus-:1.2-org.kde.KSplash@6.service",
+            "dbus-:1.2-org.kde.KSplash@6.service: Failed with result 'exit-code'.",
+        ))
+        .unwrap();
+        assert_eq!(f.category, "Service");
+        assert!(
+            f.title.contains("dbus-:1.2-org.kde.KSplash@6.service"),
+            "title was: {}",
+            f.title
+        );
+        assert!(
+            f.evidence
+                .iter()
+                .any(|e| e.contains("systemctl --user status dbus-:1.2-org.kde.KSplash@6.service")),
+            "evidence should reference the full unit name: {:?}",
+            f.evidence
+        );
+    }
+
+    #[test]
+    fn service_failure_uses_unit_field_not_message() {
+        // The UNIT/USER_UNIT field is authoritative — even when it disagrees
+        // with the message prefix (here the message shows a bare template name,
+        // but the field carries the fully-instantiated name).
+        let f = classify(&systemd_user_unit(
+            "app-org.kde.bluedevilwizard@3f97a42ddf354f3abb60f31eaab5b709.service",
+            "app-org.kde.bluedevilwizard@.service: Failed with result 'exit-code'.",
+        ))
+        .unwrap();
+        assert_eq!(f.category, "Service");
+        assert!(
+            f.title
+                .contains("app-org.kde.bluedevilwizard@3f97a42ddf354f3abb60f31eaab5b709.service"),
+            "title was: {}",
+            f.title
+        );
+        assert!(
+            f.evidence.iter().any(|e| e.contains(
+                "systemctl --user status app-org.kde.bluedevilwizard@3f97a42ddf354f3abb60f31eaab5b709.service"
+            )),
+            "evidence should reference the field name: {:?}",
+            f.evidence
+        );
+    }
+
+    #[test]
+    fn service_failure_system_unit_no_user_scope() {
+        // System units (UNIT field, from PID 1) get the plain scope — no `--user`.
+        let f = classify(&systemd_unit(
+            "nginx.service",
+            "nginx.service: Failed with result 'exit-code'.",
+        ))
+        .unwrap();
+        assert_eq!(f.category, "Service");
+        assert!(
+            f.evidence
+                .iter()
+                .any(|e| e.contains("systemctl status nginx.service") && !e.contains("--user")),
+            "system unit hint should not use --user: {:?}",
+            f.evidence
+        );
+    }
+
+    #[test]
+    fn service_failure_without_unit_field() {
+        // When the UNIT/USER_UNIT field is absent (pre-2013 journal data, or a
+        // fixture line without the field), the detector still fires but falls
+        // back to the generic "A systemd unit" label.
+        let f = classify(&systemd("nginx.service: Failed with result 'exit-code'.")).unwrap();
+        assert_eq!(f.category, "Service");
+        assert!(f.title.contains("A systemd unit"), "title was: {}", f.title);
+    }
+
+    #[test]
     fn coredump_detected() {
         let l = LogLine {
             time: Timestamp(1_700_000_000),
             message: "Process 4242 (chrome) of user 1000 dumped core.".into(),
             identifier: "systemd-coredump".into(),
             transport: "journal".into(),
+            unit: String::new(),
+            user_unit: false,
         };
         let f = classify(&l).unwrap();
         assert_eq!(f.category, "Coredump");
@@ -1500,6 +1609,8 @@ mod tests {
             message: msg.into(),
             identifier: ident.into(),
             transport: "journal".into(),
+            unit: String::new(),
+            user_unit: false,
         }
     }
 
@@ -1663,6 +1774,8 @@ mod tests {
                 message: "Lost connection to Wayland compositor.".into(),
                 identifier: "firefox".into(),
                 transport: "journal".into(),
+                unit: String::new(),
+                user_unit: false,
             },
         ];
         let found = scan(&lines);

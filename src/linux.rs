@@ -102,7 +102,7 @@ pub use crate::jsonlog::fetch_from_file;
 
 /// Runs `journalctl` with the given extra args plus JSON output and the window
 /// bounds, returning parsed lines. `--output-fields` trims each record to the
-/// four fields the detectors use, cutting journalctl's serialization and our
+/// fields the detectors use, cutting journalctl's serialization and our
 /// parsing cost (journald always also emits `__REALTIME_TIMESTAMP`).
 fn run_journalctl(extra: &[&str], window: &TimeWindow) -> io::Result<Vec<LogLine>> {
     let mut cmd = Command::new("journalctl");
@@ -111,7 +111,7 @@ fn run_journalctl(extra: &[&str], window: &TimeWindow) -> io::Result<Vec<LogLine
         "-o",
         "json",
         "--no-pager",
-        "--output-fields=MESSAGE,SYSLOG_IDENTIFIER,_TRANSPORT",
+        "--output-fields=MESSAGE,SYSLOG_IDENTIFIER,_TRANSPORT,UNIT,USER_UNIT",
     ]);
 
     // journalctl accepts `@<unix-seconds>` for absolute since/until.
