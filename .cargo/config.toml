@@ -1,0 +1,18 @@
+# Build configuration committed so local builds and CI agree.
+
+# The shipped Linux artifact is the static musl binary, and it is size-sensitive
+# (the release workflow UPX-compresses it). `relocation-model=static` builds it
+# as a plain static executable instead of the target's default static-PIE,
+# dropping the PIE relocation machinery: ~12 KB raw, ~5 KB after UPX.
+#
+# The trade-off is deliberate: a non-PIE executable is loaded at a fixed address,
+# so the binary's own code and data lose ASLR (the stack, heap, and any shared
+# libraries keep theirs — and a static binary has none). whyreboot is a local,
+# short-lived diagnostic that reads log text and opens no sockets or ports; it is
+# not an attack surface where executable-image ASLR is doing meaningful work.
+# Revisit if it ever gains a network path, a daemon mode, or setuid use.
+#
+# This stays a static binary — the release workflow's `file`/`ldd` assertion
+# still passes ("statically linked", just no longer "static-pie").
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "relocation-model=static"]

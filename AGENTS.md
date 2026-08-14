@@ -17,7 +17,7 @@ The two platforms share a portable core (data model, timestamp, analysis logic) 
 **Windows binary:** `C:\Users\angch\.local\bin\whyreboot.exe` (on PATH)  
 **Build (Windows):** `cargo build --release && copy target\release\whyreboot.exe C:\Users\angch\.local\bin\`  
 **Build/test (Linux):** `cargo build` / `cargo test` (skips the Windows-only GUI).  
-**Static Linux release:** `cargo build --release --target x86_64-unknown-linux-musl` — no `musl-tools`/C toolchain needed (no C deps; rust-std ships musl libc). Produces a static-pie binary (~541 KB; UPX → ~221 KB, no startup cost). The release workflow builds/tests/uploads this as `whyreboot-cli-x86_64-linux`; its `file`/`ldd` step asserts the binary really is static, so don't add a crate with a C build dependency without updating that job.  
+**Static Linux release:** `cargo build --release --target x86_64-unknown-linux-musl` — no `musl-tools`/C toolchain needed (no C deps; rust-std ships musl libc). Produces a static binary (~528 KB; UPX → ~216 KB, no startup cost). The release workflow builds/tests/uploads this as `whyreboot-cli-x86_64-linux`; its `file`/`ldd` step asserts the binary really is static, so don't add a crate with a C build dependency without updating that job.  
 **No admin/root required** for most data — Windows System channel is readable by standard users (`C:\Windows\Minidump` needs admin, falls back to WER AttachedFiles); Linux `journalctl` is readable by the `systemd-journal`/`adm` groups.
 
 ---
@@ -310,7 +310,9 @@ git config blame.ignoreRevsFile .git-blame-ignore-revs
 
 ## Binary size
 
-The release profile is already fully size-tuned (`opt-level="z"`, fat LTO, `codegen-units=1`, `strip`, `panic="abort"`) — there is nothing left to win there. Measured composition of the 541 KB musl binary (`nm -S -C` on an unstripped build, grouped by symbol origin):
+The shipped Linux artifact is a static musl binary, UPX-compressed by the release workflow. `.cargo/config.toml` adds `-C relocation-model=static` for that target (non-PIE; see the file for the ASLR trade-off). The release profile is otherwise fully size-tuned already — `opt-level="z"`, fat LTO, `codegen-units=1`, `strip`, `panic="abort"` — so there is nothing left to win there.
+
+Measured composition (`nm -S -C` on an unstripped build, grouped by symbol origin):
 
 | | bytes | |
 |---|---:|---|
@@ -318,12 +320,44 @@ The release profile is already fully size-tuned (`opt-level="z"`, fat LTO, `code
 | rest of std/core/alloc/musl | 167,044 | 31% |
 | **whyreboot's own code** | **34,964** | 6% |
 
-**Our code is 6% of the binary.** Micro-optimizing it is not where the size is; the two rules that actually matter:
+**Our code is 6% of the binary**, so micro-optimizing it is not where the size is. Two rules that do matter:
 
-- **Don't format floats.** A single `{:.1}` on an `f64` links all of `core::fmt::float` (plus musl's `fmt_fp`/`printf_core`) — **16 KB**, measured, for one decimal place. `oom::one_decimal` does it with integer math instead. Before adding any float formatting, check whether integers will do.
-- **Watch monomorphization over `Finding`.** It is a large struct; each distinct `sort_by_key` closure instantiates its own copy of the sort (~1.5 KB each). `detect::scan` deliberately keeps two — see the comment there for why `reverse()` is not a valid substitute.
+- **Don't format floats.** A single `{:.1}` on an `f64` links all of `core::fmt::float` plus musl's `fmt_fp`/`printf_core` — **16 KB**, measured, for one decimal place. `oom::one_decimal` does it with integer math. Check whether integers will do before adding any float formatting.
+- **Watch monomorphization over `Finding`.** It is a large struct; each distinct `sort_by_key` closure instantiates its own copy of the sort (~1.5 KB). `detect::scan` deliberately keeps two — see the comment there for why `reverse()` is not a valid substitute.
 
-The remaining 40% is std's panic-backtrace machinery, linked even though `panic = "abort"`. Removing it needs `-Zbuild-std` + `-Cpanic=immediate-abort` on **nightly**, which would trade the stable, no-C-toolchain build story (and, locally, needs gcc's musl CRT objects) for ~200 KB. Not adopted; revisit only if the size ever actually matters. Non-PIE (`-C relocation-model=static`) saves a further ~12 KB raw / ~5 KB compressed at the cost of executable ASLR — also not adopted.
+### The 40%: panic machinery, and what it's worth
+
+`strip = true` means that machinery **cannot symbolize anything**. A real panic in the shipped binary prints:
+
+```
+thread 'main' panicked at src/main.rs:4:21:
+index out of bounds: the len is 3 but the index is 99
+stack backtrace:
+   0:           0x412ffa - <unknown>
+   1:           0x406804 - <unknown>
+```
+
+218 KB to print hex addresses. Rebuilding std without its `backtrace` feature removes it and keeps the part that is actually diagnostic (message + file:line). Measured on this machine, all three verified by forcing a real panic:
+
+| build | raw | UPX | on panic |
+|---|---:|---:|---|
+| **stable, as shipped** | 528,464 | 215,952 | message + `<unknown>` frames |
+| build-std, no `backtrace` feature | 300,808 | 124,720 | message + file:line, no frames |
+| build-std + `panic=immediate-abort` | 181,920 | 84,328 | **nothing** — silent abort |
+
+`immediate-abort` is the smallest and the wrong trade for a diagnostic tool: a bug becomes an unexplained `SIGILL` with no message and no way for a user to report it usefully. The middle row is the real prize — **−58% compressed for output that is strictly more useful than what ships today**.
+
+It is not adopted because it needs **nightly** (`-Zbuild-std`), which the release workflow deliberately doesn't use. The working recipe, if that ever changes:
+
+```
+rustup toolchain install nightly --component rust-src
+rustup target add x86_64-unknown-linux-musl --toolchain nightly   # for the self-contained CRT + libunwind.a
+RUSTFLAGS="-C relocation-model=static" \
+  cargo +nightly build --release --target x86_64-unknown-linux-musl \
+    -Zbuild-std=std,panic_abort -Zbuild-std-features=
+```
+
+Needs `musl-tools` only if you link with `musl-gcc` instead of the self-contained CRT. Without the nightly musl target installed, point the linker at the stable toolchain's copy: `-C linker=musl-gcc -C link-self-contained=no -C link-arg=-L$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained`.
 
 ---
 
