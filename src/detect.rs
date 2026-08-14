@@ -79,7 +79,13 @@ pub fn scan(lines: &[LogLine]) -> Vec<Finding> {
     found.sort_by_key(|f| f.time); // ascending for coalescing
     let mut merged = coalesce(found);
     correlate(&mut merged);
-    merged.sort_by_key(|f| std::cmp::Reverse(f.time)); // present newest-first
+    // Present newest-first. This second `sort_by_key` instantiates the sort a
+    // second time for `Finding` (~1.5 KB of code), and `merged` is already
+    // ascending — but `reverse()` is NOT equivalent: a stable sort keeps the
+    // original relative order of equal timestamps, while reversing flips them,
+    // which reorders co-timestamped findings in the report (seen on the GPU
+    // cascade fixture). Keep the sort.
+    merged.sort_by_key(|f| std::cmp::Reverse(f.time));
     merged
 }
 

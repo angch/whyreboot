@@ -123,28 +123,37 @@ fn parse_argv(argv: impl Iterator<Item = String>) -> Result<Option<Args>, String
     Ok(Some(args))
 }
 
+/// One `print!` of one literal rather than ~20 `println!` calls: each call site
+/// emits its own `format_args` setup, which is pure weight in a binary this
+/// size-sensitive. The exit code is interpolated so the text can't drift from
+/// [`EXIT_ISSUES_FOUND`].
 fn print_help() -> ! {
-    println!("whyreboot — diagnose system issues (reboots on Windows; OOM and more on Linux)");
-    println!();
-    println!("USAGE: whyreboot [OPTIONS] [TIME-RANGE]");
-    println!();
-    println!("TIME-RANGE (Linux):");
-    println!("  A duration or phrase: \"1 hour ago\", \"30 minutes ago\", \"2h\", \"today\",");
-    println!("  \"yesterday\", or \"all\". Defaults to the last 24 hours.");
-    println!();
-    println!("OPTIONS:");
-    println!("  --since <expr>  Time range to analyze (alias: --for, --window)");
-    println!("  --all           Analyze all available history");
-    println!(
-        "  --exit-code     Exit {EXIT_ISSUES_FOUND} if a critical issue (or crash reboot) was found"
+    print!(
+        "\
+whyreboot — diagnose system issues (reboots on Windows; OOM and more on Linux)
+
+USAGE: whyreboot [OPTIONS] [TIME-RANGE]
+
+TIME-RANGE (Linux/macOS):
+  A duration or phrase: \"1 hour ago\", \"30 minutes ago\", \"2h\", \"today\",
+  \"yesterday\", or \"all\". Defaults to the last 24 hours.
+
+OPTIONS:
+  --since <expr>  Time range to analyze (alias: --for, --window)
+  --all           Analyze all available history
+  --exit-code     Exit {EXIT_ISSUES_FOUND} if a critical issue (or crash reboot) was found
+  --history N     [Windows] show last N boot cycles (default: 1)
+  --from-file <f> Replay a capture instead of reading live logs:
+                  journalctl -o json / log show ndjson, or on Windows
+                  `wevtutil qe System /f:xml` event XML
+  --json          Output JSON instead of text
+  --no-color      Disable ANSI color output
+  --help, -h      Show this help
+
+EXIT CODES:
+  0 ok   1 could not read logs   2 usage error   {EXIT_ISSUES_FOUND} issues found (--exit-code)
+"
     );
-    println!("  --history N     [Windows] show last N boot cycles (default: 1)");
-    println!("  --from-file <f> Replay a capture instead of reading live logs:");
-    println!("                  journalctl -o json / log show ndjson, or on Windows");
-    println!("                  `wevtutil qe System /f:xml` event XML");
-    println!("  --json          Output JSON instead of text");
-    println!("  --no-color      Disable ANSI color output");
-    println!("  --help, -h      Show this help");
     std::process::exit(0);
 }
 

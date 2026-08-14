@@ -17,7 +17,7 @@ The two platforms share a portable core (data model, timestamp, analysis logic) 
 **Windows binary:** `C:\Users\angch\.local\bin\whyreboot.exe` (on PATH)  
 **Build (Windows):** `cargo build --release && copy target\release\whyreboot.exe C:\Users\angch\.local\bin\`  
 **Build/test (Linux):** `cargo build` / `cargo test` (skips the Windows-only GUI).  
-**Static Linux release:** `cargo build --release --target x86_64-unknown-linux-musl` — no `musl-tools`/C toolchain needed (no C deps; rust-std ships musl libc). Produces a static-pie binary (~520 KB; UPX → ~215 KB, no startup cost). The release workflow builds/tests/uploads this as `whyreboot-cli-x86_64-linux`; its `file`/`ldd` step asserts the binary really is static, so don't add a crate with a C build dependency without updating that job.  
+**Static Linux release:** `cargo build --release --target x86_64-unknown-linux-musl` — no `musl-tools`/C toolchain needed (no C deps; rust-std ships musl libc). Produces a static-pie binary (~541 KB; UPX → ~221 KB, no startup cost). The release workflow builds/tests/uploads this as `whyreboot-cli-x86_64-linux`; its `file`/`ldd` step asserts the binary really is static, so don't add a crate with a C build dependency without updating that job.  
 **No admin/root required** for most data — Windows System channel is readable by standard users (`C:\Windows\Minidump` needs admin, falls back to WER AttachedFiles); Linux `journalctl` is readable by the `systemd-journal`/`adm` groups.
 
 ---
@@ -305,6 +305,25 @@ The one-shot reformat commit is listed in `.git-blame-ignore-revs` so it doesn't
 ```
 git config blame.ignoreRevsFile .git-blame-ignore-revs
 ```
+
+---
+
+## Binary size
+
+The release profile is already fully size-tuned (`opt-level="z"`, fat LTO, `codegen-units=1`, `strip`, `panic="abort"`) — there is nothing left to win there. Measured composition of the 541 KB musl binary (`nm -S -C` on an unstripped build, grouped by symbol origin):
+
+| | bytes | |
+|---|---:|---|
+| panic backtrace + unwinder (gimli, addr2line, miniz_oxide, rustc_demangle, libunwind) | 218,826 | 40% |
+| rest of std/core/alloc/musl | 167,044 | 31% |
+| **whyreboot's own code** | **34,964** | 6% |
+
+**Our code is 6% of the binary.** Micro-optimizing it is not where the size is; the two rules that actually matter:
+
+- **Don't format floats.** A single `{:.1}` on an `f64` links all of `core::fmt::float` (plus musl's `fmt_fp`/`printf_core`) — **16 KB**, measured, for one decimal place. `oom::one_decimal` does it with integer math instead. Before adding any float formatting, check whether integers will do.
+- **Watch monomorphization over `Finding`.** It is a large struct; each distinct `sort_by_key` closure instantiates its own copy of the sort (~1.5 KB each). `detect::scan` deliberately keeps two — see the comment there for why `reverse()` is not a valid substitute.
+
+The remaining 40% is std's panic-backtrace machinery, linked even though `panic = "abort"`. Removing it needs `-Zbuild-std` + `-Cpanic=immediate-abort` on **nightly**, which would trade the stable, no-C-toolchain build story (and, locally, needs gcc's musl CRT objects) for ~200 KB. Not adopted; revisit only if the size ever actually matters. Non-PIE (`-C relocation-model=static`) saves a further ~12 KB raw / ~5 KB compressed at the cost of executable ASLR — also not adopted.
 
 ---
 

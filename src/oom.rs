@@ -179,14 +179,32 @@ fn extract_field_kb(s: &str, key: &str) -> Option<u64> {
 }
 
 /// Formats a kilobyte count as a human-readable size.
+///
+/// Integer math on purpose. These were the only two float format sites in the
+/// crate, and `{:.1}` on an `f64` links all of `core::fmt::float` — ~9 KB in a
+/// ~550 KB binary, to print one decimal place. Rounding is half-up here rather
+/// than float formatting's half-to-even; for a displayed size that difference is
+/// invisible, and it only shows up at an exact .05 boundary.
 fn human_kb(kb: u64) -> String {
-    if kb >= 1024 * 1024 {
-        format!("{:.1} GB", kb as f64 / (1024.0 * 1024.0))
-    } else if kb >= 1024 {
-        format!("{:.1} MB", kb as f64 / 1024.0)
-    } else {
-        format!("{kb} kB")
+    match kb {
+        _ if kb >= 1024 * 1024 => one_decimal(kb, 1024 * 1024, "GB"),
+        _ if kb >= 1024 => one_decimal(kb, 1024, "MB"),
+        _ => format!("{kb} kB"),
     }
+}
+
+/// `kb / unit` to one decimal place, e.g. `(2_150_400, 1024*1024, "GB")` → `"2.1 GB"`.
+/// The remainder is scaled before dividing, so nothing overflows and no float is
+/// involved.
+fn one_decimal(kb: u64, unit: u64, suffix: &str) -> String {
+    let mut whole = kb / unit;
+    // +unit/2 over 10ths = round half up on the first decimal.
+    let mut tenths = ((kb % unit) * 10 + unit / 2) / unit;
+    if tenths == 10 {
+        whole += 1;
+        tenths = 0;
+    }
+    format!("{whole}.{tenths} {suffix}")
 }
 
 #[cfg(test)]
@@ -307,5 +325,21 @@ mod tests {
         assert_eq!(human_kb(512), "512 kB");
         assert_eq!(human_kb(2048), "2.0 MB");
         assert_eq!(human_kb(2 * 1024 * 1024), "2.0 GB");
+    }
+
+    /// Guards the integer formatter that replaced `{:.1}` on an `f64`: the
+    /// values below are what the float version printed.
+    #[test]
+    fn human_kb_rounds_and_carries_like_the_float_version() {
+        assert_eq!(human_kb(1024), "1.0 MB");
+        assert_eq!(human_kb(1024 * 1024 - 1), "1024.0 MB"); // just under a GB
+        assert_eq!(human_kb(2_515_432), "2.4 GB"); // a real anon-rss value
+        assert_eq!(human_kb(1536), "1.5 MB");
+        assert_eq!(human_kb(1587), "1.5 MB"); // 1.5498… → 1.5, not 1.6
+        assert_eq!(human_kb(1638), "1.6 MB"); // 1.5996… → 1.6
+        // Rounding up to the next whole unit must carry, not print "1.10".
+        assert_eq!(human_kb(1024 * 1024 - 50), "1024.0 MB");
+        assert_eq!(human_kb(0), "0 kB");
+        assert_eq!(human_kb(u64::MAX), "17592186044416.0 GB"); // no overflow
     }
 }
