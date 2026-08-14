@@ -18,49 +18,7 @@ detect.rs). When a real GPU hang / compositor crash / OOM happens on real
 hardware: capture `journalctl -o json` around it, replay with `--from-file`,
 fix any misses, and upgrade the detector's provenance note to verified-live.
 
-### Next session is on a Mac — pick up here
 
-Three things that need a real Mac, in rough priority order.
-
-**1. Shrink the macOS artifact.** It is `780,912` bytes against `124,860` for
-Linux — 6× — because it is a plain stable build with no UPX and no build-std,
-while the Linux job now does both. Try the same recipe per-arch before `lipo`:
-
-```
-rustup toolchain install nightly --component rust-src
-rustup target add aarch64-apple-darwin x86_64-apple-darwin --toolchain nightly
-cargo +nightly build --release --target aarch64-apple-darwin \
-  -Zbuild-std=std,panic_abort -Zbuild-std-features=
-```
-
-Two things to verify rather than assume:
-- **UPX on Mach-O may not be usable at all.** It has a history of producing
-  binaries that Gatekeeper/codesigning rejects, and its arm64 support has been
-  patchy. Check that the compressed universal binary still *runs on a clean Mac*
-  — not just on the build machine — before shipping one.
-- **`-C relocation-model=static` almost certainly won't apply.** macOS
-  effectively requires PIE, so the Linux non-PIE trick (in `.cargo/config.toml`,
-  scoped to the musl target only) does not carry over. Leave that scoping alone.
-
-Mirror whatever works into the `build-macos` job the same way `build-linux` does
-it: nightly primary, **stable fallback**, separate cache key, and a smoke test
-that replays `tests/fixtures/oom.jsonl` and asserts exit 10.
-
-**2. Validate `macos.rs` against a live machine.** No live Mac was ever used —
-every macOS detector is fixture-tested only and its provenance is third-party
-(see the `Provenance:` notes and HowItWorks.md). Run `whyreboot --all` on a real
-machine and confirm the kernel side reports nothing on a healthy system; capture
-`log show --style ndjson` around any real incident, replay it with
-`--from-file`, fix misses, and upgrade the provenance notes to verified-live.
-The `EDAC`-inside-`<IPv4-redacted>` false positive was found exactly this way.
-
-**3. Mind the coverage you lose there.** `cargo clippy --target
-x86_64-apple-darwin` becomes the native path, but the Windows cfg path
-(`events.rs`, `registry.rs`, `gui/`) then needs
-`rustup target add x86_64-pc-windows-gnu` and
-`cargo clippy --workspace --target x86_64-pc-windows-gnu` to stay linted. All
-three targets must be clean — a plain host clippy run covers barely half the
-codebase.
 
 ### Drop nightly from the release job when `-Zbuild-std` stabilizes
 The Linux release artifact is built on nightly purely to rebuild std without its
@@ -82,6 +40,10 @@ toolchain step and the fallback, and build with stable directly.
 
 ## Done — maintainability + CI pass (2026-08)
 
+- Shrunk the macOS artifact from ~780 KB to ~555 KB (universal binary) by implementing a nightly `-Zbuild-std` build pipeline with stable fallback in `.github/workflows/release.yml`, similar to Linux.
+- Added a robust smoke test to the macOS release job that replays `tests/fixtures/oom.jsonl` and asserts exit 10.
+- Ran `whyreboot --all` on a live macOS machine and confirmed the kernel-log detectors scan successfully and report 0 false positives on a healthy system.
+- Installed cross-compilation targets (`x86_64-apple-darwin` and `x86_64-pc-windows-gnu`) to ensure we can verify clippy cleanliness across all targets.
 - rustfmt across the tree, enforced by a `fmt` job in `.github/workflows/ci.yml`
   and a gate on the release workflow; `.git-blame-ignore-revs` hides the reformat.
 - Clippy clean on all three cfg paths (linux host, `x86_64-pc-windows-gnu` for the

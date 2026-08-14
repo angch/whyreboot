@@ -39,6 +39,12 @@ jobs:
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
+      - name: Install Rust nightly (build-std)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          components: rust-src
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -46,16 +52,25 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-buildstd-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-buildstd-
 
       - name: Run tests
-        run: cargo test --release
+        run: cargo +stable test --release
 
-      - name: Build release binaries (both architectures)
+      - name: Build release binaries (nightly, std without backtrace)
+        id: build_min
+        continue-on-error: true
         run: |
-          cargo build --release --target aarch64-apple-darwin
-          cargo build --release --target x86_64-apple-darwin
+          cargo +nightly build --release --target aarch64-apple-darwin -Zbuild-std=std,panic_abort -Zbuild-std-features=
+          cargo +nightly build --release --target x86_64-apple-darwin -Zbuild-std=std,panic_abort -Zbuild-std-features=
+
+      - name: Fall back to stable build
+        if: steps.build_min.outcome == 'failure'
+        run: |
+          echo "::warning::nightly -Zbuild-std failed; falling back to the stable build (larger binary)"
+          cargo +stable build --release --target aarch64-apple-darwin
+          cargo +stable build --release --target x86_64-apple-darwin
 
       - name: Create universal binary
         run: |
@@ -64,11 +79,16 @@ jobs:
             target/x86_64-apple-darwin/release/whyreboot
           file whyreboot-cli-macos-universal
 
-      # Smoke test: scan the runner's own unified log for the last hour.
-      - name: Smoke test on live unified log
+      # Smoke test: replay a fixture and require the documented exit code.
+      # Also test running against the runner's live unified log.
+      - name: Smoke test universal binary
         run: |
-          ./whyreboot-cli-macos-universal --help
-          ./whyreboot-cli-macos-universal --since "1 hour ago" --no-color || true
+          BIN=./whyreboot-cli-macos-universal
+          $BIN --help
+          $BIN --from-file tests/fixtures/oom.jsonl --all --no-color
+          set +e; $BIN --from-file tests/fixtures/oom.jsonl --all --exit-code >/dev/null; rc=$?; set -e
+          test "$rc" -eq 10 || { echo "expected exit 10 for critical findings, got $rc"; exit 1; }
+          $BIN --since "1 hour ago" --no-color || true
 
       - name: Show binary size
         run: ls -la whyreboot-cli-macos-universal
