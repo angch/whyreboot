@@ -155,6 +155,42 @@ pub fn parse_event(xml: &str) -> Option<EventRecord> {
     })
 }
 
+/// Parses a capture containing many `<Event>…</Event>` documents into records,
+/// skipping any that don't parse. Accepts the output of either
+/// `wevtutil qe System /f:xml` or PowerShell's
+/// `Get-WinEvent … | ForEach-Object { $_.ToXml() }`, with or without an
+/// enclosing root element and in any whitespace layout.
+///
+/// This is what `--from-file` replays on Windows. It is deliberately portable:
+/// with it, the whole boot-cycle analysis can be exercised on a captured event
+/// log from any OS, so the Windows path is no longer testable only on Windows.
+pub fn parse_event_log(text: &str) -> Vec<EventRecord> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    // Documents are delimited by their closing tag; anything between one
+    // `</Event>` and the next `<Event` (XML declarations, root element tags,
+    // wevtutil's stray whitespace) is skipped by `parse_event` finding its
+    // fields positionally.
+    while let Some(start) = rest.find("<Event") {
+        let after = &rest[start..];
+        // `<EventID>`/`<EventData>` share the prefix — only a real `<Event …>`
+        // opens a document.
+        if !after["<Event".len()..].starts_with(is_tag_boundary) {
+            rest = &after["<Event".len()..];
+            continue;
+        }
+        let Some(end) = after.find("</Event>") else {
+            break;
+        };
+        let doc = &after[..end + "</Event>".len()];
+        if let Some(rec) = parse_event(doc) {
+            out.push(rec);
+        }
+        rest = &after[end + "</Event>".len()..];
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

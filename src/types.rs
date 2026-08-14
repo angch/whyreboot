@@ -137,10 +137,35 @@ pub struct Finding {
     pub category: String,
     /// One-line human-readable headline.
     pub title: String,
-    /// Supporting detail bullets (raw log excerpts, extracted fields, advice).
+    /// Supporting detail bullets: extracted fields and advice from the detector.
+    ///
+    /// Raw log text, burst siblings, and cross-references live in their own
+    /// fields below. They used to share this vec, distinguished by `"Raw: "` /
+    /// `"+ related: "` string prefixes that later passes re-parsed — so a
+    /// detector writing an ordinary bullet starting with those words could
+    /// corrupt coalescing. Keep them separate.
     pub evidence: Vec<String>,
+    /// The log line that triggered this finding, trimmed.
+    pub raw: String,
+    /// Raw text of the other lines coalesced into this finding (a burst of one
+    /// incident); empty unless [`crate::detect::scan`] merged siblings in.
+    pub related: Vec<String>,
+    /// Cross-references to other findings, added by the correlation pass.
+    pub correlations: Vec<String>,
     /// Where it came from, e.g. `"journald:kernel"` or `"systemd-oomd"`.
     pub source: String,
+}
+
+impl Finding {
+    /// Every supporting line in display order: detector detail, the raw line,
+    /// burst siblings, then correlations.
+    pub fn detail_lines(&self) -> Vec<String> {
+        let mut out = self.evidence.clone();
+        out.push(format!("Raw: {}", self.raw));
+        out.extend(self.related.iter().map(|r| format!("+ related: {r}")));
+        out.extend(self.correlations.iter().cloned());
+        out
+    }
 }
 
 /// One boot session, from Event 12 to the next Event 12 (or end of log).

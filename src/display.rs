@@ -85,7 +85,7 @@ pub fn print_findings(findings: &[Finding], pal: &Pal, window: &TimeWindow, scan
         );
         println!("  {}{}{}", pal.bold, f.title, pal.reset);
         println!("  {}source: {}{}", pal.dim, f.source, pal.reset);
-        for e in &f.evidence {
+        for e in f.detail_lines() {
             println!("    • {}", e);
         }
     }
@@ -96,45 +96,61 @@ pub fn print_findings(findings: &[Finding], pal: &Pal, window: &TimeWindow, scan
 /// boot-cycle JSON shape.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn print_findings_json(findings: &[Finding], window: &TimeWindow, scanned: usize) {
-    println!("{{");
     println!(
-        "  \"generated\": {},",
-        json_str(&Timestamp::now().to_rfc3339())
+        "{}",
+        findings_json(findings, window, scanned, Timestamp::now())
     );
-    match window.start {
-        Some(s) => println!("  \"window_start\": {},", json_str(&s.to_rfc3339())),
-        None => println!("  \"window_start\": null,"),
-    }
-    match window.end {
-        Some(e) => println!("  \"window_end\": {},", json_str(&e.to_rfc3339())),
-        None => println!("  \"window_end\": null,"),
-    }
-    println!("  \"scanned\": {},", scanned);
-    println!("  \"issue_count\": {},", findings.len());
-    println!("  \"issues\": [");
+}
+
+/// Renders the findings JSON document. Split from the `println!` wrapper and
+/// given an explicit `generated` timestamp so the exact output can be asserted
+/// in tests — printing straight to stdout left this shape uncovered.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn findings_json(
+    findings: &[Finding],
+    window: &TimeWindow,
+    scanned: usize,
+    generated: Timestamp,
+) -> String {
+    let mut o = String::new();
+    o.push_str("{\n");
+    push_field(&mut o, "  ", "schema_version", &SCHEMA_VERSION.to_string());
+    push_field(
+        &mut o,
+        "  ",
+        "generated",
+        &json_str(&generated.to_rfc3339()),
+    );
+    push_field(&mut o, "  ", "window_start", &json_time(window.start));
+    push_field(&mut o, "  ", "window_end", &json_time(window.end));
+    push_field(&mut o, "  ", "scanned", &scanned.to_string());
+    push_field(&mut o, "  ", "issue_count", &findings.len().to_string());
+    o.push_str("  \"issues\": [\n");
     for (i, f) in findings.iter().enumerate() {
-        println!("    {{");
-        println!("      \"time\": {},", json_str(&f.time.to_rfc3339()));
-        println!("      \"severity\": {},", json_str(f.severity.label()));
-        println!("      \"category\": {},", json_str(&f.category));
-        println!("      \"title\": {},", json_str(&f.title));
-        println!("      \"source\": {},", json_str(&f.source));
-        print!("      \"evidence\": [");
-        for (j, e) in f.evidence.iter().enumerate() {
-            if j > 0 {
-                print!(", ");
-            }
-            print!("{}", json_str(e));
-        }
-        println!("]");
-        if i + 1 < findings.len() {
-            println!("    }},");
+        o.push_str("    {\n");
+        push_field(&mut o, "      ", "time", &json_str(&f.time.to_rfc3339()));
+        push_field(&mut o, "      ", "severity", &json_str(f.severity.label()));
+        push_field(&mut o, "      ", "category", &json_str(&f.category));
+        push_field(&mut o, "      ", "title", &json_str(&f.title));
+        push_field(&mut o, "      ", "source", &json_str(&f.source));
+        o.push_str("      \"evidence\": ");
+        push_array(&mut o, &f.evidence);
+        o.push_str(",\n");
+        push_field(&mut o, "      ", "raw", &json_str(&f.raw));
+        o.push_str("      \"related\": ");
+        push_array(&mut o, &f.related);
+        o.push_str(",\n");
+        o.push_str("      \"correlations\": ");
+        push_array(&mut o, &f.correlations);
+        o.push('\n');
+        o.push_str(if i + 1 < findings.len() {
+            "    },\n"
         } else {
-            println!("    }}");
-        }
+            "    }\n"
+        });
     }
-    println!("  ]");
-    println!("}}");
+    o.push_str("  ]\n}");
+    o
 }
 
 // ── Cause color ───────────────────────────────────────────────────────────────
@@ -367,6 +383,39 @@ fn print_event_table(cycle: &BootCycle, line: &str) {
 /// Escapes a string for JSON output: backslash, quote, the standard short
 /// escapes (`\n`, `\r`, `\t`), and any other ASCII control character (0x00-0x1F)
 /// via `\u00XX` so the output is valid JSON even with unexpected control bytes.
+/// Version of the JSON documents emitted by `--json`. Bump on any breaking
+/// change to either shape (renamed/removed field, changed type) so consumers can
+/// refuse output they don't understand; additive fields don't require a bump.
+const SCHEMA_VERSION: u32 = 1;
+
+/// Appends `"key": value,\n` at `indent`. `value` must already be valid JSON
+/// (use `json_str` for strings, `json_time` for optional timestamps).
+fn push_field(out: &mut String, indent: &str, key: &str, value: &str) {
+    out.push_str(indent);
+    out.push('"');
+    out.push_str(key);
+    out.push_str("\": ");
+    out.push_str(value);
+    out.push_str(",\n");
+}
+
+/// An optional timestamp as an RFC3339 string, or JSON `null`.
+fn json_time(t: Option<Timestamp>) -> String {
+    t.map_or_else(|| "null".to_string(), |t| json_str(&t.to_rfc3339()))
+}
+
+/// Appends a JSON array of escaped strings, e.g. `["a", "b"]`.
+fn push_array(out: &mut String, items: &[String]) {
+    out.push('[');
+    for (i, e) in items.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&json_str(e));
+    }
+    out.push(']');
+}
+
 fn json_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -388,61 +437,80 @@ fn json_str(s: &str) -> String {
 /// Outputs all boot cycles as hand-built JSON to stdout (no serde dependency).
 #[cfg(windows)]
 pub fn print_json(cycles: &[BootCycle]) {
-    let now = Timestamp::now().to_rfc3339();
-    println!("{{");
-    println!("  \"generated\": {},", json_str(&now));
-    println!("  \"cycle_count\": {},", cycles.len());
-    println!("  \"cycles\": [");
+    println!("{}", cycles_json(cycles, Timestamp::now()));
+}
+
+/// Renders the boot-cycle JSON document. Split from the `println!` wrapper and
+/// given an explicit `generated` timestamp so tests can assert the exact shape.
+#[cfg(windows)]
+fn cycles_json(cycles: &[BootCycle], generated: Timestamp) -> String {
+    let mut o = String::new();
+    o.push_str("{\n");
+    push_field(&mut o, "  ", "schema_version", &SCHEMA_VERSION.to_string());
+    push_field(
+        &mut o,
+        "  ",
+        "generated",
+        &json_str(&generated.to_rfc3339()),
+    );
+    push_field(&mut o, "  ", "cycle_count", &cycles.len().to_string());
+    o.push_str("  \"cycles\": [\n");
     for (ci, cycle) in cycles.iter().enumerate() {
-        println!("    {{");
-        println!("      \"index\": {},", cycle.index);
-        match cycle.boot_time {
-            Some(bt) => println!("      \"boot_time\": {},", json_str(&bt.to_rfc3339())),
-            None => println!("      \"boot_time\": null,"),
-        }
-        match cycle.shutdown_time {
-            Some(sd) => println!("      \"shutdown_time\": {},", json_str(&sd.to_rfc3339())),
-            None => println!("      \"shutdown_time\": null,"),
-        }
-        println!("      \"confidence\": {},", cycle.confidence);
+        o.push_str("    {\n");
+        push_field(&mut o, "      ", "index", &cycle.index.to_string());
+        push_field(&mut o, "      ", "boot_time", &json_time(cycle.boot_time));
+        push_field(
+            &mut o,
+            "      ",
+            "shutdown_time",
+            &json_time(cycle.shutdown_time),
+        );
+        push_field(
+            &mut o,
+            "      ",
+            "confidence",
+            &cycle.confidence.to_string(),
+        );
 
         let (kind, extra) = cause_json(&cycle.cause);
-        println!("      \"cause\": {},", json_str(kind));
+        push_field(&mut o, "      ", "cause", &json_str(kind));
         for line in extra.lines() {
-            println!("      {}", line);
+            o.push_str("      ");
+            o.push_str(line);
+            o.push('\n');
         }
 
-        match &cycle.wer_module {
-            Some(m) => println!("      \"faulting_module\": {},", json_str(m)),
-            None => println!("      \"faulting_module\": null,"),
-        }
+        push_field(
+            &mut o,
+            "      ",
+            "faulting_module",
+            &cycle
+                .wer_module
+                .as_deref()
+                .map_or_else(|| "null".to_string(), json_str),
+        );
 
-        print!("      \"evidence\": [");
-        for (i, e) in cycle.evidence.iter().enumerate() {
-            if i > 0 {
-                print!(", ");
-            }
-            print!("{}", json_str(e));
-        }
-        println!("],");
+        o.push_str("      \"evidence\": ");
+        push_array(&mut o, &cycle.evidence);
+        o.push_str(",\n");
 
-        print!("      \"minidumps\": [");
-        for (i, (_, p)) in cycle.minidumps.iter().enumerate() {
-            if i > 0 {
-                print!(", ");
-            }
-            print!("{}", json_str(&p.to_string_lossy()));
-        }
-        println!("]");
+        let dumps: Vec<String> = cycle
+            .minidumps
+            .iter()
+            .map(|(_, p)| p.to_string_lossy().into_owned())
+            .collect();
+        o.push_str("      \"minidumps\": ");
+        push_array(&mut o, &dumps);
+        o.push('\n');
 
-        if ci + 1 < cycles.len() {
-            println!("    }},");
+        o.push_str(if ci + 1 < cycles.len() {
+            "    },\n"
         } else {
-            println!("    }}");
-        }
+            "    }\n"
+        });
     }
-    println!("  ]");
-    println!("}}");
+    o.push_str("  ]\n}");
+    o
 }
 
 /// Returns `(kind_string, extra_json_fields)` for a `Cause` variant.
@@ -533,5 +601,95 @@ mod tests {
     #[test]
     fn json_str_plain_string() {
         assert_eq!(super::json_str("hello"), r#""hello""#);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    mod findings_doc {
+        use whyreboot::timestamp::Timestamp;
+        use whyreboot::timewindow::TimeWindow;
+        use whyreboot::types::{Finding, Severity};
+
+        const GEN: Timestamp = Timestamp(1_700_000_000);
+
+        fn finding(title: &str) -> Finding {
+            Finding {
+                time: Timestamp(1_699_999_000),
+                severity: Severity::Critical,
+                category: "OOM".to_string(),
+                title: title.to_string(),
+                evidence: vec!["first".to_string(), "second \"quoted\"".to_string()],
+                raw: "Out of memory: Killed process 1 (a)".to_string(),
+                related: Vec::new(),
+                correlations: Vec::new(),
+                source: "journald:kernel".to_string(),
+            }
+        }
+
+        fn render(findings: &[Finding]) -> String {
+            super::super::findings_json(findings, &TimeWindow::all(), 42, GEN)
+        }
+
+        #[test]
+        fn empty_document_shape() {
+            let doc = render(&[]);
+            assert_eq!(
+                doc,
+                concat!(
+                    "{\n",
+                    "  \"schema_version\": 1,\n",
+                    "  \"generated\": \"2023-11-14T22:13:20Z\",\n",
+                    "  \"window_start\": null,\n",
+                    "  \"window_end\": null,\n",
+                    "  \"scanned\": 42,\n",
+                    "  \"issue_count\": 0,\n",
+                    "  \"issues\": [\n",
+                    "  ]\n",
+                    "}"
+                ),
+                "unexpected document:\n{doc}"
+            );
+        }
+
+        #[test]
+        fn issue_fields_and_escaping() {
+            let doc = render(&[finding("kernel OOM")]);
+            assert!(doc.contains("\"title\": \"kernel OOM\""), "{doc}");
+            assert!(doc.contains("\"severity\": \"CRITICAL\""), "{doc}");
+            assert!(doc.contains("\"category\": \"OOM\""), "{doc}");
+            assert!(doc.contains("\"source\": \"journald:kernel\""), "{doc}");
+            assert!(doc.contains("\"time\": \"2023-11-14T21:56:40Z\""), "{doc}");
+            // Evidence strings are escaped inside the array.
+            assert!(
+                doc.contains(r#""evidence": ["first", "second \"quoted\""]"#),
+                "{doc}"
+            );
+        }
+
+        /// The separator logic is the classic hand-rolled-JSON bug: a trailing
+        /// comma after the last element is invalid JSON.
+        #[test]
+        fn no_trailing_comma_between_issues() {
+            let doc = render(&[finding("one"), finding("two")]);
+            assert!(doc.contains("    },\n    {\n"), "missing separator:\n{doc}");
+            assert!(!doc.contains("},\n  ]"), "trailing comma:\n{doc}");
+            assert_eq!(doc.matches("\"title\"").count(), 2);
+        }
+
+        #[test]
+        fn window_bounds_are_rendered_when_set() {
+            let w = TimeWindow {
+                start: Some(Timestamp(1_699_990_000)),
+                end: Some(Timestamp(1_699_999_999)),
+            };
+            let doc = super::super::findings_json(&[], &w, 0, GEN);
+            assert!(
+                doc.contains("\"window_start\": \"2023-11-14T19:26:40Z\""),
+                "{doc}"
+            );
+            assert!(
+                doc.contains("\"window_end\": \"2023-11-14T22:13:19Z\""),
+                "{doc}"
+            );
+        }
     }
 }

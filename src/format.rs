@@ -593,7 +593,7 @@ mod tests {
         let c = Cause::UserAction {
             user: "angch".into(),
             action: "Restart".into(),
-            comment: "".into(),
+            comment: String::new(),
         };
         let d = cause_detail(&c);
         assert!(d.contains("angch") && d.contains("Restart"));

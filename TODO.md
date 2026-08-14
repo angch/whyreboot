@@ -22,8 +22,31 @@ fix any misses, and upgrade the detector's provenance note to verified-live.
 - More detectors: filesystem-full (`No space left`), network link flaps, watchdog
   reboots, `systemd-coredump` truncation, apparmor/SELinux denials, USB resets.
 - Optional `--category <name>` filter and severity threshold (`--min-severity`).
+  Cheaper now that `Finding` has typed fields — filter before render, and the
+  JSON `schema_version` is in place to describe any shape change.
 - Correlate related findings (segfault ↔ coredump ↔ service failure for one pid).
 - Wire the resolved `TimeWindow` into the Windows path too (currently `--history N`).
+- Extend `tests/fixtures/windows_events.xml` as Windows analysis changes — it is
+  the only coverage of that path that runs off Windows.
+
+## Done — maintainability + CI pass (2026-08)
+
+- rustfmt across the tree, enforced by a `fmt` job in `.github/workflows/ci.yml`
+  and a gate on the release workflow; `.git-blame-ignore-revs` hides the reformat.
+- Clippy clean on all three cfg paths (linux host, `x86_64-pc-windows-gnu` for the
+  Win32 + GUI code, `x86_64-apple-darwin` for `macos.rs`). A plain Linux clippy run
+  covers barely half the codebase — cross-check all three.
+- `CycleBounds` derives each cycle's prev/next boot once; the WER/minidump pass
+  used to re-derive the same pair under different names.
+- `Finding` evidence is typed (`raw` / `related` / `correlations`) instead of
+  string-prefix encoded; `tables.rs` holds the stop-code and reason-code tables.
+- JSON emitters are pure `String`-returning functions with `schema_version: 1`,
+  and their exact shape is asserted in tests.
+- `--exit-code` (exit 10 on a critical finding or crash reboot) for cron/monitoring;
+  arg parsing now errors on bad/missing values and unknown flags instead of
+  silently analyzing a different window; `parse_argv` is unit-tested.
+- `--from-file` replays a Windows event-log XML capture through the real analysis,
+  so the Windows path finally has end-to-end coverage that runs on Linux CI.
 
 ## Done — cross-platform generalization (2026-07)
 

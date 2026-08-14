@@ -56,6 +56,10 @@ display.rs (binary module): print_findings[_json] (portable) + print_cycle/print
 
 **Testing the Linux path:** detectors and the journal JSON parser are pure and unit-tested. End-to-end coverage runs fixtures through `fetch_from_file` → `detect::scan` (`tests/oom_e2e.rs`, fixtures in `tests/fixtures/*.jsonl` — one `journalctl -o json` object per line). The `--from-file` flag is the injectable seam; use it to analyze captured journals offline too.
 
+**Testing the Windows path without Windows:** `--from-file` also accepts an event-log XML capture (`wevtutil qe System /f:xml`, or `Get-WinEvent | %{ $_.ToXml() }`), parsed by the portable `xml::parse_event_log`. `tests/windows_replay.rs` drives a captured BSOD through `extract_boot_cycles` and asserts the verdict, the faulting module, and the driver-install correlation — and it runs on Linux/macOS CI. Only the live `EvtQuery` fetch is Windows-only, so **any change to the Windows analysis should be covered by extending that fixture**, not deferred until someone is at a Windows box.
+
+**`Finding` evidence is typed, not prefix-encoded.** `evidence` holds the detector's own bullets; the triggering line is `raw`, coalesced burst siblings are `related`, and the correlation pass writes `correlations`. These used to share one `Vec<String>` distinguished by `"Raw: "` / `"+ related: "` prefixes that later passes re-parsed. Don't reintroduce that: a detector bullet that happened to start with those words corrupted burst counting. `Finding::detail_lines()` flattens them in display order when you need the old view.
+
 ---
 
 ## Repository layout
@@ -68,8 +72,9 @@ src/timestamp.rs   — portable Timestamp; UTC pure-Rust, local via Win32/libc
 src/timewindow.rs  — parse human time ranges → TimeWindow  [portable]
 src/detect.rs      — detector framework + Linux issue taxonomy  [portable]
 src/oom.rs         — OOM detectors (kernel + systemd-oomd)  [portable]
-src/xml.rs         — hand-rolled XML parsing (no external dep)  [portable]
-src/analysis.rs    — boot cycle analysis, lookup tables, WER correlation  [portable]
+src/xml.rs         — hand-rolled XML parsing + `parse_event_log` capture replay  [portable]
+src/analysis.rs    — boot cycle analysis, WER mapping/correlation  [portable]
+src/tables.rs      — bugcheck stop codes + Event 1074 reason codes  [portable]
 src/format.rs      — cause labels, explanations, formatting  [portable]
 src/color.rs       — ANSI palette; enable via Win32 VTP / unix isatty
 src/events.rs      — System + WER event fetching, minidump listing  [cfg(windows)]
@@ -79,7 +84,9 @@ src/linux.rs       — journalctl -o json source (indexed queries)  [cfg(linux)]
 src/macos.rs       — macOS `log show --style ndjson` source  [cfg(macos)]
 src/display.rs     — findings output (portable) + boot-cycle output (cfg(windows))
 tests/oom_e2e.rs   — end-to-end: fixture → detect::scan
+tests/windows_replay.rs — end-to-end: event-XML capture → extract_boot_cycles
 tests/fixtures/    — journalctl -o json sample lines (oom.jsonl, mixed.jsonl)
+                     + windows_events.xml (event-log capture)
 Cargo.toml         — windows dep is target-gated; libc for unix; default-members=["."]
 HowItWorks.md      — full narrative of the analysis pipeline and decision logic
 TODO.md            — feature tracking
@@ -246,12 +253,19 @@ Each `BootCycle` prints:
 ## CLI flags
 
 ```
---history N     show last N boot cycles (default: 1)
---all           show all cycles in the log
+--since <expr>  time range to analyze (aliases: --for, --window)
+--all           analyze all available history
+--exit-code     exit 10 if a critical issue (or crash reboot) was found
+--history N     [Windows] show last N boot cycles (default: 1)
+--from-file <f> replay a capture: journald/log-show ndjson, or Windows event XML
 --json          JSON output
 --no-color      disable ANSI color
 --help / -h
 ```
+
+**Exit codes:** `0` success, `1` operational failure (no logs readable / empty capture), `2` usage error, `10` issues found with `--exit-code`. Keep them distinct — a monitoring script needs to tell "scan worked, found a crash" from "scan failed". Argument parsing **errors** on a bad or missing value rather than falling back silently (`--history abc`, a valueless `--since`, unknown `--flags`); `parse_argv` is pure and unit-tested in `main.rs`.
+
+**JSON output carries `schema_version`** (currently `1`) as the first field of both documents. Bump it on any breaking change — renamed/removed field or changed type; purely additive fields don't need one. Both emitters are pure functions returning a `String` (`findings_json` / `cycles_json`), with the `print_*` wrappers only adding `println!`, so the exact shape is asserted in tests.
 
 ---
 

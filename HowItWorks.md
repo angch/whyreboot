@@ -262,7 +262,7 @@ The actual registry state from Step 7 is woven in: if all audio devices already 
 
 Cycles print oldest-first so the most recent result appears at the bottom of the terminal.
 
-**JSON mode** (`--json`) outputs a single object with `generated`, `cycle_count`, and a `cycles` array. Each cycle includes `index`, `boot_time`, `shutdown_time`, `confidence`, `cause`, `stop_code`, `params`, `faulting_module`, `evidence`, and `minidumps`. A `WindowsUpdate` cause additionally carries `process` and the raw `old_version` / `new_version` build strings (`"major.minor.build"`, or `null` when not found in the log window).
+**JSON mode** (`--json`) outputs a single object with `schema_version` (currently `1`, bumped on any breaking shape change), `generated`, `cycle_count`, and a `cycles` array. Each cycle includes `index`, `boot_time`, `shutdown_time`, `confidence`, `cause`, `stop_code`, `params`, `faulting_module`, `evidence`, and `minidumps`. A `WindowsUpdate` cause additionally carries `process` and the raw `old_version` / `new_version` build strings (`"major.minor.build"`, or `null` when not found in the log window).
 
 ---
 
@@ -363,18 +363,20 @@ OOM specifics (`oom.rs`): the kernel detector keys on `Killed process <pid> (<co
 
 ## Step 4 — Coalesce bursts (`coalesce()`) and correlate cascades (`correlate()`)
 
-A single incident often emits many lines (a SATA fault logs ~10). Consecutive findings of the **same category and source** within `COALESCE_SECS` (30s) are merged into the earliest, folding the rest in as `+ related:` evidence and appending `(N related log lines)` to the title. This keeps the report high-level. Distinct categories, and same-category events far apart in time, stay separate.
+A single incident often emits many lines (a SATA fault logs ~10). Consecutive findings of the **same category and source** within `COALESCE_SECS` (30s) are merged into the earliest, folding the rest into the finding's `related` list (rendered as `+ related:` bullets) and appending `(N related log lines)` to the title. This keeps the report high-level. Distinct categories, and same-category events far apart in time, stay separate.
 
 After coalescing, `correlate()` cross-annotates cascade relationships within `CORRELATE_SECS` (120s):
 
 1. **GPU incident → casualties.** Segfault/Coredump/Session/Service/Lockup findings near a `GPU` finding are marked "likely follows the GPU hang/reset", and the GPU finding lists each casualty. A GPU hang that takes down the compositor and its apps reads as one story.
 2. **Compositor crash → orphaned clients.** A Segfault/Coredump whose title names a compositor or display server (`gnome-shell`, `kwin_wayland`, `mutter`, `Xorg`, `Xwayland`, `sway`, …) is linked with the `Session` connection-loss findings around it.
 
-Annotations are appended to `evidence` on **both** sides of each link, so whichever finding the reader looks at first points at the rest of the cascade.
+Annotations are appended to the finding's `correlations` list on **both** sides of each link, so whichever finding the reader looks at first points at the rest of the cascade.
 
 ## Step 5 — Window-filter and render
 
-Findings are filtered by `TimeWindow::contains` (belt-and-suspenders with journalctl's own `--since`, and the only filter for `--from-file`) and printed newest-first. Text output: a header (`System Issue Report — <window>`, scanned/found counts), then per finding a severity-colored `[LEVEL] CATEGORY time` line, title, `source:`, and evidence bullets; a clean-bill line when none. **JSON mode** emits `{ generated, window_start, window_end, scanned, issue_count, issues: [{ time, severity, category, title, source, evidence }] }`.
+Findings are filtered by `TimeWindow::contains` (belt-and-suspenders with journalctl's own `--since`, and the only filter for `--from-file`) and printed newest-first. Text output: a header (`System Issue Report — <window>`, scanned/found counts), then per finding a severity-colored `[LEVEL] CATEGORY time` line, title, `source:`, and evidence bullets; a clean-bill line when none. **JSON mode** emits `{ schema_version, generated, window_start, window_end, scanned, issue_count, issues: [{ time, severity, category, title, source, evidence, raw, related, correlations }] }`.
+
+The supporting text is split by kind rather than concatenated into one list: `evidence` is the detector's own detail and advice, `raw` is the log line that triggered the finding, `related` holds the raw lines of a coalesced burst, and `correlations` holds cascade cross-references. Text mode renders them in that order. **This changed in schema_version 1** — before it, all four kinds shared `evidence`, tagged with `Raw: ` / `+ related: ` prefixes.
 
 ## Adding a category
 
@@ -387,6 +389,7 @@ Findings are filtered by `TimeWindow::contains` (belt-and-suspenders with journa
 | Limitation | Detail |
 |---|---|
 | Requires journalctl | The journal is read via `journalctl`; systems using only classic `/var/log/*` files (no systemd journal) aren't yet supported. `--from-file` accepts captured `-o json` output. |
+| Windows replay is analysis-only | `--from-file` on Windows replays an event-log XML capture (`wevtutil qe System /f:xml`) through the full boot-cycle analysis, but minidump listing and the audio-power registry check are machine-local and are simply skipped. |
 | Permissions | Kernel and most messages need membership in `systemd-journal`/`adm`. Without it, queries may return nothing rather than erroring. |
 | Marker-based matching | Detection keys on known substrings; kernel wording changes across versions and unusual formats may be missed. Prefer adding markers over tightening to full-line formats. |
 | Non-persistent journal | If `Storage=volatile`, history is lost on reboot, so ranges spanning a reboot may be truncated. |

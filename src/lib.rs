@@ -11,7 +11,8 @@
 //! - [`timestamp`] — Unix-epoch timestamp with portable UTC / platform local rendering
 //! - [`timewindow`] — parse "1 hour ago" / "today" / "2h" into a concrete window
 //! - [`oom`]     — pure log-line → [`types::Finding`] OOM detectors
-//! - [`analysis`], [`format`], [`xml`] — Windows boot-cycle analysis logic
+//! - [`analysis`], [`format`], [`xml`], [`tables`] — Windows boot-cycle analysis logic
+//!   (`xml::parse_event_log` also replays captured event logs on any platform)
 //!
 //! Platform backends (gated by `cfg`):
 //! - [`events`], [`registry`] — Windows Event Log & registry (`cfg(windows)`)
@@ -24,6 +25,7 @@ pub mod detect;
 pub mod format;
 pub mod jsonlog;
 pub mod oom;
+pub mod tables;
 pub mod timestamp;
 pub mod timewindow;
 pub mod types;

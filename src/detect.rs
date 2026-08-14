@@ -89,23 +89,15 @@ fn classify(line: &LogLine) -> Option<Finding> {
 }
 
 /// Merges consecutive same-category, same-source findings within `COALESCE_SECS`
-/// into the earliest of the burst, folding the rest in as evidence. Input must be
-/// sorted by ascending time.
+/// into the earliest of the burst, folding the rest in as related lines. Input
+/// must be sorted by ascending time.
 fn coalesce(findings: Vec<Finding>) -> Vec<Finding> {
     let mut out: Vec<Finding> = Vec::new();
     for f in findings {
         if let Some(last) = out.last_mut() {
             let same = last.category == f.category && last.source == f.source;
             if same && f.time.secs_since(last.time) <= COALESCE_SECS {
-                // Fold f into last as an extra related line.
-                let raw = f
-                    .evidence
-                    .iter()
-                    .find(|e| e.starts_with("Raw:"))
-                    .cloned()
-                    .unwrap_or_else(|| format!("Raw: {}", f.title));
-                last.evidence
-                    .push(format!("+ related: {}", raw.trim_start_matches("Raw: ")));
+                last.related.push(f.raw);
                 continue;
             }
         }
@@ -113,13 +105,8 @@ fn coalesce(findings: Vec<Finding>) -> Vec<Finding> {
     }
     // Annotate coalesced bursts with a count so the reader knows it was many lines.
     for f in &mut out {
-        let related = f
-            .evidence
-            .iter()
-            .filter(|e| e.starts_with("+ related:"))
-            .count();
-        if related > 0 {
-            f.title = format!("{} ({} related log lines)", f.title, related + 1);
+        if !f.related.is_empty() {
+            f.title = format!("{} ({} related log lines)", f.title, f.related.len() + 1);
         }
     }
     out
@@ -227,18 +214,19 @@ fn correlate(findings: &mut [Finding]) {
     notes.sort_by_key(|(idx, _)| *idx);
     notes.dedup();
     for (idx, note) in notes {
-        findings[idx].evidence.push(note);
+        findings[idx].correlations.push(note);
     }
 }
 
 // ── Small matching helpers ──────────────────────────────────────────────────────
 
-/// Case-insensitive substring test.
-fn has(msg: &str, needle: &str) -> bool {
-    contains_ci(msg, needle)
-}
-
 /// Returns the first needle (from `needles`) that appears in `msg`, case-insensitively.
+///
+/// The `to_lowercase()` allocations look wasteful, but do **not** replace them
+/// with a hand-rolled `eq_ignore_ascii_case` window scan: measured on a 200k-line
+/// capture, that made `scan` 18× slower (646 ms → 11.5 s). `str::contains` uses an
+/// optimized (memchr/two-way) search; a naive byte loop gives that up, and the
+/// search dominates — allocation does not. Any change here needs a benchmark.
 fn first_of<'a>(msg: &str, needles: &[&'a str]) -> Option<&'a str> {
     let lower = msg.to_lowercase();
     needles
@@ -249,6 +237,13 @@ fn first_of<'a>(msg: &str, needles: &[&'a str]) -> Option<&'a str> {
 
 fn contains_ci(haystack: &str, needle: &str) -> bool {
     haystack.to_lowercase().contains(&needle.to_lowercase())
+}
+
+/// True if any needle appears in `msg`, case-insensitively. Use this — not
+/// `first_of(..)?` with the match discarded — when the markers are only a guard
+/// and the detector never inspects *which* one hit.
+fn matches_any(msg: &str, needles: &[&str]) -> bool {
+    first_of(msg, needles).is_some()
 }
 
 /// Extracts a leading `comm[pid]:` prefix common to kernel userspace-fault lines,
@@ -271,22 +266,24 @@ fn comm_pid_prefix(msg: &str) -> Option<(String, Option<u64>)> {
     Some((comm.to_string(), pid))
 }
 
-/// Builds a finding, always attaching the raw line as the final evidence entry.
+/// Builds a finding, capturing the triggering line in `Finding::raw`.
 fn finding(
     line: &LogLine,
     sev: Severity,
     category: &str,
     title: String,
-    mut evidence: Vec<String>,
+    evidence: Vec<String>,
     source: &str,
 ) -> Finding {
-    evidence.push(format!("Raw: {}", line.message.trim()));
     Finding {
         time: line.time,
         severity: sev,
         category: category.to_string(),
         title,
         evidence,
+        raw: line.message.trim().to_string(),
+        related: Vec::new(),
+        correlations: Vec::new(),
         source: source.to_string(),
     }
 }
@@ -317,7 +314,7 @@ fn detect_kernel_panic(line: &LogLine) -> Option<Finding> {
         "userspace watchdog timeout",
     ];
     let m = first_of(&line.message, &markers)?;
-    let title = if has(&line.message, "userspace watchdog timeout") {
+    let title = if contains_ci(&line.message, "userspace watchdog timeout") {
         // A macOS watchdog panic names the process that stopped checking in
         // (classically WindowServer) — the machine force-restarted because of it.
         let who = line
@@ -336,7 +333,7 @@ fn detect_kernel_panic(line: &LogLine) -> Option<Finding> {
             Some(w) => format!("Forced restart: watchdog timeout — {w} stopped responding"),
             None => "Forced restart: userspace watchdog timeout".to_string(),
         }
-    } else if has(&line.message, "panic") {
+    } else if contains_ci(&line.message, "panic") {
         "Kernel panic".to_string()
     } else {
         format!("Kernel {}", m.trim_end_matches(':'))
@@ -672,21 +669,22 @@ fn detect_disk_io(line: &LogLine) -> Option<Finding> {
     {
         return None;
     }
-    let (title, advice) = if has(&line.message, "read-only") {
+    let (title, advice) = if contains_ci(&line.message, "read-only") {
         (
             "Filesystem remounted read-only after an error",
             "The kernel forced the filesystem read-only to protect data. Run `fsck` and \
           check SMART health (`smartctl -a <dev>`).",
         )
-    } else if has(&line.message, "medium error") || has(&line.message, "I/O error") {
+    } else if contains_ci(&line.message, "medium error") || contains_ci(&line.message, "I/O error")
+    {
         (
             "Disk I/O error",
             "The block layer reported an I/O failure — a failing drive, cable, or controller. \
           Check `smartctl -a <dev>` and `dmesg` for the device.",
         )
-    } else if has(&line.message, "EXT4-fs")
-        || has(&line.message, "XFS")
-        || has(&line.message, "Btrfs")
+    } else if contains_ci(&line.message, "EXT4-fs")
+        || contains_ci(&line.message, "XFS")
+        || contains_ci(&line.message, "Btrfs")
     {
         (
             "Filesystem error",
@@ -724,16 +722,18 @@ fn detect_lockup(line: &LogLine) -> Option<Finding> {
         "hung_task",
         "task hung",
     ];
-    let m = first_of(&line.message, &markers)?;
-    let (title, cat_advice) = if has(&line.message, "blocked for more than")
-        || has(&line.message, "hung")
+    if !matches_any(&line.message, &markers) {
+        return None;
+    }
+    let (title, cat_advice) = if contains_ci(&line.message, "blocked for more than")
+        || contains_ci(&line.message, "hung")
     {
         (
             "A task hung (blocked > 120s in uninterruptible sleep)",
             "A process is stuck in the kernel — usually blocked on failing storage or a driver. \
           Correlate with disk errors above.",
         )
-    } else if has(&line.message, "rcu") || has(&line.message, "stall") {
+    } else if contains_ci(&line.message, "rcu") || contains_ci(&line.message, "stall") {
         (
             "RCU stall detected",
             "A CPU failed to report a quiescent state — a stuck kernel path or starved CPU.",
@@ -745,7 +745,6 @@ fn detect_lockup(line: &LogLine) -> Option<Finding> {
           firmware/SMI interference.",
         )
     };
-    let _ = m;
     Some(finding(
         line,
         Severity::Critical,
@@ -769,8 +768,10 @@ fn detect_thermal(line: &LogLine) -> Option<Finding> {
         "clock throttled",
         "CPU clock throttled",
     ];
-    let m = first_of(&line.message, &markers)?;
-    let critical = has(&line.message, "critical temperature");
+    if !matches_any(&line.message, &markers) {
+        return None;
+    }
+    let critical = contains_ci(&line.message, "critical temperature");
     let (sev, title) = if critical {
         (
             Severity::Critical,
@@ -782,7 +783,6 @@ fn detect_thermal(line: &LogLine) -> Option<Finding> {
             "Thermal throttling — CPU temperature above threshold",
         )
     };
-    let _ = m;
     Some(finding(
         line,
         sev,
@@ -843,18 +843,17 @@ fn detect_hardware(line: &LogLine) -> Option<Finding> {
             return None;
         }
     }
-    let uncorrected = has(msg, "uncorrected") || has(msg, "fatal");
+    let uncorrected = contains_ci(msg, "uncorrected") || contains_ci(msg, "fatal");
     let (sev, title) = if uncorrected {
         (
             Severity::Critical,
             "Uncorrected hardware (machine-check) error",
         )
-    } else if has(msg, "corrected") || msg.contains("EDAC") {
+    } else if contains_ci(msg, "corrected") || msg.contains("EDAC") {
         (Severity::Warning, "Corrected hardware/memory error (ECC)")
     } else {
         (Severity::Critical, "Hardware error reported")
     };
-    let _ = m;
     Some(finding(
         line,
         sev,
@@ -887,7 +886,9 @@ fn detect_service_failure(line: &LogLine) -> Option<Finding> {
         "Start request repeated too quickly",
         "Failed to start",
     ];
-    let m = first_of(&line.message, &markers)?;
+    if !matches_any(&line.message, &markers) {
+        return None;
+    }
     // The unit name is the message prefix before the first ':' ("foo.service: Failed …").
     let unit = line
         .message
@@ -901,13 +902,12 @@ fn detect_service_failure(line: &LogLine) -> Option<Finding> {
                 || u.ends_with(".timer")
         })
         .unwrap_or("A systemd unit");
-    let dumped = has(&line.message, "code=dumped");
+    let dumped = contains_ci(&line.message, "code=dumped");
     let title = if dumped {
         format!("Service '{unit}' crashed (dumped core)")
     } else {
         format!("Service '{unit}' failed")
     };
-    let _ = m;
     Some(finding(
         line,
         Severity::Warning,
@@ -1133,7 +1133,9 @@ fn detect_mac_update_restart(line: &LogLine) -> Option<Finding> {
         "Installed macOS",
         "install-and-restart",
     ];
-    first_of(&line.message, &markers)?;
+    if !matches_any(&line.message, &markers) {
+        return None;
+    }
     Some(finding(
         line,
         Severity::Info,
@@ -1455,10 +1457,12 @@ mod tests {
         let found = scan(&lines);
         assert_eq!(found.len(), 1, "burst must coalesce to one finding");
         assert_eq!(found[0].severity, Severity::Critical);
+        // The culprit line is folded into the burst as a related raw line, so
+        // check what the user actually sees, not just the detector's own bullets.
         assert!(
-            found[0].evidence.iter().any(|e| e.contains("slack")),
+            found[0].detail_lines().iter().any(|e| e.contains("slack")),
             "culprit 'slack' should surface: {:?}",
-            found[0].evidence
+            found[0].detail_lines()
         );
     }
 
@@ -1661,26 +1665,26 @@ mod tests {
         let seg = found.iter().find(|f| f.category == "Segfault").unwrap();
         let ses = found.iter().find(|f| f.category == "Session").unwrap();
         assert!(
-            gpu.evidence.iter().any(|e| e.contains("casualty")),
+            gpu.correlations.iter().any(|e| e.contains("casualty")),
             "{:?}",
-            gpu.evidence
+            gpu.correlations
         );
         assert!(
-            seg.evidence.iter().any(|e| e.contains("GPU incident")),
+            seg.correlations.iter().any(|e| e.contains("GPU incident")),
             "{:?}",
-            seg.evidence
+            seg.correlations
         );
         // The session loss is correlated both to the GPU incident and to the
         // compositor (gnome-shell) segfault.
         assert!(
-            ses.evidence.iter().any(|e| e.contains("GPU incident")),
+            ses.correlations.iter().any(|e| e.contains("GPU incident")),
             "{:?}",
-            ses.evidence
+            ses.correlations
         );
         assert!(
-            ses.evidence.iter().any(|e| e.contains("compositor")),
+            ses.correlations.iter().any(|e| e.contains("compositor")),
             "{:?}",
-            ses.evidence
+            ses.correlations
         );
     }
 
@@ -1696,7 +1700,7 @@ mod tests {
         ];
         let found = scan(&lines);
         let seg = found.iter().find(|f| f.category == "Segfault").unwrap();
-        assert!(!seg.evidence.iter().any(|e| e.contains("GPU incident")));
+        assert!(!seg.correlations.iter().any(|e| e.contains("GPU incident")));
     }
 
     #[test]

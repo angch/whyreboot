@@ -80,23 +80,23 @@ fn gpu_cascade_detected_and_correlated() {
     assert_eq!(findings.iter().filter(|f| f.category == "GPU").count(), 1);
     let gpu = findings.iter().find(|f| f.category == "GPU").unwrap();
     assert!(
-        gpu.evidence.iter().any(|e| e.contains("gnome-shell")),
+        gpu.detail_lines().iter().any(|e| e.contains("gnome-shell")),
         "culprit workload should be extracted: {:?}",
-        gpu.evidence
+        gpu.detail_lines()
     );
 
     // Correlation: the GPU incident lists its casualties, and the session-loss
     // finding points back at both the GPU incident and the compositor crash.
     assert!(
-        gpu.evidence.iter().any(|e| e.contains("casualty")),
+        gpu.correlations.iter().any(|e| e.contains("casualty")),
         "{:?}",
-        gpu.evidence
+        gpu.correlations
     );
     let ses = findings.iter().find(|f| f.category == "Session").unwrap();
     assert!(
-        ses.evidence.iter().any(|e| e.contains("GPU incident")),
+        ses.correlations.iter().any(|e| e.contains("GPU incident")),
         "{:?}",
-        ses.evidence
+        ses.correlations
     );
 
     // The trailing benign "[drm] Initialized i915" boot banner must not match.

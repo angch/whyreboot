@@ -1,139 +1,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Boot cycle analysis: stop code tables, event classification, and WER/minidump annotation.
+//! Boot cycle analysis: event classification, WER mapping, and minidump/update
+//! annotation. The stop-code and reason-code lookup tables live in [`crate::tables`].
+
+pub use crate::tables::{decode_reason, stop_name};
 
 use crate::timestamp::Timestamp;
 use crate::types::{BootCycle, Cause, EventRecord, WerRecord};
 use std::path::PathBuf;
-
-// ── Lookup tables ─────────────────────────────────────────────────────────────
-
-const STOP_CODES: &[(u64, &str)] = &[
-    (0x00000001, "APC_INDEX_MISMATCH"),
-    (0x00000019, "BAD_POOL_HEADER"),
-    (0x0000001A, "MEMORY_MANAGEMENT"),
-    (0x0000001E, "KMODE_EXCEPTION_NOT_HANDLED"),
-    (0x00000023, "FAT_FILE_SYSTEM"),
-    (0x00000024, "NTFS_FILE_SYSTEM"),
-    (0x0000002E, "DATA_BUS_ERROR"),
-    (0x0000003B, "SYSTEM_SERVICE_EXCEPTION"),
-    (0x0000003F, "NO_MORE_SYSTEM_PTES"),
-    (0x00000050, "PAGE_FAULT_IN_NONPAGED_AREA"),
-    (0x00000051, "REGISTRY_ERROR"),
-    (0x0000005A, "CRITICAL_SERVICE_FAILED"),
-    (0x0000005C, "HAL_INITIALIZATION_FAILED"),
-    (0x00000074, "BAD_SYSTEM_CONFIG_INFO"),
-    (0x00000076, "PROCESS_HAS_LOCKED_PAGES"),
-    (0x00000077, "KERNEL_STACK_INPAGE_ERROR"),
-    (0x0000007A, "KERNEL_DATA_INPAGE_ERROR"),
-    (0x0000007B, "INACCESSIBLE_BOOT_DEVICE"),
-    (0x0000007E, "SYSTEM_THREAD_EXCEPTION_NOT_HANDLED"),
-    (0x0000007F, "UNEXPECTED_KERNEL_MODE_TRAP"),
-    (0x00000080, "NMI_HARDWARE_FAILURE"),
-    (0x0000008E, "KERNEL_MODE_EXCEPTION_NOT_HANDLED"),
-    (0x0000009C, "MACHINE_CHECK_EXCEPTION"),
-    (0x0000009F, "DRIVER_POWER_STATE_FAILURE"),
-    (0x000000A0, "INTERNAL_POWER_ERROR"),
-    (0x000000A5, "ACPI_BIOS_ERROR"),
-    (0x000000BE, "ATTEMPTED_WRITE_TO_READONLY_MEMORY"),
-    (0x000000C1, "SPECIAL_POOL_DETECTED_MEMORY_CORRUPTION"),
-    (0x000000C2, "BAD_POOL_CALLER"),
-    (0x000000C4, "DRIVER_VERIFIER_DETECTED_VIOLATION"),
-    (0x000000C5, "DRIVER_CORRUPTED_EXPOOL"),
-    (0x000000CA, "PNP_DETECTED_FATAL_ERROR"),
-    (0x000000D1, "DRIVER_IRQL_NOT_LESS_OR_EQUAL"),
-    (
-        0x000000D4,
-        "SYSTEM_SCAN_AT_RAISED_IRQL_CAUGHT_IMPROPER_DRIVER_UNLOAD",
-    ),
-    (0x000000EA, "THREAD_STUCK_IN_DEVICE_DRIVER"),
-    (0x000000ED, "UNMOUNTABLE_BOOT_VOLUME"),
-    (0x000000EF, "CRITICAL_PROCESS_DIED"),
-    (0x000000F4, "CRITICAL_OBJECT_TERMINATION"),
-    (0x000000FC, "ATTEMPTED_EXECUTE_OF_NOEXECUTE_MEMORY"),
-    (0x000000FE, "BUGCODE_USB_DRIVER"),
-    (0x00000101, "CLOCK_WATCHDOG_TIMEOUT"),
-    (0x00000102, "DPC_WATCHDOG_TIMEOUT"),
-    (0x00000109, "CRITICAL_STRUCTURE_CORRUPTION"),
-    (0x0000010D, "WDF_VIOLATION"),
-    (0x0000010E, "VIDEO_MEMORY_MANAGEMENT_INTERNAL"),
-    (0x00000113, "VIDEO_DXGKRNL_FATAL_ERROR"),
-    (0x00000116, "VIDEO_TDR_FAILURE"),
-    (0x00000117, "VIDEO_TDR_TIMEOUT_DETECTED"),
-    (0x00000119, "VIDEO_SCHEDULER_INTERNAL_ERROR"),
-    (0x0000019C, "WIN32K_POWER_WATCHDOG_TIMEOUT"),
-    (0x00000124, "WHEA_UNCORRECTABLE_ERROR"),
-    (0x00000125, "NMR_INVALID_STATE"),
-    (0x00000127, "PAGE_NOT_ZERO"),
-    (0x00000133, "DPC_WATCHDOG_VIOLATION"),
-    (0x00000139, "KERNEL_SECURITY_CHECK_FAILURE"),
-    (0x0000013A, "KERNEL_MODE_HEAP_CORRUPTION"),
-    (0x00000141, "VIDEO_ENGINE_TIMEOUT_DETECTED"),
-    (0x00000144, "BUGCODE_USB3_DRIVER"),
-    (0x00000154, "UNEXPECTED_STORE_EXCEPTION"),
-    (0x00000155, "OS_DATA_TAMPERING"),
-    (0x00000160, "WIN32K_ATOMIC_CHECK_FAILURE"),
-    (0x00000162, "KERNEL_AUTO_BOOST_INVALID_LOCK_RELEASE"),
-    (0x00000164, "WIN32K_CRITICAL_FAILURE"),
-    (0x00000187, "VIDEO_DWMINIT_TIMEOUT_FALLBACK_BDD"),
-    (0x00000189, "BAD_OBJECT_HEADER"),
-    (0x0000018B, "SECURE_KERNEL_ERROR"),
-    (0x000001C4, "DRIVER_VERIFIER_DETECTED_VIOLATION_LIVEDUMP"),
-    (0xC000021A, "STATUS_SYSTEM_PROCESS_TERMINATED"),
-    (0xC0000005, "STATUS_ACCESS_VIOLATION"),
-    (0xC0000142, "STATUS_DLL_INIT_FAILED"),
-];
-
-/// Returns the symbolic name for a bugcheck stop code, or `"(unknown)"`.
-pub fn stop_name(code: u64) -> &'static str {
-    STOP_CODES
-        .iter()
-        .find(|&&(c, _)| c == code)
-        .map(|&(_, n)| n)
-        .unwrap_or("(unknown)")
-}
-
-const REASON_CODES: &[(&str, &str)] = &[
-    ("80020001", "OS: Upgrade/Reinstall (planned)"),
-    (
-        "80020002",
-        "OS: Reconfiguration (planned) — typically Windows Update",
-    ),
-    ("80020003", "Application: Maintenance (planned)"),
-    ("80020004", "Application: Installation (planned)"),
-    ("80020010", "Hardware: Maintenance (planned)"),
-    ("80020011", "Hardware: Installation (planned)"),
-    ("80020012", "Hardware: Upgrade (planned)"),
-    ("80030001", "OS: Upgrade (unplanned)"),
-    ("80030002", "OS: Reconfiguration (unplanned)"),
-    ("80030003", "Application: Maintenance (unplanned)"),
-    ("80030004", "Application: Unresponsive"),
-    ("80030005", "Application: Unstable"),
-    ("80030010", "Hardware: Maintenance (unplanned)"),
-    ("80030011", "Hardware: Installation (unplanned)"),
-    ("80040000", "Hardware failure (unplanned)"),
-    ("80040001", "Hardware: Maintenance (unplanned)"),
-    ("80040002", "Hardware: Installation (unplanned)"),
-    ("80050001", "System failure: Stop error (BSOD)"),
-    ("80050002", "System failure: Loss of power (unplanned)"),
-    ("80050006", "Power supply failure (unplanned)"),
-    ("00040000", "Other (unplanned)"),
-    ("00050000", "Other (unplanned)"),
-    ("00050001", "Other (planned)"),
-    ("00050003", "Legacy API shutdown"),
-];
-
-/// Looks up an Event 1074 reason code (accepts `0x` prefix, uppercase, short forms).
-/// Returns `None` for codes not in the table.
-pub fn decode_reason(code: &str) -> Option<&'static str> {
-    let padded = format!(
-        "{:0>8}",
-        code.trim().to_lowercase().trim_start_matches("0x")
-    );
-    REASON_CODES
-        .iter()
-        .find(|&&(c, _)| c == padded)
-        .map(|&(_, d)| d)
-}
 
 /// Parses a u64 from a decimal or `0x`-prefixed hex string.
 /// Falls back to hex if the string contains a–f without a prefix.
@@ -178,6 +51,63 @@ pub fn module_from_bucket(bucket: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Maximum length kept for any single WER text field (see trust-boundary note below).
+const MAX_WER_FIELD_LEN: usize = 4096;
+
+/// Truncates `s` to at most `MAX_WER_FIELD_LEN` chars, on a char boundary.
+fn clamp_field(s: &str) -> String {
+    match s.char_indices().nth(MAX_WER_FIELD_LEN) {
+        Some((byte_idx, _)) => s[..byte_idx].to_string(),
+        None => s.to_string(),
+    }
+}
+
+/// Converts a raw WER Event 1001 record into a [`WerRecord`], or `None` if it is
+/// not a bugcheck report from Windows Error Reporting.
+///
+/// Field names here are non-obvious and were found by inspecting real event XML:
+/// the crash type is `EventName` = `"BlueScreen"` (not `"BugCheck"`, though both
+/// are accepted), and `P1` is the stop code as **bare hex with no `0x` prefix**.
+/// Falls through `Bucket` → `BucketId` → `HashedBucket` → `_0` for the bucket.
+///
+/// Portable on purpose: the Windows backend feeds it live records and the
+/// `--from-file` XML replay feeds it captured ones, so this mapping is exercised
+/// by tests on every platform rather than only on a real Windows machine.
+pub fn wer_from_event(ev: &EventRecord) -> Option<WerRecord> {
+    let prov = ev.provider.to_lowercase();
+    if !prov.contains("error reporting") && !prov.contains("wer") {
+        return None;
+    }
+    let event_name = ev.get("EventName").unwrap_or("");
+    if !event_name.eq_ignore_ascii_case("BlueScreen")
+        && !event_name.eq_ignore_ascii_case("BugCheck")
+    {
+        return None;
+    }
+    let p1 = ev
+        .get("P1")
+        .and_then(|s| u64::from_str_radix(s.trim(), 16).ok())
+        .unwrap_or(0);
+    let bucket_id = ev
+        .get("Bucket")
+        .or_else(|| ev.get("BucketId"))
+        .or_else(|| ev.get("HashedBucket"))
+        .or_else(|| ev.get("_0"))
+        .unwrap_or_default();
+    let minidump_path = ev.get("AttachedFiles").and_then(|s| {
+        s.lines()
+            .map(|l| l.trim())
+            .find(|l| l.to_lowercase().ends_with(".dmp"))
+            .map(|l| PathBuf::from(clamp_field(l.trim_start_matches(r"\\?\"))))
+    });
+    Some(WerRecord {
+        time_created: ev.time_created,
+        p1,
+        bucket_id: clamp_field(bucket_id),
+        minidump_path,
+    })
 }
 
 // ── Analysis result ───────────────────────────────────────────────────────────
@@ -538,19 +468,42 @@ pub fn extract_boot_cycles(
         })
         .collect();
 
-    // Cycles are ordered newest-first, so idx+1 is the boot before this one and
-    // idx-1 the boot after — the bounds `annotate_os_version` needs to confine
-    // each version lookup to the correct session.
     let boot_times: Vec<Option<Timestamp>> = cycles.iter().map(|c| c.boot_time).collect();
-    for idx in 0..cycles.len() {
-        let prev_boot = boot_times.get(idx + 1).copied().flatten();
-        let next_boot = if idx > 0 { boot_times[idx - 1] } else { None };
-        annotate_os_version(&mut cycles[idx], events, prev_boot, next_boot);
-        annotate_update_installs(&mut cycles[idx], events, prev_boot, next_boot);
-        annotate_service_installs(&mut cycles[idx], events, prev_boot, boot_times[idx]);
+    for (idx, cycle) in cycles.iter_mut().enumerate() {
+        let bounds = CycleBounds::at(&boot_times, idx);
+        annotate_os_version(cycle, events, bounds);
+        annotate_update_installs(cycle, events, bounds);
+        annotate_service_installs(cycle, events, bounds);
+        annotate_minidumps(cycle, bounds, dumps);
+        annotate_wer_module(cycle, bounds, wer);
     }
-    annotate_with_wer_and_dumps(&mut cycles, wer, dumps);
     cycles
+}
+
+/// The two boot times that bracket one cycle's session. Every annotation pass
+/// needs the same pair to confine its lookup to the right session, so it is
+/// derived **once** here rather than re-derived per pass — two copies of this
+/// indexing rule drifting apart is exactly the bug class it prevents.
+///
+/// Cycles are ordered newest-first, so `idx + 1` is the boot *before* this one
+/// and `idx - 1` the boot *after* it.
+#[derive(Clone, Copy)]
+struct CycleBounds {
+    /// Boot that started the session which this cycle's boot ended. `None` for
+    /// the oldest cycle in the window (its session start is off the end of the log).
+    prev_boot: Option<Timestamp>,
+    /// The next boot after this one. `None` for the most recent cycle, meaning
+    /// "unbounded → now".
+    next_boot: Option<Timestamp>,
+}
+
+impl CycleBounds {
+    fn at(boot_times: &[Option<Timestamp>], idx: usize) -> Self {
+        Self {
+            prev_boot: boot_times.get(idx + 1).copied().flatten(),
+            next_boot: if idx > 0 { boot_times[idx - 1] } else { None },
+        }
+    }
 }
 
 /// Returns the OS version from the first *parseable* Event 6009 in the half-open
@@ -599,12 +552,7 @@ fn nearest_os_version(
 /// bump the build number on the final restart, so `old_version == new_version`
 /// here does **not** prove no upgrade occurred — it only means the build hadn't
 /// changed yet at this boot. `cause_detail` is careful not to overclaim on that.
-fn annotate_os_version(
-    cycle: &mut BootCycle,
-    events: &[EventRecord],
-    prev_boot: Option<Timestamp>,
-    next_boot: Option<Timestamp>,
-) {
+fn annotate_os_version(cycle: &mut BootCycle, events: &[EventRecord], bounds: CycleBounds) {
     let Cause::WindowsUpdate {
         old_version,
         new_version,
@@ -614,8 +562,8 @@ fn annotate_os_version(
         return;
     };
     let Some(bt) = cycle.boot_time else { return };
-    *old_version = nearest_os_version(events, prev_boot, Some(bt), true);
-    *new_version = nearest_os_version(events, Some(bt), next_boot, false);
+    *old_version = nearest_os_version(events, bounds.prev_boot, Some(bt), true);
+    *new_version = nearest_os_version(events, Some(bt), bounds.next_boot, false);
 }
 
 /// Returns all Event-`id` records whose `TimeCreated` lies in the half-open window
@@ -650,12 +598,7 @@ fn is_defender_intelligence(title: &str) -> bool {
 /// evidence from Microsoft's troubleshooting guidance. Quality/cumulative/feature
 /// updates (the ones that actually reboot) are listed ahead of Defender definition
 /// updates; up to three distinct titles are shown.
-fn annotate_update_installs(
-    cycle: &mut BootCycle,
-    events: &[EventRecord],
-    prev_boot: Option<Timestamp>,
-    next_boot: Option<Timestamp>,
-) {
+fn annotate_update_installs(cycle: &mut BootCycle, events: &[EventRecord], bounds: CycleBounds) {
     if !matches!(cycle.cause, Cause::WindowsUpdate { .. }) {
         return;
     }
@@ -668,8 +611,8 @@ fn annotate_update_installs(
     // Store/Defender updates and misattribute them to this reboot.
     const POST_BOOT_GRACE_SECS: i64 = 60 * 60;
     let grace_end = bt.add_secs(POST_BOOT_GRACE_SECS);
-    let upper = Some(next_boot.map_or(grace_end, |nb| nb.min(grace_end)));
-    let found = events_in_window(events, 19, prev_boot, upper);
+    let upper = Some(bounds.next_boot.map_or(grace_end, |nb| nb.min(grace_end)));
+    let found = events_in_window(events, 19, bounds.prev_boot, upper);
     if found.is_empty() {
         return;
     }
@@ -683,7 +626,7 @@ fn annotate_update_installs(
         if is_defender_intelligence(t) {
             continue;
         }
-        if !titles.iter().any(|x| *x == t) {
+        if !titles.contains(&t) {
             titles.push(t);
         }
         if titles.len() >= 3 {
@@ -691,10 +634,10 @@ fn annotate_update_installs(
         }
     }
     // Fall back to the newest update of any kind if nothing else matched.
-    if titles.is_empty() {
-        if let Some(t) = found[0].get("updateTitle") {
-            titles.push(t);
-        }
+    if titles.is_empty()
+        && let Some(t) = found[0].get("updateTitle")
+    {
+        titles.push(t);
     }
     for t in titles {
         cycle
@@ -712,17 +655,12 @@ fn annotate_update_installs(
 /// The search is bounded below by `session_start` (the boot that began the crashed
 /// session): without a lower bound there is no way to tell "installed just before
 /// the crash" from ancient history, so the annotation is skipped rather than guess.
-fn annotate_service_installs(
-    cycle: &mut BootCycle,
-    events: &[EventRecord],
-    session_start: Option<Timestamp>,
-    boot_time: Option<Timestamp>,
-) {
+fn annotate_service_installs(cycle: &mut BootCycle, events: &[EventRecord], bounds: CycleBounds) {
     if !matches!(cycle.cause, Cause::BlueScreen { .. }) {
         return;
     }
-    let Some(lo) = session_start else { return };
-    let found = events_in_window(events, 7045, Some(lo), boot_time);
+    let Some(lo) = bounds.prev_boot else { return };
+    let found = events_in_window(events, 7045, Some(lo), cycle.boot_time);
     if found.is_empty() {
         return;
     }
@@ -747,34 +685,12 @@ fn annotate_service_installs(
     }
 }
 
-/// Runs both annotation passes (minidumps then WER module) over all cycles.
-fn annotate_with_wer_and_dumps(
-    cycles: &mut [BootCycle],
-    wer: &[WerRecord],
-    dumps: &[(Timestamp, PathBuf)],
-) {
-    let boot_times: Vec<Option<Timestamp>> = cycles.iter().map(|c| c.boot_time).collect();
-
-    for idx in 0..cycles.len() {
-        let boot_time = boot_times[idx];
-        let session_start = boot_times.get(idx + 1).copied().flatten();
-        let wer_end = if idx > 0 { boot_times[idx - 1] } else { None };
-
-        annotate_minidumps(&mut cycles[idx], boot_time, session_start, dumps);
-        annotate_wer_module(&mut cycles[idx], boot_time, wer_end, wer);
-    }
-}
-
 /// Matches filesystem minidumps to this cycle by modification time.
-/// The window is `[session_start, boot_time + 10 min]`; the upper bound
+/// The window is `[prev_boot, boot_time + 10 min]`; the upper bound
 /// accommodates WER processing delay after the recovery boot.
-fn annotate_minidumps(
-    cycle: &mut BootCycle,
-    boot_time: Option<Timestamp>,
-    session_start: Option<Timestamp>,
-    dumps: &[(Timestamp, PathBuf)],
-) {
-    let lower = session_start.unwrap_or_else(|| {
+fn annotate_minidumps(cycle: &mut BootCycle, bounds: CycleBounds, dumps: &[(Timestamp, PathBuf)]) {
+    let boot_time = cycle.boot_time;
+    let lower = bounds.prev_boot.unwrap_or_else(|| {
         boot_time
             .map(|t| t.add_secs(-30 * 86_400))
             .unwrap_or_else(Timestamp::now)
@@ -790,21 +706,16 @@ fn annotate_minidumps(
 }
 
 /// Matches a WER record to this cycle's BSOD by stop code and time window.
-/// WER runs during the recovery boot, so the window is `[boot_time, wer_end]`
-/// where `wer_end` is the start of the next boot (or now for the most recent cycle).
+/// WER runs during the recovery boot, so the window is `[boot_time, next_boot]`
+/// (or now for the most recent cycle).
 /// Also fills `minidumps` from `WerRecord.minidump_path` if the filesystem scan found nothing.
-fn annotate_wer_module(
-    cycle: &mut BootCycle,
-    boot_time: Option<Timestamp>,
-    wer_end: Option<Timestamp>,
-    wer: &[WerRecord],
-) {
+fn annotate_wer_module(cycle: &mut BootCycle, bounds: CycleBounds, wer: &[WerRecord]) {
     let Cause::BlueScreen { stop_code, .. } = &cycle.cause else {
         return;
     };
     let sc = *stop_code;
-    let bt = boot_time.unwrap_or_else(Timestamp::now);
-    let upper = wer_end.unwrap_or_else(Timestamp::now);
+    let bt = cycle.boot_time.unwrap_or_else(Timestamp::now);
+    let upper = bounds.next_boot.unwrap_or_else(Timestamp::now);
 
     let Some(wr) = wer
         .iter()
@@ -824,10 +735,10 @@ fn annotate_wer_module(
 #[cfg(test)]
 mod tests {
     use super::{
-        analyze_slice, annotate_os_version, annotate_service_installs, annotate_update_installs,
-        bsod_evidence, classify_event41, classify_event1074, collect_boot_indices, decode_reason,
-        events_in_window, extract_boot_cycles, hex_u64, is_defender_intelligence,
-        module_from_bucket, os_version_from_6009, stop_name,
+        CycleBounds, analyze_slice, annotate_os_version, annotate_service_installs,
+        annotate_update_installs, bsod_evidence, classify_event41, classify_event1074,
+        collect_boot_indices, events_in_window, extract_boot_cycles, hex_u64,
+        is_defender_intelligence, module_from_bucket, os_version_from_6009,
     };
     use crate::timestamp::Timestamp;
     use crate::types::{BootCycle, Cause, EventRecord};
@@ -884,47 +795,6 @@ mod tests {
         assert_eq!(hex_u64(""), None);
         assert_eq!(hex_u64("xyz"), None);
         assert_eq!(hex_u64("0xgg"), None);
-    }
-
-    // ── stop_name ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn stop_name_known_codes() {
-        assert_eq!(stop_name(0x9F), "DRIVER_POWER_STATE_FAILURE");
-        assert_eq!(stop_name(0x19C), "WIN32K_POWER_WATCHDOG_TIMEOUT");
-        assert_eq!(stop_name(0xFE), "BUGCODE_USB_DRIVER");
-        assert_eq!(stop_name(0x144), "BUGCODE_USB3_DRIVER");
-        assert_eq!(stop_name(0x50), "PAGE_FAULT_IN_NONPAGED_AREA");
-    }
-
-    #[test]
-    fn stop_name_unknown() {
-        assert_eq!(stop_name(0xDEADBEEF), "(unknown)");
-        assert_eq!(stop_name(0), "(unknown)");
-    }
-
-    // ── decode_reason ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn decode_reason_with_0x_prefix() {
-        let r = decode_reason("0x80020002").expect("should be found");
-        assert!(r.contains("Windows Update") || r.contains("Reconfiguration"));
-    }
-
-    #[test]
-    fn decode_reason_without_prefix() {
-        assert_eq!(decode_reason("80020002"), decode_reason("0x80020002"));
-    }
-
-    #[test]
-    fn decode_reason_uppercase_x() {
-        assert_eq!(decode_reason("0X80020002"), decode_reason("0x80020002"));
-    }
-
-    #[test]
-    fn decode_reason_not_found() {
-        assert!(decode_reason("DEADBEEF").is_none());
-        assert!(decode_reason("00000000").is_none());
     }
 
     // ── module_from_bucket ────────────────────────────────────────────────────
@@ -1290,8 +1160,10 @@ mod tests {
         annotate_os_version(
             &mut cycle,
             &events,
-            Some(boot_time.add_secs(-300)),
-            Some(boot_time.add_secs(300)),
+            CycleBounds {
+                prev_boot: Some(boot_time.add_secs(-300)),
+                next_boot: Some(boot_time.add_secs(300)),
+            },
         );
         match cycle.cause {
             Cause::WindowsUpdate {
@@ -1340,8 +1212,10 @@ mod tests {
         annotate_os_version(
             &mut cycle,
             &events,
-            Some(boot_time.add_secs(-300)),
-            Some(boot_time.add_secs(300)),
+            CycleBounds {
+                prev_boot: Some(boot_time.add_secs(-300)),
+                next_boot: Some(boot_time.add_secs(300)),
+            },
         );
         match cycle.cause {
             Cause::WindowsUpdate {
@@ -1359,7 +1233,14 @@ mod tests {
     #[test]
     fn annotate_os_version_no_op_for_non_windows_update_cause() {
         let mut cycle = make_cycle(Cause::NormalShutdown, Some(Timestamp(1_705_314_600)));
-        annotate_os_version(&mut cycle, &[], None, None);
+        annotate_os_version(
+            &mut cycle,
+            &[],
+            CycleBounds {
+                prev_boot: None,
+                next_boot: None,
+            },
+        );
         assert!(matches!(cycle.cause, Cause::NormalShutdown));
     }
 
@@ -1379,7 +1260,14 @@ mod tests {
             Timestamp(1_705_314_600),
             &[("_0", "10.00."), ("_1", "26100")],
         )];
-        annotate_os_version(&mut cycle, &events, None, None);
+        annotate_os_version(
+            &mut cycle,
+            &events,
+            CycleBounds {
+                prev_boot: None,
+                next_boot: None,
+            },
+        );
         match cycle.cause {
             Cause::WindowsUpdate {
                 old_version,
@@ -1465,7 +1353,14 @@ mod tests {
             },
             Some(bt),
         );
-        annotate_update_installs(&mut cycle, &events, Some(bt.add_secs(-600)), None);
+        annotate_update_installs(
+            &mut cycle,
+            &events,
+            CycleBounds {
+                prev_boot: Some(bt.add_secs(-600)),
+                next_boot: None,
+            },
+        );
         assert!(
             cycle.evidence.iter().any(|e| e.contains("KB5099999")),
             "cumulative update should be surfaced: {:?}",
@@ -1498,7 +1393,14 @@ mod tests {
             },
             Some(bt),
         );
-        annotate_update_installs(&mut cycle, &events, Some(bt.add_secs(-600)), None);
+        annotate_update_installs(
+            &mut cycle,
+            &events,
+            CycleBounds {
+                prev_boot: Some(bt.add_secs(-600)),
+                next_boot: None,
+            },
+        );
         assert!(
             cycle.evidence.iter().any(|e| e.contains("KB2267602")),
             "with nothing else, the newest update is shown as context: {:?}",
@@ -1516,7 +1418,14 @@ mod tests {
             &[("updateTitle", "2026-07 Cumulative Update (KB5099999)")],
         )];
         let mut cycle = make_cycle(Cause::NormalShutdown, Some(bt));
-        annotate_update_installs(&mut cycle, &events, Some(bt.add_secs(-600)), None);
+        annotate_update_installs(
+            &mut cycle,
+            &events,
+            CycleBounds {
+                prev_boot: Some(bt.add_secs(-600)),
+                next_boot: None,
+            },
+        );
         assert!(
             cycle.evidence.is_empty(),
             "non-update cause must not gain update evidence"
@@ -1547,7 +1456,14 @@ mod tests {
             },
             Some(bt),
         );
-        annotate_service_installs(&mut cycle, &events, Some(session_start), Some(bt));
+        annotate_service_installs(
+            &mut cycle,
+            &events,
+            CycleBounds {
+                prev_boot: Some(session_start),
+                next_boot: None,
+            },
+        );
         assert!(
             cycle
                 .evidence
@@ -1576,7 +1492,14 @@ mod tests {
             Some(bt),
         );
         // No session_start → cannot bound "shortly before" → no annotation.
-        annotate_service_installs(&mut cycle, &events, None, Some(bt));
+        annotate_service_installs(
+            &mut cycle,
+            &events,
+            CycleBounds {
+                prev_boot: None,
+                next_boot: None,
+            },
+        );
         assert!(cycle.evidence.is_empty());
     }
 
@@ -1590,7 +1513,14 @@ mod tests {
             &[("ServiceName", "x"), ("ServiceType", "kernel mode driver")],
         )];
         let mut cycle = make_cycle(Cause::NormalShutdown, Some(bt));
-        annotate_service_installs(&mut cycle, &events, Some(bt.add_secs(-3600)), Some(bt));
+        annotate_service_installs(
+            &mut cycle,
+            &events,
+            CycleBounds {
+                prev_boot: Some(bt.add_secs(-3600)),
+                next_boot: None,
+            },
+        );
         assert!(
             cycle.evidence.is_empty(),
             "non-BSOD cause must not gain service-install evidence"
@@ -1631,8 +1561,10 @@ mod tests {
         annotate_os_version(
             &mut cycle,
             &events,
-            Some(bt.add_secs(-300)),
-            Some(next_boot),
+            CycleBounds {
+                prev_boot: Some(bt.add_secs(-300)),
+                next_boot: Some(next_boot),
+            },
         );
         match cycle.cause {
             Cause::WindowsUpdate {
@@ -1674,7 +1606,14 @@ mod tests {
             },
             Some(bt),
         );
-        annotate_os_version(&mut cycle, &events, Some(bt.add_secs(-300)), None);
+        annotate_os_version(
+            &mut cycle,
+            &events,
+            CycleBounds {
+                prev_boot: Some(bt.add_secs(-300)),
+                next_boot: None,
+            },
+        );
         match cycle.cause {
             Cause::WindowsUpdate { old_version, .. } => {
                 assert_eq!(old_version.as_deref(), Some("10.0.19045"))

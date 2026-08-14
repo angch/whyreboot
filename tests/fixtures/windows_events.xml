@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Events>
+<!-- Capture shape produced by `wevtutil qe System /f:xml` (newest first).
+     Scenario: the machine bugchecked with 0x9F (portcls) on 2026-06-28, then
+     rebooted. Event 41 + 6008 are logged at the *recovery* boot to report the
+     previous session's crash; Event 1074 in the older session is the clean
+     shutdown that preceded it. The Application-channel WER 1001 record names
+     the faulting module. -->
+<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-Kernel-Power' Guid='{331c3b3a-2005-44c2-ac5e-77220c37d6b4}'/><EventID>41</EventID><TimeCreated SystemTime='2026-06-28T08:00:05.000000000Z'/></System><EventData><Data Name='BugcheckCode'>159</Data><Data Name='BugcheckParameter1'>0x3</Data><Data Name='BugcheckParameter2'>0xffffb00</Data><Data Name='BugcheckParameter3'>0x0</Data><Data Name='BugcheckParameter4'>0x0</Data></EventData></Event>
+<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='EventLog'/><EventID Qualifiers='32768'>6008</EventID><TimeCreated SystemTime='2026-06-28T08:00:04.000000000Z'/></System><EventData><Data>8:00:05 AM</Data><Data>‎6/‎28/‎2026</Data></EventData></Event>
+<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-Kernel-General' Guid='{a68ca8b7-004f-d7b6-a698-07e2de0f1f5d}'/><EventID>12</EventID><TimeCreated SystemTime='2026-06-28T08:00:00.000000000Z'/></System><EventData><Data Name='MajorVersion'>10</Data><Data Name='MinorVersion'>0</Data><Data Name='BuildVersion'>26200</Data></EventData></Event>
+<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='EventLog'/><EventID Qualifiers='32768'>6009</EventID><TimeCreated SystemTime='2026-06-28T08:00:01.000000000Z'/></System><EventData><Data>10.0.26200</Data><Data>Multiprocessor Free</Data></EventData></Event>
+<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Service Control Manager' Guid='{555908d1-a6d7-4695-8e1e-26931d2012f4}'/><EventID Qualifiers='16384'>7045</EventID><TimeCreated SystemTime='2026-06-27T21:14:00.000000000Z'/></System><EventData><Data Name='ServiceName'>RTKVHD64</Data><Data Name='ImagePath'>C:\Windows\System32\drivers\RTKVHD64.sys</Data><Data Name='ServiceType'>kernel mode driver</Data></EventData></Event>
+<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-Kernel-General' Guid='{a68ca8b7-004f-d7b6-a698-07e2de0f1f5d}'/><EventID>12</EventID><TimeCreated SystemTime='2026-06-27T20:00:00.000000000Z'/></System><EventData><Data Name='BuildVersion'>26200</Data></EventData></Event>
+</Events>

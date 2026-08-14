@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Windows Event Log fetching: System channel, WER (Application channel), and minidump listing.
 
+use crate::analysis::wer_from_event;
 use crate::timestamp::Timestamp;
 use crate::types::{EventRecord, WerRecord};
 use crate::xml::parse_event;
@@ -135,17 +136,6 @@ pub fn fetch_system_events() -> Vec<EventRecord> {
     records
 }
 
-/// Maximum length kept for any single WER text field (see trust-boundary note below).
-const MAX_WER_FIELD_LEN: usize = 4096;
-
-/// Truncates `s` to at most `MAX_WER_FIELD_LEN` chars, on a char boundary.
-fn clamp_field(s: &str) -> String {
-    match s.char_indices().nth(MAX_WER_FIELD_LEN) {
-        Some((byte_idx, _)) => s[..byte_idx].to_string(),
-        None => s.to_string(),
-    }
-}
-
 /// Fetches WER BugCheck records from the Application log (Event 1001).
 /// Filters to records where the provider name contains "error reporting" or "wer"
 /// and `EventName` is `"BlueScreen"` or `"BugCheck"` (both accepted defensively).
@@ -166,44 +156,7 @@ pub fn fetch_wer_events() -> Vec<WerRecord> {
 
     let (records, unparsed) = fetch_channel(&ch, &q, 100);
     warn_if_unparsed("Application/WER", unparsed);
-    records
-        .into_iter()
-        .filter_map(|ev| {
-            let prov = ev.provider.to_lowercase();
-            if !prov.contains("error reporting") && !prov.contains("wer") {
-                return None;
-            }
-            let event_name = ev.get("EventName").unwrap_or("");
-            if !event_name.eq_ignore_ascii_case("BlueScreen")
-                && !event_name.eq_ignore_ascii_case("BugCheck")
-            {
-                return None;
-            }
-            let p1 = ev
-                .get("P1")
-                .and_then(|s| u64::from_str_radix(s.trim(), 16).ok())
-                .unwrap_or(0);
-            let bucket_id = ev
-                .get("Bucket")
-                .or_else(|| ev.get("BucketId"))
-                .or_else(|| ev.get("HashedBucket"))
-                .or_else(|| ev.get("_0"))
-                .unwrap_or_default();
-            let bucket_id = clamp_field(bucket_id);
-            let minidump_path = ev.get("AttachedFiles").and_then(|s| {
-                s.lines()
-                    .map(|l| l.trim())
-                    .find(|l| l.to_lowercase().ends_with(".dmp"))
-                    .map(|l| PathBuf::from(clamp_field(l.trim_start_matches(r"\\?\"))))
-            });
-            Some(WerRecord {
-                time_created: ev.time_created,
-                p1,
-                bucket_id,
-                minidump_path,
-            })
-        })
-        .collect()
+    records.iter().filter_map(wer_from_event).collect()
 }
 
 /// Lists `*.dmp` files in `%SystemRoot%\Minidump`, sorted newest first.

@@ -68,7 +68,6 @@ fn detect_kernel_oom(line: &LogLine) -> Option<Finding> {
     if let Some(adj) = extract_after(msg, "oom_score_adj:") {
         evidence.push(format!("oom_score_adj: {adj}"));
     }
-    evidence.push(format!("Raw: {}", msg.trim()));
     evidence.push(
         "The kernel ran out of memory and killed the highest-scoring process to \
          reclaim RAM. Check for a memory leak or an under-provisioned machine/cgroup."
@@ -81,6 +80,9 @@ fn detect_kernel_oom(line: &LogLine) -> Option<Finding> {
         category: "OOM".to_string(),
         title: format!("Kernel OOM killer terminated {victim}"),
         evidence,
+        raw: msg.trim().to_string(),
+        related: Vec::new(),
+        correlations: Vec::new(),
         source: "journald:kernel".to_string(),
     })
 }
@@ -102,7 +104,6 @@ fn detect_systemd_oomd(line: &LogLine) -> Option<Finding> {
     if !reason.is_empty() {
         evidence.push(format!("Reason: {reason}"));
     }
-    evidence.push(format!("Raw: {}", msg.trim()));
     evidence.push(
         "systemd-oomd killed this control group in userspace based on memory-pressure \
          (PSI) thresholds — the kernel OOM killer may not have fired. Review the unit's \
@@ -122,6 +123,9 @@ fn detect_systemd_oomd(line: &LogLine) -> Option<Finding> {
         category: "OOM".to_string(),
         title: format!("systemd-oomd killed {cg} under memory pressure"),
         evidence,
+        raw: msg.trim().to_string(),
+        related: Vec::new(),
+        correlations: Vec::new(),
         source: "systemd-oomd".to_string(),
     })
 }
@@ -287,7 +291,7 @@ mod tests {
 
     #[test]
     fn detect_selects_only_oom_lines() {
-        let lines = vec![
+        let lines = [
             kline("Out of memory: Killed process 1 (a) anon-rss:1000kB"),
             oomd_line("Killed /x.service due to memory pressure for /x being 99% > 50% for > 5s"),
             kline("nothing to see here"),
