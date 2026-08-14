@@ -2,6 +2,7 @@
 //! Windows Event Log fetching: System channel, WER (Application channel), and minidump listing.
 
 use crate::analysis::wer_from_event;
+use crate::registry::wide;
 use crate::timestamp::Timestamp;
 use crate::types::{EventRecord, WerRecord};
 use crate::xml::parse_event;
@@ -72,12 +73,9 @@ pub fn fetch_channel(
                         // `needed` is the byte count including the UTF-16 null
                         // terminator; strip it so the resulting String is clean.
                         let char_count = needed as usize / 2;
-                        let end = if char_count > 0 && buf.get(char_count - 1) == Some(&0) {
-                            char_count - 1
-                        } else {
-                            char_count
-                        };
-                        let xml = String::from_utf16_lossy(&buf[..end]);
+                        let slice = &buf[..char_count];
+                        let xml =
+                            String::from_utf16_lossy(slice.strip_suffix(&[0]).unwrap_or(slice));
                         match parse_event(&xml) {
                             Some(rec) => records.push(rec),
                             None => unparsed += 1,
@@ -125,12 +123,12 @@ fn warn_if_unparsed(channel: &str, unparsed: usize) {
 /// shutdown-event set needed so several boot cycles stay in view despite the
 /// frequent Defender "Security Intelligence" Event 19s that share the channel.
 pub fn fetch_system_events() -> Vec<EventRecord> {
-    let ch: Vec<u16> = "System\0".encode_utf16().collect();
-    let q: Vec<u16> = "*[System[(EventID=12 or EventID=13 or EventID=19 or EventID=41 \
+    let ch = wide("System");
+    let q = wide(
+        "*[System[(EventID=12 or EventID=13 or EventID=19 or EventID=41 \
           or EventID=109 or EventID=1074 or EventID=1076 or EventID=7045 \
-          or EventID=6006 or EventID=6008 or EventID=6009 or EventID=6013)]]\0"
-        .encode_utf16()
-        .collect();
+          or EventID=6006 or EventID=6008 or EventID=6009 or EventID=6013)]]",
+    );
     let (records, unparsed) = fetch_channel(&ch, &q, 500);
     warn_if_unparsed("System", unparsed);
     records
@@ -151,8 +149,8 @@ pub fn fetch_system_events() -> Vec<EventRecord> {
 /// Field lengths are still clamped defensively so a malicious record can't bloat
 /// the displayed output.
 pub fn fetch_wer_events() -> Vec<WerRecord> {
-    let ch: Vec<u16> = "Application\0".encode_utf16().collect();
-    let q: Vec<u16> = "*[System[EventID=1001]]\0".encode_utf16().collect();
+    let ch = wide("Application");
+    let q = wide("*[System[EventID=1001]]");
 
     let (records, unparsed) = fetch_channel(&ch, &q, 100);
     warn_if_unparsed("Application/WER", unparsed);

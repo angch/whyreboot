@@ -1168,8 +1168,7 @@ mod tests {
             message: msg.into(),
             identifier: "kernel".into(),
             transport: "kernel".into(),
-            unit: String::new(),
-            user_unit: false,
+            ..Default::default()
         }
     }
     fn kline(msg: &str) -> LogLine {
@@ -1181,8 +1180,7 @@ mod tests {
             message: msg.into(),
             identifier: "systemd".into(),
             transport: "journal".into(),
-            unit: String::new(),
-            user_unit: false,
+            ..Default::default()
         }
     }
     /// Like [`systemd`] but sets the `UNIT` journal field (as a real
@@ -1438,8 +1436,7 @@ mod tests {
             message: "Process 4242 (chrome) of user 1000 dumped core.".into(),
             identifier: "systemd-coredump".into(),
             transport: "journal".into(),
-            unit: String::new(),
-            user_unit: false,
+            ..Default::default()
         };
         let f = classify(&l).unwrap();
         assert_eq!(f.category, "Coredump");
@@ -1609,8 +1606,7 @@ mod tests {
             message: msg.into(),
             identifier: ident.into(),
             transport: "journal".into(),
-            unit: String::new(),
-            user_unit: false,
+            ..Default::default()
         }
     }
 
@@ -1774,8 +1770,7 @@ mod tests {
                 message: "Lost connection to Wayland compositor.".into(),
                 identifier: "firefox".into(),
                 transport: "journal".into(),
-                unit: String::new(),
-                user_unit: false,
+                ..Default::default()
             },
         ];
         let found = scan(&lines);

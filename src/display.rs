@@ -192,15 +192,11 @@ pub fn print_cycle(cycle: &BootCycle, pal: &Pal, total: usize, audio: &[AudioPow
 fn print_cycle_header(cycle: &BootCycle, pal: &Pal, total: usize, dline: &str) {
     let w = 74usize;
     if total > 1 {
-        let label = if cycle.index == 0 {
-            format!(
-                " Boot Cycle {} of {} — most recent ",
-                total - cycle.index,
-                total
-            )
-        } else {
-            format!(" Boot Cycle {} of {} ", total - cycle.index, total)
-        };
+        let n = total - cycle.index;
+        let mut label = format!(" Boot Cycle {n} of {total} ");
+        if cycle.index == 0 {
+            label.push_str("— most recent ");
+        }
         // Pad by char count, not byte length — the em dash is 3 bytes but 1 column.
         let pad = w.saturating_sub(label.chars().count());
         let lpad = pad / 2;
@@ -404,6 +400,17 @@ fn json_time(t: Option<Timestamp>) -> String {
     t.map_or_else(|| "null".to_string(), |t| json_str(&t.to_rfc3339()))
 }
 
+/// Like [`json_str`], but for an optional string: `Some(s)` → quoted JSON string,
+/// `None` → bare `null`.  Only called from Windows-gated `cause_json`; the gate
+/// keeps it from being flagged dead code on Linux.
+#[cfg(windows)]
+fn json_opt_str(opt: Option<&str>) -> String {
+    match opt {
+        Some(s) => json_str(s),
+        None => "null".to_string(),
+    }
+}
+
 /// Appends a JSON array of escaped strings, e.g. `["a", "b"]`.
 fn push_array(out: &mut String, items: &[String]) {
     out.push('[');
@@ -543,14 +550,8 @@ fn cause_json(cause: &Cause) -> (&'static str, String) {
             format!(
                 "\"process\": {}, \"old_version\": {}, \"new_version\": {},",
                 json_str(process),
-                old_version
-                    .as_deref()
-                    .map(json_str)
-                    .unwrap_or_else(|| "null".to_string()),
-                new_version
-                    .as_deref()
-                    .map(json_str)
-                    .unwrap_or_else(|| "null".to_string()),
+                json_opt_str(old_version.as_deref()),
+                json_opt_str(new_version.as_deref()),
             ),
         ),
         Cause::UserAction {

@@ -93,7 +93,7 @@ pub enum Cause {
 
 /// A normalized log record, independent of the source (journald, dmesg, file, …).
 /// Detectors in [`crate::detect`] consume these and emit [`Finding`]s.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LogLine {
     pub time: Timestamp,
     pub message: String,
