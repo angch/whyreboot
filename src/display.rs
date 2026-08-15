@@ -157,10 +157,11 @@ fn findings_json(
 
 #[cfg(windows)]
 fn cause_color<'p>(cause: &Cause, pal: &'p Pal) -> &'p str {
-    match cause {
-        Cause::BlueScreen { .. } | Cause::ForcedPowerOff | Cause::UnexpectedShutdown => pal.crash,
-        Cause::Undetermined => pal.warn,
-        _ => pal.ok,
+    use whyreboot::format::CauseSeverity;
+    match whyreboot::format::cause_severity(cause) {
+        CauseSeverity::Crash => pal.crash,
+        CauseSeverity::Warn => pal.warn,
+        CauseSeverity::Ok => pal.ok,
     }
 }
 

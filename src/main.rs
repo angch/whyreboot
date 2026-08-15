@@ -349,12 +349,7 @@ fn run_windows(args: &Args, pal: &color::Pal) {
     // down, not on any older crash still inside the log window.
     if args.exit_code
         && cycles.first().is_some_and(|c| {
-            matches!(
-                c.cause,
-                whyreboot::types::Cause::BlueScreen { .. }
-                    | whyreboot::types::Cause::ForcedPowerOff
-                    | whyreboot::types::Cause::UnexpectedShutdown
-            )
+            whyreboot::format::cause_severity(&c.cause) == whyreboot::format::CauseSeverity::Crash
         })
     {
         std::process::exit(EXIT_ISSUES_FOUND);

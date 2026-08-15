@@ -6,17 +6,26 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::*;
+use windows::Win32::UI::Input::KeyboardAndMouse::VK_F5;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{PCWSTR, PWSTR, w};
+use windows::core::{PCWSTR, w};
 
-use whyreboot::format::relative_ago;
+use whyreboot::format::{CauseSeverity, cause_severity, relative_ago};
 use whyreboot::timestamp::Timestamp;
 
-use crate::panels::{build_about, build_boot_history, panel_proc, switch_tab, update_detail};
-use crate::state::{CYCLES, DETAIL_H, LV_H, LV_W, PAD, PANELS, TAB_H, WIN_H, WIN_W};
+use crate::fetch;
+use crate::panels::{ABOUT_TEXT, build_boot_history, panel_proc, update_detail};
+use crate::state::{self, DETAIL_H, LV_H, LV_W, PAD, PANEL_H, WIN_H, WIN_W};
 use crate::win32::{
-    LVN_GETINFOTIPW_CODE, NMLVGETINFOTIPW, apply_font, as_hwnd, hinstance, hmenu_id, wstr,
+    LVN_GETINFOTIPW_CODE, NMLVGETINFOTIPW, as_hwnd, hinstance, open_capture_dialog, rgb, wstr,
 };
+
+// ── Menu command IDs ──────────────────────────────────────────────────────────
+
+pub const ID_REFRESH: usize = 1001;
+pub const ID_OPEN_CAPTURE: usize = 1002;
+pub const ID_ABOUT: usize = 1003;
+pub const ID_EXIT: usize = 1004;
 
 // ── Main window procedure ─────────────────────────────────────────────────────
 
@@ -26,58 +35,46 @@ pub unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             let hi = hinstance(GetModuleHandleW(PCWSTR(std::ptr::null())).unwrap_or_default());
             let font = GetStockObject(DEFAULT_GUI_FONT);
 
-            let tab = CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                WC_TABCONTROLW,
-                w!(""),
-                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
-                0,
-                0,
-                WIN_W,
-                WIN_H,
-                Some(hwnd),
-                hmenu_id(1000),
-                Some(hi),
-                None,
-            )
-            .unwrap_or(HWND(std::ptr::null_mut()));
-            apply_font(tab, font);
-            TAB_H.with(|t| t.set(tab.0 as isize));
+            build_menu(hwnd);
 
-            for (i, name) in ["Boot History", "About"].iter().enumerate() {
-                let mut txt = wstr(name);
-                let mut ti = TCITEMW {
-                    mask: TCIF_TEXT,
-                    pszText: PWSTR(txt.as_mut_ptr()),
-                    ..Default::default()
-                };
-                SendMessageW(
-                    tab,
-                    TCM_INSERTITEMW,
-                    Some(WPARAM(i)),
-                    Some(LPARAM(&mut ti as *mut _ as isize)),
-                );
+            let mut client = RECT::default();
+            let _ = GetClientRect(hwnd, &mut client);
+            let rc = panel_rect(client.right, client.bottom);
+            let panel = build_boot_history(hwnd, rc, hi, font);
+            PANEL_H.with(|p| p.set(panel.0 as isize));
+
+            LRESULT(0)
+        }
+        WM_COMMAND => {
+            match wp.0 & 0xFFFF {
+                ID_REFRESH => fetch::reload_live(),
+                ID_OPEN_CAPTURE => {
+                    if let Some(path) = open_capture_dialog(hwnd)
+                        && let Err(e) = fetch::reload_from_file(&path)
+                    {
+                        let msg = wstr(&e);
+                        MessageBoxW(
+                            Some(hwnd),
+                            PCWSTR(msg.as_ptr()),
+                            w!("whyreboot"),
+                            MB_ICONERROR,
+                        );
+                    }
+                }
+                ID_ABOUT => {
+                    let msg = wstr(ABOUT_TEXT);
+                    MessageBoxW(
+                        Some(hwnd),
+                        PCWSTR(msg.as_ptr()),
+                        w!("About whyreboot"),
+                        MB_ICONINFORMATION,
+                    );
+                }
+                ID_EXIT => {
+                    let _ = DestroyWindow(hwnd);
+                }
+                _ => {}
             }
-
-            let mut rc = RECT {
-                left: 2,
-                top: 2,
-                right: WIN_W - 2,
-                bottom: WIN_H - 2,
-            };
-            SendMessageW(
-                tab,
-                TCM_ADJUSTRECT,
-                Some(WPARAM(0)),
-                Some(LPARAM(&mut rc as *mut _ as isize)),
-            );
-
-            let p0 = build_boot_history(hwnd, rc, hi, font);
-            let p1 = build_about(hwnd, rc, hi, font);
-            PANELS.with(|p| p.set([p0.0 as isize, p1.0 as isize]));
-
-            SetWindowPos(tab, Some(HWND_TOP), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE).ok();
-            switch_tab(0);
             LRESULT(0)
         }
         WM_NOTIFY => {
@@ -85,14 +82,9 @@ pub unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                 return DefWindowProcW(hwnd, msg, wp, lp);
             }
             let hdr = &*(lp.0 as *const NMHDR);
-            let tab = TAB_H.with(|t| as_hwnd(t.get()));
             let lv = LV_H.with(|t| as_hwnd(t.get()));
 
-            if hdr.hwndFrom == tab && hdr.code == TCN_SELCHANGE {
-                let sel =
-                    SendMessageW(tab, TCM_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))).0 as usize;
-                switch_tab(sel);
-            } else if hdr.hwndFrom == lv && hdr.code == LVN_ITEMCHANGED {
+            if hdr.hwndFrom == lv && hdr.code == LVN_ITEMCHANGED {
                 let nmlv = &*(lp.0 as *const NMLISTVIEW);
                 // Only act when a row becomes selected (not deselected)
                 if nmlv.uChanged.0 & LVIF_STATE.0 != 0 && nmlv.uNewState & LVIS_SELECTED.0 != 0 {
@@ -101,9 +93,13 @@ pub unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             } else if hdr.hwndFrom == lv && hdr.code == LVN_GETINFOTIPW_CODE {
                 let tip = &mut *(lp.0 as *mut NMLVGETINFOTIPW);
                 if tip.item >= 0 && !tip.psz_text.0.is_null() && tip.cch_max > 0 {
-                    let cycles = CYCLES.get().map(|v| v.as_slice()).unwrap_or(&[]);
-                    if let Some(t) = cycles.get(tip.item as usize).and_then(|c| c.boot_time) {
-                        let ago = relative_ago(Timestamp::now().secs_since(t));
+                    let ago = state::with_cycles(|cycles| {
+                        cycles
+                            .get(tip.item as usize)
+                            .and_then(|c| c.boot_time)
+                            .map(|t| relative_ago(Timestamp::now().secs_since(t)))
+                    });
+                    if let Some(ago) = ago {
                         let encoded: Vec<u16> = ago.encode_utf16().collect();
                         let max = (tip.cch_max as usize).saturating_sub(1);
                         let len = encoded.len().min(max);
@@ -113,6 +109,8 @@ pub unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                         *tip.psz_text.0.add(len) = 0;
                     }
                 }
+            } else if hdr.hwndFrom == lv && hdr.code == NM_CUSTOMDRAW {
+                return list_view_custom_draw(lp);
             }
             LRESULT(0)
         }
@@ -129,41 +127,28 @@ pub unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             }
             let cw = (lp.0 & 0xFFFF) as i32;
             let ch = (lp.0 >> 16 & 0xFFFF) as i32;
-            let tab = TAB_H.with(|t| as_hwnd(t.get()));
 
-            // Stretch tab control to fill the client area.
-            SetWindowPos(tab, None, 0, 0, cw, ch, SWP_NOZORDER | SWP_NOACTIVATE).ok();
-
-            // Ask the tab control for the usable inner rect.
-            let mut rc = RECT {
-                left: 2,
-                top: 2,
-                right: cw - 2,
-                bottom: ch - 2,
-            };
-            SendMessageW(
-                tab,
-                TCM_ADJUSTRECT,
-                Some(WPARAM(0)),
-                Some(LPARAM(&mut rc as *mut _ as isize)),
-            );
+            // The Boot History panel fills the whole client area (minus a
+            // small margin) — there's no tab control competing for the space
+            // anymore. `panel_rect` is shared with WM_CREATE so the two can't
+            // drift out of sync (they used to: WM_CREATE built the panel flush
+            // against the edges while WM_SIZE always inset by 2px, causing a
+            // visible jump the first time the window was resized).
+            let rc = panel_rect(cw, ch);
             let pw = rc.right - rc.left;
             let ph = rc.bottom - rc.top;
 
-            // Resize both panels to the new inner rect.
-            let panels = PANELS.with(|p| p.get());
-            for &raw in &panels {
-                SetWindowPos(
-                    as_hwnd(raw),
-                    None,
-                    rc.left,
-                    rc.top,
-                    pw,
-                    ph,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                )
-                .ok();
-            }
+            let panel = PANEL_H.with(|p| as_hwnd(p.get()));
+            SetWindowPos(
+                panel,
+                None,
+                rc.left,
+                rc.top,
+                pw,
+                ph,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+            .ok();
 
             // Resize ListView (left, fixed width) and EDIT (right, fills rest).
             let lv = LV_H.with(|t| as_hwnd(t.get()));
@@ -190,20 +175,6 @@ pub unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             )
             .ok();
 
-            // Resize the About panel's static text child.
-            if let Ok(child) = GetWindow(as_hwnd(panels[1]), GW_CHILD) {
-                SetWindowPos(
-                    child,
-                    None,
-                    16,
-                    16,
-                    pw - 32,
-                    ph - 32,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                )
-                .ok();
-            }
-
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -214,6 +185,60 @@ pub unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
     }
 }
 
+/// The Boot History panel's rect within the client area: a small margin so
+/// child controls don't touch the window frame.
+fn panel_rect(cw: i32, ch: i32) -> RECT {
+    RECT {
+        left: 2,
+        top: 2,
+        right: cw - 2,
+        bottom: ch - 2,
+    }
+}
+
+/// Builds the "File" menu: Refresh (re-scan the live event log), Open
+/// Capture… (replay a `--from-file`-style XML capture), About, and Exit.
+unsafe fn build_menu(hwnd: HWND) {
+    let Ok(menu) = CreateMenu() else { return };
+    if let Ok(file_menu) = CreatePopupMenu() {
+        let _ = AppendMenuW(file_menu, MF_STRING, ID_REFRESH, w!("&Refresh\tF5"));
+        let _ = AppendMenuW(
+            file_menu,
+            MF_STRING,
+            ID_OPEN_CAPTURE,
+            w!("&Open Capture...\tCtrl+O"),
+        );
+        let _ = AppendMenuW(file_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(file_menu, MF_STRING, ID_ABOUT, w!("&About whyreboot"));
+        let _ = AppendMenuW(file_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(file_menu, MF_STRING, ID_EXIT, w!("E&xit"));
+        let _ = AppendMenuW(menu, MF_POPUP, file_menu.0 as usize, w!("&File"));
+    }
+    let _ = SetMenu(hwnd, Some(menu));
+}
+
+/// Colors each Boot History row's text by the cycle's [`CauseSeverity`] —
+/// the GUI equivalent of the CLI's ANSI-colored verdict line.
+unsafe fn list_view_custom_draw(lp: LPARAM) -> LRESULT {
+    let cd = &mut *(lp.0 as *mut NMLVCUSTOMDRAW);
+    if cd.nmcd.dwDrawStage == CDDS_PREPAINT {
+        return LRESULT(CDRF_NOTIFYITEMDRAW as isize);
+    }
+    if cd.nmcd.dwDrawStage == CDDS_ITEMPREPAINT {
+        let idx = cd.nmcd.dwItemSpec;
+        let sev = state::with_cycles(|cycles| cycles.get(idx).map(|c| cause_severity(&c.cause)));
+        if let Some(sev) = sev {
+            cd.clrText = COLORREF(match sev {
+                CauseSeverity::Crash => rgb(180, 0, 0),
+                CauseSeverity::Warn => rgb(150, 95, 0),
+                CauseSeverity::Ok => GetSysColor(COLOR_WINDOWTEXT),
+            });
+        }
+        return LRESULT(CDRF_NEWFONT as isize);
+    }
+    LRESULT(CDRF_DODEFAULT as isize)
+}
+
 // ── Message loop ──────────────────────────────────────────────────────────────
 
 pub unsafe fn run_ui() {
@@ -221,7 +246,7 @@ pub unsafe fn run_ui() {
 
     let icc = INITCOMMONCONTROLSEX {
         dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-        dwICC: ICC_TAB_CLASSES | ICC_LISTVIEW_CLASSES,
+        dwICC: ICC_LISTVIEW_CLASSES,
     };
     let _ = InitCommonControlsEx(&icc);
 
@@ -253,7 +278,10 @@ pub unsafe fn run_ui() {
         right: WIN_W,
         bottom: WIN_H,
     };
-    AdjustWindowRect(&mut rc, style, false).ok();
+    // `true`: a menu bar is added in WM_CREATE, so its height must be budgeted
+    // into the window rect too, or the client area would come up short by
+    // exactly one menu row.
+    AdjustWindowRect(&mut rc, style, true).ok();
 
     let main = CreateWindowExW(
         WINDOW_EX_STYLE(0),
@@ -274,9 +302,29 @@ pub unsafe fn run_ui() {
     let _ = ShowWindow(main, SW_SHOWNORMAL);
     let _ = UpdateWindow(main);
 
+    // F5 = Refresh, Ctrl+O = Open Capture — mirrors the menu, works regardless
+    // of which child control has focus.
+    let accels = [
+        ACCEL {
+            fVirt: FVIRTKEY,
+            key: VK_F5.0,
+            cmd: ID_REFRESH as u16,
+        },
+        ACCEL {
+            fVirt: FVIRTKEY | FCONTROL,
+            key: b'O' as u16,
+            cmd: ID_OPEN_CAPTURE as u16,
+        },
+    ];
+    let haccel = CreateAcceleratorTableW(&accels).unwrap_or_default();
+
     let mut msg = MSG::default();
     while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        if TranslateAcceleratorW(main, haccel, &msg) != 0 {
+            continue;
+        }
         let _ = TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    let _ = DestroyAcceleratorTable(haccel);
 }

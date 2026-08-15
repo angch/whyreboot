@@ -37,6 +37,39 @@ toolchain step and the fallback, and build with stable directly.
 - Wire the resolved `TimeWindow` into the Windows path too (currently `--history N`).
 - Extend `tests/fixtures/windows_events.xml` as Windows analysis changes — it is
   the only coverage of that path that runs off Windows.
+- GUI: "Refresh" and "Open Capture…" re-fetch synchronously on the UI thread
+  (`gui/src/fetch.rs`), so the window is unresponsive for the duration — same
+  cost the original startup fetch always had, just now visible after the
+  window is already showing. Move the fetch to a background thread and marshal
+  the result back via a custom `WM_APP` message if a large event log ever makes
+  this noticeable.
+
+## Done — Windows GUI: File menu, Refresh, offline replay (2026-08)
+
+- The GUI had drifted behind the CLI (last touched at v0.4.0 — missing
+  `--exit-code`'s prerequisites, `--from-file` replay, and any way to see new
+  data without restarting). Brought it back to parity and past it:
+  - **File menu** (replaces the old "Boot History"/"About" tab pair — About is
+    now a `MessageBoxW` behind `File > About`, so the single Boot History panel
+    fills the whole window): **Refresh** (`F5`) re-scans the live Event Log in
+    place; **Open Capture…** (`Ctrl+O`) replays a `wevtutil qe System /f:xml` /
+    `Get-WinEvent | %{ $_.ToXml() }` capture through the same portable
+    `xml::parse_event_log` / `analysis::extract_boot_cycles` pipeline the CLI's
+    `--from-file` uses — the GUI equivalent of that flag.
+  - Boot History rows are colored by cause severity (red/amber/default) via
+    `NM_CUSTOMDRAW`, mirroring the CLI's ANSI verdict coloring. Backed by a new
+    shared `format::cause_severity`/`CauseSeverity` so "what counts as bad" for
+    a `Cause` — used by the CLI's `cause_color` and now `--exit-code` too, and
+    by the GUI's row coloring — lives in exactly one place. (Deliberately kept
+    separate from `types::Severity`, which classifies `Finding`s on
+    Linux/macOS and has a genuine fourth "informational" tier that `Cause`
+    doesn't — the two enums look alike but aren't interchangeable.)
+  - `state.rs` moved from `OnceLock` (set once at startup, read forever) to
+    thread-local `RefCell`s, since Refresh/Open Capture now need to replace the
+    analysis data after the window is already showing. The whole GUI runs on
+    one thread (the message-loop thread), so no locking is needed.
+  - Fixed the About text's hardcoded `v0.1.0` (the crate had moved on to
+    0.6.0 without it) — now `env!("CARGO_PKG_VERSION")`.
 
 ## Done — maintainability + CI pass (2026-08)
 

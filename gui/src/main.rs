@@ -3,23 +3,14 @@
 
 mod app;
 mod detail;
+mod fetch;
 mod panels;
 mod state;
 mod win32;
 
-use whyreboot::analysis::extract_boot_cycles;
-use whyreboot::events::{fetch_system_events, fetch_wer_events, list_minidumps};
-use whyreboot::registry::check_audio_power_settings;
-
 fn main() {
-    let sys = fetch_system_events();
-    let wer = fetch_wer_events();
-    let dumps = list_minidumps();
-    let audio = check_audio_power_settings();
-    state::CYCLES
-        .set(extract_boot_cycles(&sys, &wer, &dumps, 0))
-        .ok();
-    state::AUDIO.set(audio).ok();
-
+    // The window doesn't exist yet, so this just seeds `state`; `run_ui`
+    // populates the ListView from it once the panel is built.
+    unsafe { fetch::reload_live() };
     unsafe { app::run_ui() };
 }

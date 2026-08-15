@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Panel window procedure and the two tab panels: Boot History (ListView + detail
-//! EDIT) and About.
+//! Panel window procedure and the Boot History panel (ListView + detail EDIT),
+//! which now fills the whole client area — see [`crate::app::ID_ABOUT`] for the
+//! About info, which lives in the File menu instead of a second tab.
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use windows::Win32::Foundation::*;
@@ -12,8 +13,28 @@ use windows::core::{PCWSTR, PWSTR, w};
 use whyreboot::types::Cause;
 
 use crate::detail::format_cycle_detail;
-use crate::state::{AUDIO, CYCLES, DETAIL_H, LV_H, LV_W, PAD, PANELS};
+use crate::state::{self, DETAIL_H, LV_H, LV_W, PAD};
 use crate::win32::{apply_font, as_hwnd, hmenu_id, wstr};
+
+/// About text shown from the File menu's "About" command via `MessageBoxW`.
+pub const ABOUT_TEXT: &str = concat!(
+    "whyreboot  v",
+    env!("CARGO_PKG_VERSION"),
+    "\r\n",
+    "Windows boot cause analyzer\r\n\r\n",
+    "Reads the Windows Event Log (System channel) and Windows Error\r\n",
+    "Reporting to diagnose why the machine last shut down or crashed.\r\n\r\n",
+    "Data sources:\r\n",
+    "  \u{2022} System Event Log  \u{2014}  Event IDs 12, 13, 41, 1074, 6006, 6008\r\n",
+    "  \u{2022} WER Event 1001    \u{2014}  faulting driver from Bucket field\r\n",
+    "  \u{2022} C:\\Windows\\Minidump  \u{2014}  crash dump files (needs admin)\r\n",
+    "  \u{2022} Registry audio class  \u{2014}  AllowIdleIrpInD3 power settings\r\n\r\n",
+    "File menu:\r\n",
+    "  \u{2022} Refresh (F5)       \u{2014}  re-scan the live event log\r\n",
+    "  \u{2022} Open Capture\u{2026}     \u{2014}  replay a wevtutil/PowerShell XML capture\r\n\r\n",
+    "Licensed under MIT OR Apache-2.0\r\n",
+    "https://github.com/angch/whyreboot",
+);
 
 // ── Panel window procedure ────────────────────────────────────────────────────
 
@@ -56,14 +77,101 @@ pub unsafe fn update_detail(idx: usize) {
     if detail.0.is_null() {
         return;
     }
-    let cycles = CYCLES.get().map(|v| v.as_slice()).unwrap_or(&[]);
-    let audio = AUDIO.get().map(|v| v.as_slice()).unwrap_or(&[]);
-    let text = cycles
-        .get(idx)
-        .map(|c| format_cycle_detail(c, audio))
-        .unwrap_or_default();
+    let text = state::with_cycles(|cycles| {
+        state::with_audio(|audio| {
+            cycles
+                .get(idx)
+                .map(|c| format_cycle_detail(c, audio))
+                .unwrap_or_default()
+        })
+    });
     let txt = wstr(&text);
     let _ = SetWindowTextW(detail, PCWSTR(txt.as_ptr()));
+}
+
+// ── (Re)populate the ListView from current CYCLES ─────────────────────────────
+
+/// Clears and refills the boot-history ListView from the current `state`
+/// cycles, then selects the first row (or shows the empty-state message).
+/// Shared by the initial build and by "Refresh" / "Open Capture…", so the
+/// window never needs to be torn down to show newly-loaded data.
+pub unsafe fn refresh_boot_history() {
+    let lv = LV_H.with(|t| as_hwnd(t.get()));
+    if lv.0.is_null() {
+        return;
+    }
+    SendMessageW(lv, LVM_DELETEALLITEMS, Some(WPARAM(0)), Some(LPARAM(0)));
+
+    state::with_cycles(|cycles| {
+        for (row, c) in cycles.iter().enumerate() {
+            insert_row(lv, row, c);
+        }
+    });
+
+    let detail = DETAIL_H.with(|t| as_hwnd(t.get()));
+    if state::with_cycles(|c| !c.is_empty()) {
+        let mut sel_state = LVITEMW {
+            stateMask: LVIS_SELECTED,
+            state: LVIS_SELECTED,
+            ..Default::default()
+        };
+        SendMessageW(
+            lv,
+            LVM_SETITEMSTATE,
+            Some(WPARAM(0)),
+            Some(LPARAM(&mut sel_state as *mut _ as isize)),
+        );
+        update_detail(0);
+    } else if !detail.0.is_null() {
+        let empty = wstr("No boot cycles found.\r\nTry running as Administrator.");
+        let _ = SetWindowTextW(detail, PCWSTR(empty.as_ptr()));
+    }
+}
+
+/// Inserts one ListView row for boot cycle `c` at position `row`.
+unsafe fn insert_row(lv: HWND, row: usize, c: &whyreboot::types::BootCycle) {
+    let mut num_w = wstr(&format!("{}", c.index + 1));
+    let date_str = c
+        .boot_time
+        .map(|t| t.format_dt())
+        .unwrap_or_else(|| "?".into());
+    let mut date_w = wstr(&date_str);
+    let cause_str = match &c.cause {
+        Cause::BlueScreen { .. } => "BSOD",
+        Cause::ForcedPowerOff => "Forced off",
+        Cause::UnexpectedShutdown => "Unexpected",
+        Cause::WindowsUpdate { .. } => "Update",
+        Cause::UserAction { .. } => "User",
+        Cause::SystemProcess { .. } => "System",
+        Cause::NormalShutdown => "Normal",
+        Cause::Undetermined => "?",
+    };
+    let mut cause_w = wstr(cause_str);
+
+    let mut item = LVITEMW {
+        mask: LVIF_TEXT,
+        iItem: row as i32,
+        iSubItem: 0,
+        pszText: PWSTR(num_w.as_mut_ptr()),
+        ..Default::default()
+    };
+    SendMessageW(
+        lv,
+        LVM_INSERTITEMW,
+        Some(WPARAM(0)),
+        Some(LPARAM(&mut item as *mut _ as isize)),
+    );
+
+    for (col, txt) in [(1, &mut date_w), (2, &mut cause_w)] {
+        item.iSubItem = col;
+        item.pszText = PWSTR(txt.as_mut_ptr());
+        SendMessageW(
+            lv,
+            LVM_SETITEMW,
+            Some(WPARAM(0)),
+            Some(LPARAM(&mut item as *mut _ as isize)),
+        );
+    }
 }
 
 // ── Build boot-history panel (two-pane) ──────────────────────────────────────
@@ -138,52 +246,6 @@ pub unsafe fn build_boot_history(parent: HWND, rc: RECT, hi: HINSTANCE, font: HG
         );
     }
 
-    let cycles = CYCLES.get().map(|v| v.as_slice()).unwrap_or(&[]);
-    for (row, c) in cycles.iter().enumerate() {
-        let mut num_w = wstr(&format!("{}", c.index + 1));
-        let date_str = c
-            .boot_time
-            .map(|t| t.format_dt())
-            .unwrap_or_else(|| "?".into());
-        let mut date_w = wstr(&date_str);
-        let cause_str = match &c.cause {
-            Cause::BlueScreen { .. } => "BSOD",
-            Cause::ForcedPowerOff => "Forced off",
-            Cause::UnexpectedShutdown => "Unexpected",
-            Cause::WindowsUpdate { .. } => "Update",
-            Cause::UserAction { .. } => "User",
-            Cause::SystemProcess { .. } => "System",
-            Cause::NormalShutdown => "Normal",
-            Cause::Undetermined => "?",
-        };
-        let mut cause_w = wstr(cause_str);
-
-        let mut item = LVITEMW {
-            mask: LVIF_TEXT,
-            iItem: row as i32,
-            iSubItem: 0,
-            pszText: PWSTR(num_w.as_mut_ptr()),
-            ..Default::default()
-        };
-        SendMessageW(
-            lv,
-            LVM_INSERTITEMW,
-            Some(WPARAM(0)),
-            Some(LPARAM(&mut item as *mut _ as isize)),
-        );
-
-        for (col, txt) in [(1, &mut date_w), (2, &mut cause_w)] {
-            item.iSubItem = col;
-            item.pszText = PWSTR(txt.as_mut_ptr());
-            SendMessageW(
-                lv,
-                LVM_SETITEMW,
-                Some(WPARAM(0)),
-                Some(LPARAM(&mut item as *mut _ as isize)),
-            );
-        }
-    }
-
     // ── Right: detail EDIT ────────────────────────────────────────────────────
     let ex = LV_W + PAD * 2;
     let ew = pw - ex - PAD;
@@ -208,88 +270,7 @@ pub unsafe fn build_boot_history(parent: HWND, rc: RECT, hi: HINSTANCE, font: HG
     apply_font(detail, font);
     DETAIL_H.with(|t| t.set(detail.0 as isize));
 
-    // Select first row and populate detail
-    if !cycles.is_empty() {
-        let mut state = LVITEMW {
-            stateMask: LVIS_SELECTED,
-            state: LVIS_SELECTED,
-            ..Default::default()
-        };
-        SendMessageW(
-            lv,
-            LVM_SETITEMSTATE,
-            Some(WPARAM(0)),
-            Some(LPARAM(&mut state as *mut _ as isize)),
-        );
-        update_detail(0);
-    } else {
-        let empty = wstr("No boot cycles found.\r\nTry running as Administrator.");
-        let _ = SetWindowTextW(detail, PCWSTR(empty.as_ptr()));
-    }
+    refresh_boot_history();
 
     panel
-}
-
-// ── Build about panel ─────────────────────────────────────────────────────────
-
-pub unsafe fn build_about(parent: HWND, rc: RECT, hi: HINSTANCE, font: HGDIOBJ) -> HWND {
-    let pw = rc.right - rc.left;
-    let ph = rc.bottom - rc.top;
-
-    let panel = CreateWindowExW(
-        WINDOW_EX_STYLE(0),
-        w!("WRPanel"),
-        w!(""),
-        WS_CHILD,
-        rc.left,
-        rc.top,
-        pw,
-        ph,
-        Some(parent),
-        None,
-        Some(hi),
-        None,
-    )
-    .unwrap_or(HWND(std::ptr::null_mut()));
-
-    let about = wstr(concat!(
-        "whyreboot  v0.1.0\r\n",
-        "Windows boot cause analyzer\r\n\r\n",
-        "Reads the Windows Event Log (System channel) and Windows Error\r\n",
-        "Reporting to diagnose why the machine last shut down or crashed.\r\n\r\n",
-        "Data sources:\r\n",
-        "  \u{2022} System Event Log  \u{2014}  Event IDs 12, 13, 41, 1074, 6006, 6008\r\n",
-        "  \u{2022} WER Event 1001    \u{2014}  faulting driver from Bucket field\r\n",
-        "  \u{2022} C:\\Windows\\Minidump  \u{2014}  crash dump files (needs admin)\r\n",
-        "  \u{2022} Registry audio class  \u{2014}  AllowIdleIrpInD3 power settings\r\n\r\n",
-        "Licensed under MIT OR Apache-2.0\r\n",
-        "https://github.com/angch/whyreboot",
-    ));
-    let hw = CreateWindowExW(
-        WINDOW_EX_STYLE(0),
-        w!("STATIC"),
-        PCWSTR(about.as_ptr()),
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(0),
-        16,
-        16,
-        pw - 32,
-        ph - 32,
-        Some(panel),
-        hmenu_id(400),
-        Some(hi),
-        None,
-    )
-    .unwrap_or(HWND(std::ptr::null_mut()));
-    apply_font(hw, font);
-
-    panel
-}
-
-// ── Tab switching ─────────────────────────────────────────────────────────────
-
-pub unsafe fn switch_tab(idx: usize) {
-    let panels = PANELS.with(|p| p.get());
-    for (i, &raw) in panels.iter().enumerate() {
-        let _ = ShowWindow(as_hwnd(raw), if i == idx { SW_SHOW } else { SW_HIDE });
-    }
 }

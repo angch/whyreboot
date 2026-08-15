@@ -5,6 +5,29 @@ use crate::types::{AudioPowerInfo, Cause, EventRecord};
 
 // ── Cause labelling ───────────────────────────────────────────────────────────
 
+/// Three-way severity bucket for coloring a boot cycle's verdict: crash-like
+/// causes are the headline concern, `Undetermined` is a lesser warning, and
+/// every clean/expected shutdown is fine. Shared between the CLI's ANSI
+/// coloring (`display.rs::cause_color`) and the GUI's list/detail coloring so
+/// "what counts as bad" lives in exactly one place.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CauseSeverity {
+    Crash,
+    Warn,
+    Ok,
+}
+
+/// Classifies a [`Cause`] into a [`CauseSeverity`] bucket.
+pub fn cause_severity(cause: &Cause) -> CauseSeverity {
+    match cause {
+        Cause::BlueScreen { .. } | Cause::ForcedPowerOff | Cause::UnexpectedShutdown => {
+            CauseSeverity::Crash
+        }
+        Cause::Undetermined => CauseSeverity::Warn,
+        _ => CauseSeverity::Ok,
+    }
+}
+
 /// Short all-caps verdict label.
 pub fn cause_label(cause: &Cause) -> &'static str {
     match cause {
