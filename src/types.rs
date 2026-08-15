@@ -93,7 +93,7 @@ pub enum Cause {
 
 /// A normalized log record, independent of the source (journald, dmesg, file, …).
 /// Detectors in [`crate::detect`] consume these and emit [`Finding`]s.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LogLine {
     pub time: Timestamp,
     pub message: String,
@@ -101,6 +101,14 @@ pub struct LogLine {
     pub identifier: String,
     /// journald `_TRANSPORT`, e.g. `"kernel"` (may be empty).
     pub transport: String,
+    /// journald unit name — `UNIT` for system-manager (PID 1) entries or
+    /// `USER_UNIT` for user-session entries (may be empty; absent on non-systemd
+    /// entries and macOS).  Set by the systemd manager when logging about a unit.
+    pub unit: String,
+    /// Whether [`unit`](Self::unit) is a *user-session* unit (managed by a
+    /// per-user systemd instance) rather than a system unit.  Drives the
+    /// `journalctl --user -u` / `systemctl --user status` hint.
+    pub user_unit: bool,
 }
 
 /// Severity of a detected issue. Ordered least-to-most severe so `Ord` can rank.

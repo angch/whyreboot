@@ -8,11 +8,16 @@
 
 use crate::types::AudioPowerInfo;
 
+/// Encodes a Rust string as a null-terminated UTF-16 wide string for Win32 APIs.
+pub(crate) fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain([0]).collect()
+}
+
 /// Reads a `REG_DWORD` value from an open registry key. Returns `None` if the
 /// value is absent, the wrong type, or the query fails.
 fn reg_read_dword(hk: windows::Win32::System::Registry::HKEY, name: &str) -> Option<u32> {
     use windows::Win32::System::Registry::{REG_VALUE_TYPE, RegQueryValueExW};
-    let w: Vec<u16> = name.encode_utf16().chain([0]).collect();
+    let w = wide(name);
     let mut val = 0u32;
     let mut sz = 4u32;
     let mut tp = REG_VALUE_TYPE(0);
@@ -25,7 +30,6 @@ fn reg_read_dword(hk: windows::Win32::System::Registry::HKEY, name: &str) -> Opt
             Some(&mut val as *mut u32 as *mut u8),
             Some(&mut sz),
         )
-        .ok()
         .is_ok()
     };
     if ok && tp.0 == 4 { Some(val) } else { None }
@@ -35,7 +39,7 @@ fn reg_read_dword(hk: windows::Win32::System::Registry::HKEY, name: &str) -> Opt
 /// Uses a two-pass query: size probe then read. Returns `None` if absent or empty.
 fn reg_read_string(hk: windows::Win32::System::Registry::HKEY, name: &str) -> Option<String> {
     use windows::Win32::System::Registry::{REG_VALUE_TYPE, RegQueryValueExW};
-    let w: Vec<u16> = name.encode_utf16().chain([0]).collect();
+    let w = wide(name);
     let mut sz = 0u32;
     let mut tp = REG_VALUE_TYPE(0);
     unsafe {
@@ -64,7 +68,6 @@ fn reg_read_string(hk: windows::Win32::System::Registry::HKEY, name: &str) -> Op
             Some(buf.as_mut_ptr() as *mut u8),
             Some(&mut sz),
         )
-        .ok()
         .is_ok()
     };
     if ok && (tp.0 == 1 || tp.0 == 2) {
@@ -93,7 +96,7 @@ pub fn check_audio_power_settings() -> Vec<AudioPowerInfo> {
         r"SYSTEM\CurrentControlSet\Control\Class\{4d36e96c-e325-11ce-bfc1-08002be10318}";
     let mut results = Vec::new();
     unsafe {
-        let base_w: Vec<u16> = BASE.encode_utf16().chain([0]).collect();
+        let base_w = wide(BASE);
         let mut hk_base = HKEY(std::ptr::null_mut());
         if RegOpenKeyExW(
             HKEY_LOCAL_MACHINE,
@@ -102,7 +105,6 @@ pub fn check_audio_power_settings() -> Vec<AudioPowerInfo> {
             KEY_READ,
             &mut hk_base,
         )
-        .ok()
         .is_err()
         {
             return results;
@@ -110,7 +112,7 @@ pub fn check_audio_power_settings() -> Vec<AudioPowerInfo> {
 
         for i in 0..=20u32 {
             let inst = format!("{:04}", i);
-            let inst_w: Vec<u16> = inst.encode_utf16().chain([0]).collect();
+            let inst_w = wide(&inst);
             let mut hk = HKEY(std::ptr::null_mut());
             if RegOpenKeyExW(
                 hk_base,
@@ -119,7 +121,6 @@ pub fn check_audio_power_settings() -> Vec<AudioPowerInfo> {
                 KEY_READ,
                 &mut hk,
             )
-            .ok()
             .is_err()
             {
                 continue;

@@ -42,11 +42,27 @@ fn line_to_log(line: &str) -> Option<LogLine> {
     if let Some(message) = get("MESSAGE") {
         // journald: __REALTIME_TIMESTAMP is microseconds since the Unix epoch.
         let micros: i64 = get("__REALTIME_TIMESTAMP")?.parse().ok()?;
+        let identifier = get("SYSLOG_IDENTIFIER").unwrap_or("").to_string();
+        // The systemd manager logs the affected unit in UNIT (system/PID 1) or
+        // USER_UNIT (per-user session).  Both are absent on non-systemd entries
+        // (kernel, app logs), so field presence alone distinguishes the three
+        // cases — no identifier check needed.  The fields carry the exact unit
+        // name even when it contains colons (e.g.
+        // `dbus-:1.2-org.kde.KSplash@6.service`).
+        let (unit, user_unit) = match get("UNIT").filter(|u| !u.is_empty()) {
+            Some(u) => (u.to_string(), false),
+            None => match get("USER_UNIT").filter(|u| !u.is_empty()) {
+                Some(u) => (u.to_string(), true),
+                None => (String::new(), false),
+            },
+        };
         return Some(LogLine {
             time: Timestamp(micros / 1_000_000),
             message: message.to_string(),
-            identifier: get("SYSLOG_IDENTIFIER").unwrap_or("").to_string(),
+            identifier,
             transport: get("_TRANSPORT").unwrap_or("").to_string(),
+            unit,
+            user_unit,
         });
     }
 
@@ -58,6 +74,8 @@ fn line_to_log(line: &str) -> Option<LogLine> {
             message: message.to_string(),
             identifier: get("process").unwrap_or("").to_string(),
             transport: get("subsystem").unwrap_or("").to_string(),
+            unit: String::new(),
+            user_unit: false,
         });
     }
 

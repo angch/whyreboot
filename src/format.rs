@@ -144,16 +144,23 @@ pub fn relative_ago(secs: i64) -> String {
 
 // ── Audio power-crash classification ──────────────────────────────────────────
 
+/// True if the (already lowercased) driver name matches a known audio subsystem
+/// module. Callers that have the original name should lowercase it first — and
+/// reuse that lowercased form rather than calling this with the raw name.
+fn is_audio_module(low: &str) -> bool {
+    low.contains("portcls") || low.contains("audio") || low.contains("hdaud")
+}
+
 /// True if `cause` is a known power-transition BSOD (0x9F, 0x19C, 0xFE, 0x144)
 /// and `wer_module` names an audio driver (`portcls`, `audio`, `hdaud`).
 pub fn is_audio_power_crash(cause: &Cause, wer_module: &Option<String>) -> bool {
     let is_power_crash = matches!(cause, Cause::BlueScreen { stop_code, .. }
-        if *stop_code == 0x9F || *stop_code == 0x19C || *stop_code == 0xFE || *stop_code == 0x144);
+        if [0x9F, 0x19C, 0xFE, 0x144].contains(stop_code));
     if !is_power_crash {
         return false;
     }
-    let module_low = wer_module.as_deref().unwrap_or("").to_lowercase();
-    module_low.contains("portcls") || module_low.contains("audio") || module_low.contains("hdaud")
+    let low = wer_module.as_deref().unwrap_or("").to_lowercase();
+    is_audio_module(&low)
 }
 
 /// Human-readable status text for one audio device's `AllowIdleIrpInD3` registry
@@ -265,7 +272,7 @@ fn explain_driver_power_failure(
 ) {
     let m = module.as_deref().unwrap_or("(unknown driver)");
     let m_low = m.to_lowercase();
-    let is_audio = m_low.contains("portcls") || m_low.contains("audio") || m_low.contains("hdaud");
+    let is_audio = is_audio_module(&m_low);
     let is_usb = m_low.contains("usbccgp") || m_low.contains("usbhub") || m_low.contains("usb");
 
     out.push(format!(

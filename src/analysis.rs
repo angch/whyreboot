@@ -133,14 +133,14 @@ fn bsod_evidence(stop_code: u64, params: [u64; 4]) -> Vec<String> {
     )];
     if stop_code == 0x9F {
         let meaning = match params[0] {
-            1 => " (device object failed WaitForSingleObject during power transition)",
-            2 => " (device object failed IRP_MN_SET_POWER for SystemPowerState)",
-            3 => " (device object stalled during IRP_MN_SET_POWER; check P4)",
-            4 => " (device object stalled powering down; check P4)",
-            _ => "",
+            1 => Some(" (device object failed WaitForSingleObject during power transition)"),
+            2 => Some(" (device object failed IRP_MN_SET_POWER for SystemPowerState)"),
+            3 => Some(" (device object stalled during IRP_MN_SET_POWER; check P4)"),
+            4 => Some(" (device object stalled powering down; check P4)"),
+            _ => None,
         };
-        if !meaning.is_empty() {
-            ev.push(format!("  0x9F P1=0x{:X}{}", params[0], meaning));
+        if let Some(m) = meaning {
+            ev.push(format!("  0x9F P1=0x{:X}{}", params[0], m));
         }
     }
     for (i, &p) in params.iter().enumerate() {
@@ -156,12 +156,13 @@ fn bsod_evidence(stop_code: u64, params: [u64; 4]) -> Vec<String> {
 /// `unexpected_flag` is true if Event 6008 also appears in the same `post_boot` slice.
 fn classify_event41(ev: &EventRecord, unexpected_flag: bool) -> (Cause, u8, Vec<String>) {
     let stop_code = ev.get("BugcheckCode").and_then(hex_u64).unwrap_or(0);
-    let params = [
-        ev.get("BugcheckParameter1").and_then(hex_u64).unwrap_or(0),
-        ev.get("BugcheckParameter2").and_then(hex_u64).unwrap_or(0),
-        ev.get("BugcheckParameter3").and_then(hex_u64).unwrap_or(0),
-        ev.get("BugcheckParameter4").and_then(hex_u64).unwrap_or(0),
+    let param_keys = [
+        "BugcheckParameter1",
+        "BugcheckParameter2",
+        "BugcheckParameter3",
+        "BugcheckParameter4",
     ];
+    let params = param_keys.map(|k| ev.get(k).and_then(hex_u64).unwrap_or(0));
     let power_btn = ev
         .get("PowerButtonTimestamp")
         .and_then(hex_u64)
@@ -234,8 +235,8 @@ fn classify_event1074(ev: &EventRecord) -> (Cause, u8, Vec<String>, String) {
     let pl = process.to_lowercase();
     // Normalize the reason code to bare hex (strip "0x"/"0X" if present) before
     // comparing, since Event 1074 param4 may arrive with or without the prefix.
-    let rc_norm = reason_code.trim().to_lowercase();
-    let rc_norm = rc_norm.trim_start_matches("0x");
+    let rc_lower = reason_code.trim().to_lowercase();
+    let rc_norm = rc_lower.trim_start_matches("0x");
     let is_update = pl.contains("tiworker")
         || pl.contains("trustedinstaller")
         || pl.contains("wuauclt")
@@ -403,6 +404,28 @@ pub fn collect_boot_indices(events: &[EventRecord]) -> Vec<usize> {
         .collect()
 }
 
+/// Builds a [`BootCycle`] from a [`CycleAnalysis`] plus the fields that
+/// `analyze_slice` doesn't own (index, boot_time, display_events).
+fn cycle_to_boot(
+    index: usize,
+    boot_time: Option<Timestamp>,
+    a: CycleAnalysis,
+    display_events: Vec<EventRecord>,
+) -> BootCycle {
+    BootCycle {
+        index,
+        boot_time,
+        shutdown_time: a.shutdown_time,
+        cause: a.cause,
+        confidence: a.confidence,
+        evidence: a.evidence,
+        timeline: a.timeline,
+        wer_module: None,
+        minidumps: Vec::new(),
+        display_events,
+    }
+}
+
 /// Slices the flat event list into per-boot cycles and classifies each one.
 /// `limit` is the number of most-recent cycles to return (0 = all).
 /// Falls back to treating the entire event set as a single cycle if no Event 12 is found.
@@ -417,18 +440,12 @@ pub fn extract_boot_cycles(
 
     if boot_idxs.is_empty() {
         let a = analyze_slice(None, &[], events);
-        return vec![BootCycle {
-            index: 0,
-            boot_time: None,
-            shutdown_time: a.shutdown_time,
-            cause: a.cause,
-            confidence: a.confidence,
-            evidence: a.evidence,
-            timeline: a.timeline,
-            wer_module: None,
-            minidumps: Vec::new(),
-            display_events: events.iter().take(20).cloned().collect(),
-        }];
+        return vec![cycle_to_boot(
+            0,
+            None,
+            a,
+            events.iter().take(20).cloned().collect(),
+        )];
     }
 
     let n = if limit == 0 {
@@ -453,18 +470,7 @@ pub fn extract_boot_cycles(
                 .cloned()
                 .collect();
 
-            BootCycle {
-                index: idx,
-                boot_time,
-                shutdown_time: a.shutdown_time,
-                cause: a.cause,
-                confidence: a.confidence,
-                evidence: a.evidence,
-                timeline: a.timeline,
-                wer_module: None,
-                minidumps: Vec::new(),
-                display_events,
-            }
+            cycle_to_boot(idx, boot_time, a, display_events)
         })
         .collect();
 
@@ -724,8 +730,13 @@ fn annotate_wer_module(cycle: &mut BootCycle, bounds: CycleBounds, wer: &[WerRec
         return;
     };
 
-    cycle.wer_module = module_from_bucket(&wr.bucket_id)
-        .or_else(|| (!wr.bucket_id.is_empty()).then(|| format!("(bucket: {})", wr.bucket_id)));
+    cycle.wer_module = module_from_bucket(&wr.bucket_id).or_else(|| {
+        if wr.bucket_id.is_empty() {
+            None
+        } else {
+            Some(format!("(bucket: {})", wr.bucket_id))
+        }
+    });
 
     if let (true, Some(p)) = (cycle.minidumps.is_empty(), &wr.minidump_path) {
         cycle.minidumps = vec![(wr.time_created, p.clone())];

@@ -218,6 +218,7 @@ mod tests {
             message: msg.to_string(),
             identifier: "kernel".into(),
             transport: "kernel".into(),
+            ..Default::default()
         }
     }
     fn oomd_line(msg: &str) -> LogLine {
@@ -226,6 +227,7 @@ mod tests {
             message: msg.to_string(),
             identifier: "systemd-oomd".into(),
             transport: "journal".into(),
+            ..Default::default()
         }
     }
 
